@@ -1,4 +1,4 @@
-﻿import crypto from "crypto";
+import crypto from "crypto";
 import { streamLLM, callLLM, getUseCaseConfigWithScope, resolveAutomaticInterviewModel } from "../llmRouter2";
 import { buildSystemPrompt, buildTier0Prompt, buildMessages, getMaxTokensForFormat, buildStrictInterviewTurnUserPrompt } from "../prompt";
 import { formatMemorySlotsForPrompt, processPostAnswerMemory } from "../memoryExtractor";
@@ -11,6 +11,7 @@ import type { Meeting } from "@shared/schema";
 import { shouldRetrieveDocs, type DocsRetrievalMode } from "./retrievalGate";
 import { retrieveDocumentContext } from "../rag";
 import { enqueuePersistRetry } from "./persistRetry";
+import { extractQuestionsWithLLM } from "../openai";
 import { isFollowUp, resolveAnchorTurn, type CodeTransitionType } from "@shared/followup";
 import { detectTechnicalSubtype, type TechnicalSubtype } from "@shared/technicalSubtype";
 import { classifyTechnicalIntent } from "@shared/technicalIntent";
@@ -1527,9 +1528,16 @@ export async function* streamAssistantAnswer(
           : [followUpPack, styleAppliedQuestion].filter(Boolean).join("\n\n"));
 
     const explicitListQuestions = extractExplicitNumberedQuestions(effectiveQuestion);
-    const extractedQuestions = explicitListQuestions.length >= 2
-      ? explicitListQuestions
-      : extractInterviewerQuestions(effectiveQuestion);
+    let extractedQuestions: string[] = [];
+    if (explicitListQuestions.length >= 2) {
+      extractedQuestions = explicitListQuestions;
+    } else {
+      extractedQuestions = await extractQuestionsWithLLM(effectiveQuestion, requestedModel);
+      if (!extractedQuestions.length && effectiveQuestion.trim()) {
+        console.warn("[QExtractor] LLM extraction returned 0 questions. Falling back to Regex.");
+        extractedQuestions = extractInterviewerQuestions(effectiveQuestion);
+      }
+    }
     const primaryQuestion = pickPrimaryInterviewerQuestion(extractedQuestions);
     const questionWordCount = effectiveQuestion.split(/\s+/).filter(Boolean).length;
     const isComplexTurn =
