@@ -22,6 +22,7 @@ async function getTransporter(): Promise<Transporter | null> {
     port: parseInt(port || "587", 10),
     secure: parseInt(port || "587", 10) === 465,
     auth: { user, pass },
+    tls: { rejectUnauthorized: false }, // Allow self-signed certs for local SMTP
   });
 }
 
