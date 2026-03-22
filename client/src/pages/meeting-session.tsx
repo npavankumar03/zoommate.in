@@ -3405,12 +3405,22 @@ export default function MeetingSession() {
     lastAnswerWasCodeRef.current = /```/.test(a);
     const tempId = `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     setResponsesLocal((prev) => {
-      const newest = prev[0];
-      if (
-        newest &&
-        normalizeForDedup(newest.question || "") === normalizeForDedup(q) &&
-        normalizeForDedup(newest.answer || "") === normalizeForDedup(a)
-      ) {
+      // Enhanced dedupe check
+      const newQ = (q || '').toLowerCase().trim();
+      const isDuplicate = prev.some((r) => {
+        const existingQ = (r.question || '').toLowerCase().trim();
+        if (!existingQ) return false;
+        // Simple similarity: if 80% of words match, it's a duplicate
+        const newWords = newQ.split(/\s+/).filter(Boolean);
+        if (newWords.length === 0) return false;
+        const existingWords = new Set(existingQ.split(/\s+/));
+        const matchCount = newWords.filter(w => existingWords.has(w)).length;
+        const similarity = matchCount / Math.max(newWords.length, 1);
+        return similarity > 0.8;
+      });
+      
+      if (isDuplicate) {
+        console.log('[DEDUPE] Blocked similar question:', q);
         return prev;
       }
       const localResponse: Response = {
@@ -3457,6 +3467,27 @@ export default function MeetingSession() {
     el.addEventListener("scroll", onScroll);
     return () => el.removeEventListener("scroll", onScroll);
   }, [isNearBottom]);
+
+  // Force memory extraction on page load
+  useEffect(() => {
+    if (!id) return;
+    
+    async function extractMemory() {
+      try {
+        await fetch(`/api/meetings/${id}/extract-memory`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ force: true })
+        });
+        console.log('[MEMORY] Extraction triggered');
+        queryClient.invalidateQueries({ queryKey: [`/api/meetings/${id}`] }); // Refresh meeting data
+      } catch (error) {
+        console.error('[MEMORY] Extraction failed:', error);
+      }
+    }
+    
+    extractMemory();
+  }, [id]);
 
   useEffect(() => {
     scheduleAutoScroll();

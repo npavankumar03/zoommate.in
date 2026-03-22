@@ -51,12 +51,23 @@ echo "   Installation Script v1.0"
 echo "=============================================="
 echo ""
 
-read -p "Enter your domain name (or press Enter for IP-based access): " DOMAIN_RAW
-read -p "Enter your OpenAI API key (or press Enter to skip): " OPENAI_KEY
-read -p "Enter your Stripe Secret Key (or press Enter to skip): " STRIPE_SECRET
-read -p "Enter your Stripe Publishable Key (or press Enter to skip): " STRIPE_PUBLISHABLE
+if [ -z "$DOMAIN" ]; then
+  read -p "Enter your domain name (or press Enter for IP-based access): " DOMAIN_RAW
+  DOMAIN=$(echo "$DOMAIN_RAW" | sed 's|https\?://||' | sed 's|/.*||' | sed 's|:.*||' | xargs)
+fi
 
-DOMAIN=$(echo "$DOMAIN_RAW" | sed 's|https\?://||' | sed 's|/.*||' | sed 's|:.*||' | xargs)
+if [ -z "$OPENAI_KEY" ]; then
+  read -p "Enter your OpenAI API key (or press Enter to skip): " OPENAI_KEY
+fi
+
+if [ -z "$STRIPE_SECRET" ]; then
+  read -p "Enter your Stripe Secret Key (or press Enter to skip): " STRIPE_SECRET
+fi
+
+if [ -z "$STRIPE_PUBLISHABLE" ]; then
+  read -p "Enter your Stripe Publishable Key (or press Enter to skip): " STRIPE_PUBLISHABLE
+fi
+
 if [ -n "$DOMAIN" ] && ! echo "$DOMAIN" | grep -qP '^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)*$'; then
   log_error "Invalid domain name: '$DOMAIN'"
   log_error "Please enter a valid domain like 'example.com' or 'app.example.com'"
@@ -292,9 +303,23 @@ EOF
   apt-get install -y -qq certbot python3-certbot-nginx
 
   read -p "Set up SSL certificate now? (y/n): " SETUP_SSL
-  if [ "$SETUP_SSL" = "y" ] || [ "$SETUP_SSL" = "Y" ]; then
-    read -p "Enter email for SSL certificate notifications: " SSL_EMAIL
-    certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$SSL_EMAIL" --redirect
+  if [ "$AUTO_INSTALL" = "true" ] || [ "$SETUP_SSL" = "y" ] || [ "$SETUP_SSL" = "Y" ]; then
+    SSL_EMAIL_ARG=""
+    if [ -n "$SSL_EMAIL" ]; then
+      SSL_EMAIL_ARG="-m $SSL_EMAIL"
+    else
+      if [ "$AUTO_INSTALL" != "true" ]; then
+        read -p "Enter email for SSL certificate notifications (or press Enter to skip email registration): " USER_SSL_EMAIL
+        if [ -n "$USER_SSL_EMAIL" ]; then
+          SSL_EMAIL_ARG="-m $USER_SSL_EMAIL"
+        else
+          SSL_EMAIL_ARG="--register-unsafely-without-email"
+        fi
+      else
+        SSL_EMAIL_ARG="--register-unsafely-without-email"
+      fi
+    fi
+    certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos $SSL_EMAIL_ARG --redirect
     log_success "SSL certificate installed"
     systemctl enable certbot.timer
     log_success "Auto-renewal enabled"
@@ -348,7 +373,11 @@ log_success "Firewall configured (SSH + HTTP/HTTPS)"
 # 12. Create admin user
 ##############################################################################
 log_info "Creating default admin user..."
-ADMIN_PASS=$(openssl rand -hex 8)
+if [ -z "$ADMIN_PASSWORD" ]; then
+  ADMIN_PASS=$(openssl rand -hex 8)
+else
+  ADMIN_PASS="$ADMIN_PASSWORD"
+fi
 ADMIN_HASH=$(node -e "const bcrypt=require('bcrypt'); bcrypt.hash('$ADMIN_PASS', 10).then(h=>console.log(h))")
 
 sudo -u postgres psql -d "$DB_NAME" -c "
