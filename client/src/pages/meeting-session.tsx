@@ -5711,9 +5711,13 @@ export default function MeetingSession() {
       return { seedText: seed, displayQuestion: questions.join("\n"), source: "transcript", multiQuestionMode: true };
     };
 
-    const modeThreshold = mode === "pause" ? 0.45 : mode === "final" ? 0.5 : 0.4;
+    // Raise thresholds to stop partial/noisy ASR fragments from triggering answers.
+    // pause mode needs 3+ words and higher confidence since it fires on every detected silence.
+    const modeThreshold = mode === "pause" ? 0.60 : mode === "final" ? 0.52 : 0.4;
     if (mode === "pause") {
-      const pauseEligible = sourceWordCount >= 1 && !isLikelyNoiseSegment(sourceText);
+      // Hard-block single/dual-word fragments in pause mode — they're almost always ASR noise
+      if (sourceWordCount < 3 && !sourceText.includes("?") && !hasImperative) return null;
+      const pauseEligible = sourceWordCount >= 3 && !isLikelyNoiseSegment(sourceText);
       const passesQuestionGate = advanced.isQuestion && advanced.confidence >= modeThreshold;
       if (!pauseEligible && !passesQuestionGate && !hasImperative) return null;
     } else if (mode === "final") {

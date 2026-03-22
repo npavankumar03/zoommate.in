@@ -414,6 +414,26 @@ export function setupWsAnswer(httpServer: Server): void {
           // (stored below after answer completes; used here via lastQuestionBySession as proxy)
           lastQuestionBySession.set(sessionId, questionForStream);
 
+          // Backend noise guard: reject partial/noisy ASR fragments that have no real question signal.
+          // This is a safety net for cases where the frontend's gating passes too-short fragments.
+          if (!force) {
+            const qWords = questionForStream.trim().split(/\s+/).filter(Boolean);
+            const hasQuestionMark = questionForStream.includes("?");
+            const hasQuestionWord = /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are|tell|walk|explain|describe|share|give|talk)[\s,]/i.test(questionForStream.trim());
+            const isKnownFollowUp = KNOWN_FOLLOWUP_RE.test(questionForStream.trim().toLowerCase());
+            const hasInterviewSignal = /\b(experience|worked|familiar|background|explain|tell me about|walk me through|have you used|have you ever|your thoughts on|describe a time)\b/i.test(questionForStream);
+            // Reject if fewer than 3 words and no clear question signal
+            if (qWords.length < 3 && !hasQuestionMark && !hasQuestionWord && !isKnownFollowUp && !hasInterviewSignal) {
+              console.log(`[ws/answer] noise_guard suppressed sessionId=${sessionId} words=${qWords.length} text="${questionForStream.slice(0, 60)}"`);
+              return;
+            }
+            // Also reject very short fragments (1 word) that would have no context
+            if (qWords.length <= 1 && !hasQuestionMark && !isKnownFollowUp) {
+              console.log(`[ws/answer] noise_guard suppressed single-word sessionId=${sessionId} text="${questionForStream.slice(0, 60)}"`);
+              return;
+            }
+          }
+
           const fp = normalizeQuestionForSimilarity(questionForStream);
           if (!fp) return;
           if (!force && isRecentDuplicate(sessionId, fp)) {
