@@ -386,9 +386,9 @@ fi
 ADMIN_HASH=$(node -e "const bcrypt=require('bcrypt'); bcrypt.hash('$ADMIN_PASS', 10).then(h=>console.log(h))")
 
 sudo -u postgres psql -d "$DB_NAME" -c "
-INSERT INTO users (id, username, password, email, role, plan, status)
-VALUES (gen_random_uuid(), 'admin', '$ADMIN_HASH', 'admin@zoommate.app', 'admin', 'enterprise', 'active')
-ON CONFLICT (username) DO NOTHING;
+INSERT INTO users (id, username, password, email, role, plan, status, email_verified)
+VALUES (gen_random_uuid(), 'admin', '$ADMIN_HASH', 'admin@zoommate.app', 'admin', 'enterprise', 'active', true)
+ON CONFLICT (username) DO UPDATE SET email_verified = true;
 " 2>/dev/null || true
 
 ##############################################################################
