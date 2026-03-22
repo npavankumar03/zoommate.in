@@ -228,6 +228,25 @@ function tryHeuristicExtraction(rawText: string): HeuristicResult | null {
   // Helper: capitalise first letter and ensure trailing "?"
   const q = (s: string) => s.charAt(0).toUpperCase() + s.slice(1).replace(/[?.!]*$/, "") + "?";
 
+  // ── Rhetorical Test / Noise Guard ─────────────────────────────────────────
+  if (/^(does\s+that\s+)?make\s+sense\??$/.test(lower) || /^(are\s+you\s+)?following\??$/.test(lower) || /^right\??$/.test(lower) || /^you\s+know\??$/.test(lower))
+    return null; // Force LLM or drop to ignore simple check-ins
+
+  // ── Code-Specific Inquiries ─────────────────────────────────────────────
+  if (/^(what\s+is\s+the\s+)?(time|space)\s+complexity/.test(lower))
+    return { question: q(text), type: "technical", confidence: 0.98 };
+
+  if (/^what\s+happens\s+on\s+line\s+\w+/.test(lower) || /^big\s+o\s+of/.test(lower))
+    return { question: q(text), type: "technical", confidence: 0.96 };
+
+  // ── Deep-Dive Technical Challenges ──────────────────────────────────────
+  if (/^(why\s+did\s+you\s+choose|why\s+not\s+use|what\s+are\s+the\s+trade-?offs?(?:\s+of)?|what\s+are\s+the\s+pros\s+and\s+cons|how\s+does\s+that\s+work|can\s+we\s+optimize|how\s+would\s+you\s+scale|can\s+you\s+elaborate)/.test(lower))
+    return { question: q(text), type: "technical", confidence: 0.95 };
+
+  // ── Hypothetical / Scenario Patterns ────────────────────────────────────
+  if (/^(suppose\s+you\s+have|imagine\s+a\s+situation|let'?s\s+say|if\s+you\s+were\s+to|what\s+if\s+(the\s+system|we))/.test(lower))
+    return { question: q(text), type: "technical", confidence: 0.94 };
+
   // ── Behavioral staples ──────────────────────────────────────────────────
   if (/^tell\s+me\s+about\s+yourself$/.test(lower))
     return { question: "Tell me about yourself?", type: "behavioral", confidence: 0.97 };

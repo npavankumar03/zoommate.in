@@ -417,11 +417,18 @@ export function setupWsAnswer(httpServer: Server): void {
           // Backend noise guard: reject partial/noisy ASR fragments that have no real question signal.
           // This is a safety net for cases where the frontend's gating passes too-short fragments.
           if (!force) {
+            const lowerQuestion = questionForStream.trim().toLowerCase();
+            // Block rhetorical check-ins where the interviewer is just confirming understanding
+            if (/^(does\s+that\s+)?make\s+sense\??$/.test(lowerQuestion) || /^(are\s+you\s+)?following\??$/.test(lowerQuestion) || /^right\??$/.test(lowerQuestion) || /^you\s+know\??$/.test(lowerQuestion)) {
+              console.log(`[ws/answer] rhetorical_checkin suppressed sessionId=${sessionId} text="${questionForStream.slice(0, 60)}"`);
+              return;
+            }
+
             const qWords = questionForStream.trim().split(/\s+/).filter(Boolean);
             const hasQuestionMark = questionForStream.includes("?");
             const hasQuestionWord = /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are|tell|walk|explain|describe|share|give|talk)[\s,]/i.test(questionForStream.trim());
-            const isKnownFollowUp = KNOWN_FOLLOWUP_RE.test(questionForStream.trim().toLowerCase());
-            const hasInterviewSignal = /\b(experience|worked|familiar|background|explain|tell me about|walk me through|have you used|have you ever|your thoughts on|describe a time)\b/i.test(questionForStream);
+            const isKnownFollowUp = KNOWN_FOLLOWUP_RE.test(lowerQuestion);
+            const hasInterviewSignal = /\b(experience|worked|familiar|background|explain|tell me about|walk me through|have you used|have you ever|your thoughts on|describe a time|trade-?offs?|pros and cons|optimize|scale|complexity)\b/i.test(questionForStream);
             // Reject if fewer than 3 words and no clear question signal
             if (qWords.length < 3 && !hasQuestionMark && !hasQuestionWord && !isKnownFollowUp && !hasInterviewSignal) {
               console.log(`[ws/answer] noise_guard suppressed sessionId=${sessionId} words=${qWords.length} text="${questionForStream.slice(0, 60)}"`);

@@ -68,6 +68,35 @@ const QUESTION_PHRASES = [
   "let's start with",
   "lets start with",
   "start with",
+  // Hypothetical / Scenario Patterns
+  "suppose you have",
+  "imagine a situation",
+  "let's say",
+  "lets say",
+  "if you were to design",
+  "how would you handle",
+  "what if the system",
+  "what if we",
+  // Deep-Dive Technical Challenges
+  "why did you choose",
+  "why not use",
+  "what are the trade-offs",
+  "what are the tradeoffs",
+  "what are the pros and cons",
+  "how does that work under",
+  "can we optimize",
+  "how would you scale",
+  "can you elaborate on",
+  // Code-Specific Inquiries
+  "time complexity",
+  "space complexity",
+  "big o of",
+  "why not use a",
+  "can you write a function",
+  "how would you code",
+  "what happens on line",
+  "walk me through this snippet",
+  "walk us through this snippet",
   // Topic-only interview phrases (no interrogative starter)
   "your thoughts on",
   "your opinion on",
@@ -91,11 +120,11 @@ const QUESTION_PHRASES = [
   "thoughts on",
 ];
 
-const INTERVIEW_INTENT_KEYWORDS = /\b(experience|worked|used|familiar|comfortable|exposure|background|hands on|knowledge|certification|strong in|thoughts?|opinion|approach|perspective|take)\b/i;
+const INTERVIEW_INTENT_KEYWORDS = /\b(experience|worked|used|familiar|comfortable|exposure|background|hands on|knowledge|certification|strong in|thoughts?|opinion|approach|perspective|take|trade-?offs?|pros and cons|optimize|scale|complexity)\b/i;
 const SECOND_PERSON_DECLARATIVE = /^(you\s+(have|got|worked|used|built|implemented|handled|seen|ever|know)|youve\s+(worked|used|built|implemented|handled|seen)|youre\s+(familiar|comfortable)|your\s+(experience|background|role|work|skills?|knowledge|expertise)\s+(with|in|on|at|using|related)|your\s+(thoughts?|opinion|take|approach|perspective|view|understanding)\b)\b/i;
 
 // Broader interview question signals: phrases that don't start with interrogatives but are clearly questions
-export const INTERVIEW_SIGNAL_RE = /\b(your\s+(thoughts?|opinion|take|approach|perspective|view|understanding)\b|any\s+(experience|background|knowledge|exposure|familiarity|idea)\b|familiar\s+with\b|comfortable\s+with\b|experience\s+(with|in|using|on|of)\b|background\s+(in|with|on)\b|knowledge\s+of\b|exposure\s+to\b|talk\s+(me|us)\s+through\b|share\s+(your|a|an|with)\b|give\s+(me|us)\s+(an?\s+)?(example|idea|sense|overview|insight|walkthrough)\b|thoughts?\s+on\b|opinion\s+on\b|approach\s+to\b|worked?\s+with\b|done\s+any\b)\b/i;
+export const INTERVIEW_SIGNAL_RE = /\b(your\s+(thoughts?|opinion|take|approach|perspective|view|understanding)\b|any\s+(experience|background|knowledge|exposure|familiarity|idea)\b|familiar\s+with\b|comfortable\s+with\b|experience\s+(with|in|using|on|of)\b|background\s+(in|with|on)\b|knowledge\s+of\b|exposure\s+to\b|talk\s+(me|us)\s+through\b|share\s+(your|a|an|with)\b|give\s+(me|us)\s+(an?\s+)?(example|idea|sense|overview|insight|walkthrough)\b|thoughts?\s+on\b|opinion\s+on\b|approach\s+to\b|worked?\s+with\b|done\s+any\b|trade-?offs?\s+of\b|pros\s+and\s+cons\b|time\s+complexity\b|space\s+complexity\b|big\s+o\b|write\s+a\s+function\b|code\s+this\b)\b/i;
 
 // Standalone tech terms — interviewer says just "Flask" or "React and Vue" as a question cue
 export const STANDALONE_TECH_RE = /\b(react|angular|vue|svelte|nextjs|nuxtjs|gatsby|remix|astro|ember|backbone|jquery|bootstrap|tailwind|tailwindcss|chakra|antd|shadcn|materialui|storybook|nodejs|node|express|fastapi|flask|django|spring|springboot|rails|laravel|aspnet|nestjs|fastify|hapi|koa|gin|echo|fiber|phoenix|sinatra|tornado|sanic|aiohttp|typescript|javascript|python|java|golang|go|rust|kotlin|swift|scala|csharp|cpp|php|ruby|dart|elixir|clojure|haskell|fsharp|julia|perl|lua|bash|powershell|shell|cobol|matlab|postgres|postgresql|mysql|sqlite|mongodb|redis|cassandra|dynamodb|elasticsearch|solr|neo4j|influxdb|cockroachdb|mariadb|oracle|sqlserver|firestore|supabase|planetscale|fauna|couchbase|hbase|aurora|aws|azure|gcp|heroku|vercel|netlify|cloudflare|digitalocean|linode|railway|render|docker|kubernetes|k8s|terraform|ansible|chef|puppet|jenkins|githubactions|gitlabci|circleci|argocd|helm|vagrant|packer|kafka|rabbitmq|sqs|sns|pubsub|nats|zeromq|activemq|celery|tensorflow|pytorch|keras|sklearn|scikit|pandas|numpy|opencv|nltk|spacy|huggingface|langchain|llamaindex|llm|gpt|bert|transformers|xgboost|lightgbm|rag|spark|hadoop|airflow|flink|databricks|snowflake|dbt|looker|tableau|powerbi|redshift|bigquery|hive|presto|trino|graphql|grpc|websocket|rest|restful|http|https|tcp|udp|mqtt|amqp|oauth|jwt|saml|openid|microservices|monolith|serverless|eventdriven|cqrs|ddd|tdd|bdd|git|github|gitlab|bitbucket|jira|confluence|figma|postman|swagger|openapi|webpack|vite|rollup|babel|eslint|prettier|devops|sre|cicd|agile|scrum|kanban|dotnet|blazor|xamarin|unity|wpf|winforms|api|sdk|cli|oop|solid|mvc|mvvm|spa|pwa|ssr|csr|cdn|dns|vpn|ssl|tls|microservice|containerization|orchestration|html|css|sass|less|json|xml|yaml|toml|markdown|linux|ubuntu|debian|centos|macos|unix|stripe|twilio|sendgrid|datadog|sentry|pagerduty|splunk|newrelic|grafana|prometheus|sqlalchemy|alembic|pydantic|nginx|apache|gunicorn|uvicorn|wipro|anthem|tcs|infosys|cognizant|accenture|capgemini|deloitte|ibm|microsoft|google|amazon|meta|apple|netflix|uber|airbnb|backend|frontend|fullstack|devops|sysadmin|architect|engineer|developer|programmer)\b|\.NET\b/i;
@@ -519,8 +548,9 @@ export function detectQuestionAdvanced(text: string): {
   if (startsInterrogative && words.length >= 3) score += 0.15;
   if (startsWh && words.length >= 4) score += 0.25;
   if (startsWh && words.length >= 3) score += 0.15;
-  if (/\b(difference between|walk me through|tell me about|explain|what happens if|how would you)\b/.test(normalized)) score += 0.5;
-  if (/\b(do you have experience|have you worked with|have you used|have you ever|are you familiar with|are you comfortable with|what was your|when did you|can you share|could you share|your experience with|your background in|your experience in|describe a time|give me an example|give an example|your thoughts on|your opinion on|your take on|your approach to|any experience with|any experience in|familiar with|comfortable with|thoughts on)\b/.test(normalized)) score += 0.35;
+  if (/\b(difference between|walk me through|tell me about|explain|what happens if|how would you|suppose you have|imagine a situation|let's say|lets say|if you were to|how would you handle|what if the system)\b/.test(normalized)) score += 0.5;
+  if (/\b(trade-?offs?|pros and cons|optimize this|how would you scale|elaborate on|time complexity|space complexity|big o of|why not use a|write a function|code this|what happens on line|this snippet)\b/.test(normalized)) score += 0.5;
+  if (/\b(do you have experience|have you worked with|have you used|have you ever|are you familiar with|are you comfortable with|what was your|when did you|can you share|could you share|your experience with|your background in|your experience in|describe a time|give me an example|give an example|your thoughts on|your opinion on|your take on|your approach to|any experience with|any experience in|familiar with|comfortable with|thoughts on|why did you choose|why not use)\b/.test(normalized)) score += 0.35;
   // Standalone tech term with no other signals still warrants a small boost
   if (STANDALONE_TECH_RE.test(normalized) && words.length <= 5) score += 0.3;
 
