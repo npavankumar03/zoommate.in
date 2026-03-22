@@ -8877,6 +8877,9 @@ export default function MeetingSession() {
                           )}
                           {(streamingAnswer || pendingResponse?.answer) ? (
                             <div className="text-sm leading-relaxed">
+                              {streamingDisplayQuestion && (
+                                <div className="font-bold mb-2 text-foreground/90 pb-2 border-b border-primary/10">Q: {streamingDisplayQuestion}</div>
+                              )}
                               {streamingDisplayAsCode ? (
                                 <MarkdownRenderer content={enforceCodeOnlyDisplay(streamingDisplayAnswer, streamingDisplayQuestion)} />
                               ) : (
@@ -8917,6 +8920,9 @@ export default function MeetingSession() {
                               </Button>
                             </div>
                             <div className="text-sm leading-relaxed">
+                              {resp.question && (
+                                <div className="font-bold mb-2 text-foreground/90 pb-2 border-b border-primary/10">Q: {resp.question}</div>
+                              )}
                               {shouldDisplayAnswerAsCode(resp.question, resp.answer) ? (
                                 <MarkdownRenderer content={enforceCodeOnlyDisplay(resp.answer, resp.question)} />
                               ) : (
