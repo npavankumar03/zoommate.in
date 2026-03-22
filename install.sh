@@ -302,21 +302,26 @@ EOF
   log_info "Installing Certbot for SSL..."
   apt-get install -y -qq certbot python3-certbot-nginx
 
-  read -p "Set up SSL certificate now? (y/n): " SETUP_SSL
-  if [ "$AUTO_INSTALL" = "true" ] || [ "$SETUP_SSL" = "y" ] || [ "$SETUP_SSL" = "Y" ]; then
+  if [ "$AUTO_INSTALL" != "true" ]; then
+    read -p "Set up SSL certificate now? (y/n): " SETUP_SSL
+  else
+    SETUP_SSL="y"
+  fi
+
+  if [ "$SETUP_SSL" = "y" ] || [ "$SETUP_SSL" = "Y" ]; then
     SSL_EMAIL_ARG=""
     if [ -n "$SSL_EMAIL" ]; then
       SSL_EMAIL_ARG="-m $SSL_EMAIL"
     else
       if [ "$AUTO_INSTALL" != "true" ]; then
-        read -p "Enter email for SSL certificate notifications (or press Enter to skip email registration): " USER_SSL_EMAIL
+        read -p "Enter email for SSL certificate notifications (or press Enter to use admin@$DOMAIN): " USER_SSL_EMAIL
         if [ -n "$USER_SSL_EMAIL" ]; then
           SSL_EMAIL_ARG="-m $USER_SSL_EMAIL"
         else
-          SSL_EMAIL_ARG="--register-unsafely-without-email"
+          SSL_EMAIL_ARG="-m admin@$DOMAIN"
         fi
       else
-        SSL_EMAIL_ARG="--register-unsafely-without-email"
+        SSL_EMAIL_ARG="-m admin@$DOMAIN"
       fi
     fi
     certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos $SSL_EMAIL_ARG --redirect
