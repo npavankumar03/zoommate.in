@@ -25,6 +25,8 @@ import {
 } from "@shared/questionDetection";
 import { isFollowUp } from "@shared/followup";
 import { AzureRecognizer, checkAzureAvailability } from "@/lib/stt/azureRecognizer";
+import { DeepgramRecognizer } from "@/lib/stt/deepgramRecognizer";
+import { fetchSttConfig, type SttProvider } from "@/lib/stt/sttConfig";
 import { getSocket } from "@/realtime/socketClient";
 import {
   Zap, Mic, MicOff, Monitor, Send, Square,
@@ -340,9 +342,10 @@ export default function MeetingSession() {
   const [selectedQuestionFilter, setSelectedQuestionFilter] = useState<string>("");
   const [recentQuestions, setRecentQuestions] = useState<string[]>([]);
   const [azureAvailable, setAzureAvailable] = useState<boolean | null>(null);
-  const [sttProvider, setSttProvider] = useState<"azure" | "browser">(() => {
+  const [deepgramAvailable, setDeepgramAvailable] = useState(false);
+  const [sttProvider, setSttProvider] = useState<SttProvider>(() => {
     const saved = localStorage.getItem("zoommate-stt-engine");
-    if (saved === "azure" || saved === "browser") return saved;
+    if (saved === "azure" || saved === "deepgram" || saved === "browser") return saved;
     return "browser";
   });
   const [autoAnswerEnabled, setAutoAnswerEnabled] = useState(false);
@@ -395,6 +398,7 @@ export default function MeetingSession() {
   const styleInitializedRef = useRef(false);
   const recognitionRef = useRef<any>(null);
   const azureRecognizerRef = useRef<AzureRecognizer | null>(null);
+  const deepgramRecognizerRef = useRef<DeepgramRecognizer | null>(null);
   const azureMicShadowRef = useRef<AzureRecognizer | null>(null); // Dual-stream: candidate mic recognizer
   const timerRef = useRef<NodeJS.Timeout | null>(null);
   const segmentsRef = useRef<string[]>([]);
@@ -3150,16 +3154,48 @@ export default function MeetingSession() {
   }, [meeting?.incognito]);
 
   useEffect(() => {
-    checkAzureAvailability().then((available) => {
-      setAzureAvailable(available);
-      const saved = localStorage.getItem("zoommate-stt-engine");
-      if (available && !saved) {
-        setSttProvider("azure");
-        localStorage.setItem("zoommate-stt-engine", "azure");
-      } else if (saved === "azure" && !available) {
-        setSttProvider("browser");
-      }
-    });
+    let cancelled = false;
+
+    fetchSttConfig()
+      .then((config) => {
+        if (cancelled) return;
+        setAzureAvailable(config.azureAvailable);
+        setDeepgramAvailable(config.deepgramAvailable);
+
+        const resolvedProvider: SttProvider =
+          config.defaultProvider === "azure" && config.azureAvailable
+            ? "azure"
+            : config.defaultProvider === "deepgram" && config.deepgramAvailable
+              ? "deepgram"
+              : config.defaultProvider === "browser"
+                ? "browser"
+                : config.azureAvailable
+                  ? "azure"
+                  : config.deepgramAvailable
+                    ? "deepgram"
+                    : "browser";
+
+        setSttProvider(resolvedProvider);
+        localStorage.setItem("zoommate-stt-engine", resolvedProvider);
+      })
+      .catch(() => {
+        checkAzureAvailability().then((available) => {
+          if (cancelled) return;
+          setAzureAvailable(available);
+          setDeepgramAvailable(false);
+          if (available) {
+            setSttProvider("azure");
+            localStorage.setItem("zoommate-stt-engine", "azure");
+            return;
+          }
+          setSttProvider("browser");
+          localStorage.setItem("zoommate-stt-engine", "browser");
+        });
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
     // Force memory extraction on page load
@@ -4738,39 +4774,41 @@ export default function MeetingSession() {
     startFirstChunkWatchdog,
   ]);
 
+  const buildRealtimeRecognizerCallbacks = useCallback((providerLabel: string, speaker: "interviewer" | "candidate" | "unknown" = "unknown") => ({
+    onPartial: (text: string) => {
+      if (speaker !== "candidate" && text?.trim()) {
+        handleBargeIn();
+      }
+      if (speaker !== "candidate") {
+        updateDraftFromPartial(text);
+      }
+    },
+    onFinal: (text: string) => {
+      handleFinalTurn(text, undefined, undefined, speaker);
+    },
+    onError: (error: string) => {
+      console.error(`[${providerLabel}] Error:`, error);
+      setSttStatus("error");
+      setSttError(error);
+      toast({ title: "Transcription error", description: error, variant: "destructive" });
+    },
+    onStatusChange: (status: "connecting" | "connected" | "disconnected" | "error") => {
+      if (status === "connected") {
+        console.log(`[${providerLabel}] Connected`);
+        setSttStatus("connected");
+        setSttError("");
+      } else if (status === "error" || status === "disconnected") {
+        console.log(`[${providerLabel}] Status:`, status);
+        setSttStatus(status === "error" ? "error" : "idle");
+      }
+    },
+  }), [handleBargeIn, updateDraftFromPartial, handleFinalTurn, toast]);
+
   const startAzureRecognizer = useCallback(async (mode: "mic" | "system", stream?: MediaStream, speaker: "interviewer" | "candidate" | "unknown" = "unknown") => {
     setSttStatus("connecting");
     setSttError("");
     const recognizer = new AzureRecognizer(
-      {
-        onPartial: (text) => {
-          if (speaker !== "candidate" && text?.trim()) {
-            handleBargeIn();
-          }
-          if (speaker !== "candidate") {
-            updateDraftFromPartial(text);
-          }
-        },
-        onFinal: (text) => {
-          handleFinalTurn(text, undefined, undefined, speaker);
-        },
-        onError: (error) => {
-          console.error("[Azure STT] Error:", error);
-          setSttStatus("error");
-          setSttError(error);
-          toast({ title: "Transcription error", description: error, variant: "destructive" });
-        },
-        onStatusChange: (status) => {
-          if (status === "connected") {
-            console.log("[Azure STT] Connected");
-            setSttStatus("connected");
-            setSttError("");
-          } else if (status === "error" || status === "disconnected") {
-            console.log("[Azure STT] Status:", status);
-            setSttStatus(status === "error" ? "error" : "idle");
-          }
-        },
-      },
+      buildRealtimeRecognizerCallbacks("Azure STT", speaker),
       {
         language: sttLanguage,
         // Moderate segmentation: reduce early splits while keeping live feel.
@@ -4788,7 +4826,31 @@ export default function MeetingSession() {
     } else if (stream) {
       await recognizer.startFromStream(stream);
     }
-  }, [sttLanguage, toast, handleFinalTurn, handleBargeIn, updateDraftFromPartial, buildSpeechPhraseHints]);
+  }, [sttLanguage, buildSpeechPhraseHints, buildRealtimeRecognizerCallbacks]);
+
+  const startDeepgramRecognizer = useCallback(async (mode: "mic" | "system", stream?: MediaStream, speaker: "interviewer" | "candidate" | "unknown" = "unknown") => {
+    setSttStatus("connecting");
+    setSttError("");
+    const recognizer = new DeepgramRecognizer(
+      buildRealtimeRecognizerCallbacks("Deepgram STT", speaker),
+      {
+        language: sttLanguage,
+        silenceTimeoutMs: mode === "system" ? 2100 : 600,
+        phraseHints: buildSpeechPhraseHints(),
+        vadEnabled: true,
+        vadNoiseFloor: mode === "system" ? 0.02 : 0.008,
+      },
+    );
+
+    deepgramRecognizerRef.current = recognizer;
+
+    if (stream) {
+      await recognizer.startFromStream(stream);
+      return;
+    }
+
+    throw new Error(`Deepgram ${mode} recognizer requires an audio stream`);
+  }, [sttLanguage, buildSpeechPhraseHints, buildRealtimeRecognizerCallbacks]);
 
   // ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ Free-tier tick: deduct 1 min every 60s while listening ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬
   const startFreeSessionTick = useCallback(() => {
@@ -4884,7 +4946,14 @@ export default function MeetingSession() {
 
   const startMicListening = useCallback(async () => {
     try {
-      if (sttProvider === "azure" && azureAvailable) {
+      const preferredRealtimeProvider =
+        sttProvider === "azure" && azureAvailable
+          ? "azure"
+          : sttProvider === "deepgram" && deepgramAvailable
+            ? "deepgram"
+            : null;
+
+      if (preferredRealtimeProvider) {
         try {
           // Step 1: get mic stream with echo cancellation OFF so speaker audio leaks through
           const micStream = await navigator.mediaDevices.getUserMedia({
@@ -4906,38 +4975,33 @@ export default function MeetingSession() {
 
           setSttStatus("connecting");
           setSttError("");
-          const recognizer = new AzureRecognizer(
-            {
-              onPartial: (text) => {
-                if (text?.trim()) handleBargeIn();
-                updateDraftFromPartial(text);
+          if (preferredRealtimeProvider === "azure") {
+            const recognizer = new AzureRecognizer(
+              buildRealtimeRecognizerCallbacks("Azure STT", "unknown"),
+              {
+                language: sttLanguage,
+                silenceTimeoutMs: 600,
+                phraseHints: buildSpeechPhraseHints(),
+                vadEnabled: true,
+                vadNoiseFloor: 0.008,
               },
-              onFinal: (text) => handleFinalTurn(text, undefined, undefined, "unknown"),
-              onError: (error) => {
-                console.error("[Azure mixed] Error:", error);
-                setSttStatus("error");
-                setSttError(error);
-                toast({ title: "Transcription error", description: error, variant: "destructive" });
+            );
+            azureRecognizerRef.current = recognizer;
+            await recognizer.startFromMixedStreams(streamsToMix);
+          } else {
+            const recognizer = new DeepgramRecognizer(
+              buildRealtimeRecognizerCallbacks("Deepgram STT", "unknown"),
+              {
+                language: sttLanguage,
+                silenceTimeoutMs: 600,
+                phraseHints: buildSpeechPhraseHints(),
+                vadEnabled: true,
+                vadNoiseFloor: 0.008,
               },
-              onStatusChange: (status) => {
-                if (status === "connected") {
-                  setSttStatus("connected");
-                  setSttError("");
-                } else if (status === "error" || status === "disconnected") {
-                  setSttStatus(status === "error" ? "error" : "idle");
-                }
-              },
-            },
-            {
-              language: sttLanguage,
-              silenceTimeoutMs: 600,
-              phraseHints: buildSpeechPhraseHints(),
-              vadEnabled: true,
-              vadNoiseFloor: 0.008,
-            },
-          );
-          azureRecognizerRef.current = recognizer;
-          await recognizer.startFromMixedStreams(streamsToMix);
+            );
+            deepgramRecognizerRef.current = recognizer;
+            await recognizer.startFromMixedStreams(streamsToMix);
+          }
 
           setIsListening(true);
           setAudioMode("mic");
@@ -4949,13 +5013,20 @@ export default function MeetingSession() {
               : "Microphone is ready. Listening for audio.",
           });
           return;
-        } catch (azureErr: any) {
-          console.error("[Azure mic] Failed, falling back:", azureErr.message);
+        } catch (providerErr: any) {
+          console.error(`[${preferredRealtimeProvider} mic] Failed, falling back:`, providerErr.message);
           // Clean up any streams opened before the failure
           micStreamRef.current?.getTracks().forEach((t) => t.stop());
           micStreamRef.current = null;
           tabAudioStreamRef.current?.getTracks().forEach((t) => t.stop());
           tabAudioStreamRef.current = null;
+          if (preferredRealtimeProvider === "azure") {
+            azureRecognizerRef.current?.stop();
+            azureRecognizerRef.current = null;
+          } else {
+            deepgramRecognizerRef.current?.stop();
+            deepgramRecognizerRef.current = null;
+          }
           toast({ title: "Switching to browser speech recognition.", variant: "destructive" });
         }
       }
@@ -4976,10 +5047,10 @@ export default function MeetingSession() {
         stream.getTracks().forEach((t: MediaStreamTrack) => t.stop());
         micStreamRef.current = null;
         setSttStatus("error");
-        setSttError("Live transcription requires Azure Speech or Browser Speech API.");
+        setSttError("Live transcription requires Azure Speech, Deepgram, or Browser Speech API.");
         toast({
           title: "Live STT unavailable",
-          description: "Enable Azure Speech or use a browser with Web Speech API. Server-side Whisper is batch mode and disabled for live.",
+          description: "Enable Azure Speech, Deepgram, or use a browser with Web Speech API. Server-side Whisper is batch mode and disabled for live.",
           variant: "destructive",
         });
         return;
@@ -5051,7 +5122,7 @@ export default function MeetingSession() {
         toast({ title: "Failed to start microphone", description: error.message, variant: "destructive" });
       }
     }
-  }, [toast, sttLanguage, sttProvider, azureAvailable, startAzureRecognizer, handleFinalTurn, handleBargeIn, updateDraftFromPartial, buildSpeechPhraseHints]);
+  }, [toast, sttLanguage, sttProvider, azureAvailable, deepgramAvailable, buildSpeechPhraseHints, buildRealtimeRecognizerCallbacks]);
 
   // ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ Start Session (paid ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â deducts minutes) ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬
   const handleStartSession = useCallback(async () => {
@@ -5149,7 +5220,14 @@ export default function MeetingSession() {
         stopListening();
       };
 
-      if (sttProvider === "azure" && azureAvailable) {
+      const preferredRealtimeProvider =
+        sttProvider === "azure" && azureAvailable
+          ? "azure"
+          : sttProvider === "deepgram" && deepgramAvailable
+            ? "deepgram"
+            : null;
+
+      if (preferredRealtimeProvider === "azure") {
         try {
           // Tag system audio as interviewer ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â Q detection always active
           await startAzureRecognizer("system", audioStream, "interviewer");
@@ -5192,6 +5270,25 @@ export default function MeetingSession() {
         }
       }
 
+      if (preferredRealtimeProvider === "deepgram") {
+        try {
+          await startDeepgramRecognizer("system", audioStream, "interviewer");
+          setIsListening(true);
+          setAudioMode("system");
+          updateStatusMutation.mutate({ status: "active" });
+          toast({
+            title: "System audio active",
+            description: "Deepgram live transcription is analyzing the shared audio stream.",
+          });
+          return;
+        } catch (deepgramErr: any) {
+          console.error("[Deepgram system] Failed, falling back:", deepgramErr.message);
+          deepgramRecognizerRef.current?.stop();
+          deepgramRecognizerRef.current = null;
+          toast({ title: "System audio unavailable", description: "Please try sharing your screen/tab audio again.", variant: "destructive" });
+        }
+      }
+
       audioTracks.forEach((t) => t.stop());
       if (displayCaptureStreamRef.current) {
         displayCaptureStreamRef.current.getTracks().forEach((t) => t.stop());
@@ -5199,10 +5296,10 @@ export default function MeetingSession() {
       }
       systemAudioStreamRef.current = null;
       setSttStatus("error");
-      setSttError("Live system-audio transcription requires Azure Speech.");
+      setSttError("Live system-audio transcription requires Azure Speech or Deepgram.");
       toast({
         title: "Live system STT unavailable",
-        description: "Enable Azure Speech for real-time system audio transcription. Batch upload transcription is disabled in live mode.",
+        description: "Enable Azure Speech or Deepgram for real-time shared-audio transcription. Batch upload transcription is disabled in live mode.",
         variant: "destructive",
       });
       return;
@@ -5215,7 +5312,7 @@ export default function MeetingSession() {
         toast({ title: "Failed to capture system audio", description: error.message, variant: "destructive" });
       }
     }
-  }, [azureAvailable, startAzureRecognizer, sttLanguage, sttProvider, toast, handleFinalTurn]);
+  }, [azureAvailable, deepgramAvailable, startAzureRecognizer, startDeepgramRecognizer, sttProvider, toast, handleFinalTurn]);
 
   const stopListening = useCallback(() => {
     recognitionAlive.current = false;
@@ -5229,6 +5326,11 @@ export default function MeetingSession() {
     if (azureRecognizerRef.current) {
       azureRecognizerRef.current.stop();
       azureRecognizerRef.current = null;
+    }
+
+    if (deepgramRecognizerRef.current) {
+      deepgramRecognizerRef.current.stop();
+      deepgramRecognizerRef.current = null;
     }
 
     if (azureMicShadowRef.current) {
@@ -7428,6 +7530,10 @@ export default function MeetingSession() {
         azureRecognizerRef.current.stop();
         azureRecognizerRef.current = null;
       }
+      if (deepgramRecognizerRef.current) {
+        deepgramRecognizerRef.current.stop();
+        deepgramRecognizerRef.current = null;
+      }
       if (recognitionRef.current) {
         try { recognitionRef.current.stop(); } catch (e) {}
         recognitionRef.current = null;
@@ -8456,7 +8562,7 @@ export default function MeetingSession() {
               <select
                 value={sttProvider}
                 onChange={(e) => {
-                  const val = e.target.value as "azure" | "browser";
+                  const val = e.target.value as SttProvider;
                   setSttProvider(val);
                   localStorage.setItem("zoommate-stt-engine", val);
                 }}
@@ -8464,11 +8570,17 @@ export default function MeetingSession() {
                 data-testid="select-stt-provider"
               >
                 {azureAvailable && <option value="azure">Azure Speech (recommended)</option>}
+                {deepgramAvailable && <option value="deepgram">Deepgram Live</option>}
                 <option value="browser">Browser Speech API</option>
               </select>
               {sttProvider === "azure" && (
                 <p className="text-xs text-emerald-500 mt-1 flex items-center gap-1">
                   <Cloud className="w-3 h-3" /> Azure Speech active - smooth real-time partials + finals
+                </p>
+              )}
+              {sttProvider === "deepgram" && (
+                <p className="text-xs text-emerald-500 mt-1 flex items-center gap-1">
+                  <Cloud className="w-3 h-3" /> Deepgram active - live partials + finals via short-lived tokens
                 </p>
               )}
               {sttProvider === "browser" && (
@@ -8478,8 +8590,10 @@ export default function MeetingSession() {
             <p className="text-xs text-muted-foreground mt-3">
               {sttProvider === "azure"
                 ? "Azure Speech provides smooth real-time transcription with partial updates for both microphone and system audio."
+                : sttProvider === "deepgram"
+                  ? "Deepgram provides real-time transcription for microphone and shared audio using short-lived server-minted browser tokens."
                 : <>
-                    <strong>Microphone</strong> uses browser speech recognition for real-time results (Chrome best). <strong>System Audio</strong> live mode requires Azure Speech.
+                    <strong>Microphone</strong> uses browser speech recognition for real-time results (Chrome best). <strong>System Audio</strong> live mode requires Azure Speech or Deepgram.
                   </>
               }
             </p>

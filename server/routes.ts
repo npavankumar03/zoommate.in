@@ -21,6 +21,7 @@ import OpenAI from "openai";
 import fs from "fs";
 import path from "path";
 import { mintAzureToken, getAzureStatus } from "./speech/azureToken";
+import { mintDeepgramToken, getDeepgramStatus } from "./speech/deepgramToken";
 import { encryptSettingValue, decryptSettingValue } from "./settingsCrypto";
 import { sendVerificationEmail, testSmtpConnection } from "./emailService";
 import { runDetectionPipeline, extractQuestionsWithLLM, composeQuestionWithLLM, normalizeQuestion, isDuplicateQuestion } from "./assist/questionDetect";
@@ -2132,6 +2133,54 @@ export async function registerRoutes(
   app.get("/api/speech/azure/status", requireAuth, azureStatusHandler);
   app.get("/api/stt/azure-status", requireAuth, azureStatusHandler);
 
+  const deepgramTokenHandler = async (req: any, res: any) => {
+    try {
+      const canUseSpeech = await hasSpeechCredits(req.userId);
+      if (!canUseSpeech) {
+        return res.status(402).json({ message: "No credits remaining for speech transcription." });
+      }
+
+      const result = await mintDeepgramToken();
+      if (!result) {
+        return res.status(404).json({ message: "Deepgram STT is not configured. Ask admin to set the Deepgram API key." });
+      }
+
+      res.json({
+        token: result.token,
+        expires_in_seconds: result.expiresInSeconds,
+      });
+    } catch (error: any) {
+      console.error("[deepgram-token] Error:", error.message);
+      res.status(500).json({ message: "Failed to get Deepgram token" });
+    }
+  };
+
+  const sttConfigHandler = async (_req: any, res: any) => {
+    try {
+      const [azureStatus, deepgramStatus, rawDefaultProvider] = await Promise.all([
+        getAzureStatus(),
+        getDeepgramStatus(),
+        storage.getSetting("default_stt_provider"),
+      ]);
+
+      const defaultProvider = rawDefaultProvider === "azure" || rawDefaultProvider === "deepgram" || rawDefaultProvider === "browser"
+        ? rawDefaultProvider
+        : "browser";
+
+      res.json({
+        azureAvailable: azureStatus.configured === true,
+        deepgramAvailable: deepgramStatus.configured === true,
+        defaultProvider,
+      });
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  };
+
+  app.get("/api/speech/deepgram/token", requireAuth, deepgramTokenHandler);
+  app.get("/api/stt/deepgram-token", requireAuth, deepgramTokenHandler);
+  app.get("/api/speech/stt/config", requireAuth, sttConfigHandler);
+
   app.get("/api/admin/settings", requireAdmin, async (req: any, res) => {
     try {
       const settings = await storage.getAllSettings();
@@ -2149,7 +2198,7 @@ export async function registerRoutes(
           } else {
             safeSettings[key] = "";
           }
-        } else if (key === "azure_speech_key") {
+        } else if (key === "azure_speech_key" || key === "deepgram_api_key") {
           const decrypted = decryptSettingValue(value);
           safeSettings[`${key}_set`] = !!decrypted;
           safeSettings[`${key}_last4`] = decrypted ? decrypted.slice(-4) : "";
@@ -2169,6 +2218,7 @@ export async function registerRoutes(
       }
       safeSettings.openai_env_set = !!process.env.OPENAI_API_KEY;
       safeSettings.default_model = settings.default_model || "gpt-4o";
+      safeSettings.default_stt_provider = settings.default_stt_provider || "browser";
       res.json(safeSettings);
     } catch (error: any) {
       res.status(500).json({ message: error.message });
@@ -2210,6 +2260,16 @@ export async function registerRoutes(
       }
       if (typeof req.body.azure_speech_region === "string") {
         await storage.setSetting("azure_speech_region", req.body.azure_speech_region.trim() || "eastus");
+      }
+      if (typeof req.body.deepgram_api_key === "string") {
+        const key = req.body.deepgram_api_key.trim();
+        await storage.setSetting("deepgram_api_key", key ? encryptSettingValue(key) : "");
+      }
+      if (typeof req.body.default_stt_provider === "string") {
+        const provider = req.body.default_stt_provider.trim();
+        if (provider === "azure" || provider === "deepgram" || provider === "browser") {
+          await storage.setSetting("default_stt_provider", provider);
+        }
       }
 
       if (typeof default_model === "string" && default_model) {
