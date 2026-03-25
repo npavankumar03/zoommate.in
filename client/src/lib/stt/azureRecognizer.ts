@@ -153,6 +153,9 @@ export class AzureRecognizer {
     this.audioStream = SpeechSDK.AudioInputStream.createPushStream(format);
 
     this.audioContext = new AudioContext({ sampleRate: 16000, latencyHint: "interactive" });
+    if (this.audioContext.state === "suspended") {
+      await this.audioContext.resume();
+    }
     const destination = this.audioContext.createMediaStreamDestination();
 
     for (const stream of streams) {
@@ -214,6 +217,9 @@ export class AzureRecognizer {
     this.audioStream = SpeechSDK.AudioInputStream.createPushStream(format);
 
     this.audioContext = new AudioContext({ sampleRate: 16000, latencyHint: "interactive" });
+    if (this.audioContext.state === "suspended") {
+      await this.audioContext.resume();
+    }
     const source = this.audioContext.createMediaStreamSource(mediaStream);
 
     if (this.audioContext.audioWorklet) {
