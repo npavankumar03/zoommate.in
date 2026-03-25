@@ -5039,7 +5039,8 @@ export default function MeetingSession() {
           // Step 2: use existing tab audio stream if user already shared screen
           // (getDisplayMedia popup is NOT triggered on session start — only when user clicks "Share Screen / Tab Audio")
           const tabStream: MediaStream | null = tabAudioStreamRef.current || null;
-          // Step 3: start Azure with mixed streams (mic + optional tab audio)
+          // Step 3: for plain mic mode use the direct stream path.
+          // Only use mixed-stream mode when tab audio is actually present.
           const streamsToMix = [micStream, ...(tabStream ? [tabStream] : [])].filter(
             (s) => s.getAudioTracks().length > 0,
           );
@@ -5058,7 +5059,11 @@ export default function MeetingSession() {
               },
             );
             azureRecognizerRef.current = recognizer;
-            await recognizer.startFromMixedStreams(streamsToMix);
+            if (tabStream) {
+              await recognizer.startFromMixedStreams(streamsToMix);
+            } else {
+              await recognizer.startFromStream(micStream);
+            }
           } else {
             const recognizer = new DeepgramRecognizer(
               buildRealtimeRecognizerCallbacks("Deepgram STT", "unknown"),
@@ -5071,7 +5076,11 @@ export default function MeetingSession() {
               },
             );
             deepgramRecognizerRef.current = recognizer;
-            await recognizer.startFromMixedStreams(streamsToMix);
+            if (tabStream) {
+              await recognizer.startFromMixedStreams(streamsToMix);
+            } else {
+              await recognizer.startFromStream(micStream);
+            }
           }
 
           setIsListening(true);
