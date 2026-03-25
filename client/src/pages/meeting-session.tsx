@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { Link, useLocation, useParams } from "wouter";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -12,6 +12,9 @@ import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { DebugPanel, type DebugPanelData } from "@/components/debug-panel";
 import { ReadingPane } from "@/components/reading-pane";
 import { LiveCodeEditor } from "@/components/live-code-editor";
+import { SessionInsightsPanel } from "@/components/session-insights-panel";
+import { SessionSidebarPanel } from "@/components/session-sidebar-panel";
+import { SessionTranscriptPanel } from "@/components/session-transcript-panel";
 import {
   detectQuestion,
   detectQuestionAdvanced,
@@ -61,6 +64,7 @@ type VideoFrameCallbackVideo = HTMLVideoElement & {
 const SCREEN_CAPTURE_MAX_WIDTH = 1400;
 const SCREEN_CAPTURE_JPEG_QUALITY = 0.72;
 const TRANSCRIPT_GROUPING_MS = 5_000;
+const DISPLAY_TRANSCRIPT_RENDER_LIMIT = 120;
 
 function isLikelyInterviewTopic(raw: string): boolean {
   const text = String(raw || "").toLowerCase().replace(/[^\w\s.+#/-]/g, " ").replace(/\s+/g, " ").trim();
@@ -308,7 +312,6 @@ export default function MeetingSession() {
   const [isRefining, setIsRefining] = useState(false);
   const [compactMode, setCompactMode] = useState(false);
   const [conversationHistory, setConversationHistory] = useState("");
-  const [audioLevel, setAudioLevel] = useState(0);
   const [initializedFromMeeting, setInitializedFromMeeting] = useState(false);
   const [quickResponseMode, setQuickResponseMode] = useState(() => {
     const stored = localStorage.getItem("zoommate-quick-response");
@@ -331,6 +334,7 @@ export default function MeetingSession() {
   });
   const [socketConnected, setSocketConnected] = useState(false);
   const [responsesLocal, setResponsesLocal] = useState<Response[]>([]);
+  const [selectedResponseId, setSelectedResponseId] = useState<string | null>(null);
   const [showResponseHistory, setShowResponseHistory] = useState(false);
   const [highlightResponseId, setHighlightResponseId] = useState<string | null>(null);
   const [selectedQuestionFilter, setSelectedQuestionFilter] = useState<string>("");
@@ -405,9 +409,6 @@ export default function MeetingSession() {
   const tabAudioStreamRef = useRef<MediaStream | null>(null);  // tab audio captured via getDisplayMedia for mixing
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const systemAudioAlive = useRef(false);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
-  const animFrameRef = useRef<number>(0);
   const systemTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const askedQuestionsRef = useRef<string[]>([]);
   const recentAskedFingerprintsRef = useRef<string[]>([]);
@@ -704,8 +705,9 @@ export default function MeetingSession() {
     const nextNorm = normalizeForDedup(next);
     if (!nextNorm) return;
     if (displaySegmentsRef.current.some((seg) => normalizeForDedup(seg) === nextNorm)) return;
-    displaySegmentsRef.current = [next, ...displaySegmentsRef.current];
-    displaySegmentKeysRef.current = [`${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, ...displaySegmentKeysRef.current];
+    displaySegmentsRef.current = [next, ...displaySegmentsRef.current].slice(0, DISPLAY_TRANSCRIPT_RENDER_LIMIT);
+    displaySegmentKeysRef.current = [`${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, ...displaySegmentKeysRef.current]
+      .slice(0, DISPLAY_TRANSCRIPT_RENDER_LIMIT);
     setDisplayTranscriptSegments([...displaySegmentsRef.current]);
     setDisplayTranscriptSegmentKeys([...displaySegmentKeysRef.current]);
   }, []);
@@ -1398,21 +1400,48 @@ export default function MeetingSession() {
     return `\`\`\`${lang}\n${formatted}\n\`\`\``;
   }, [formatSingleLineCode, inferCodeLanguage, normalizeCodeFences]);
 
-  const streamingDisplayQuestion = streamingQuestion || pendingResponse?.question || "";
-  const streamingDisplayAnswer = streamingAnswer || pendingResponse?.answer || "";
-  const streamingDisplayAsCode = shouldDisplayAnswerAsCode(streamingDisplayQuestion, streamingDisplayAnswer);
-  const streamingDisplayAnswerNormalized = normalizeCodeFences(streamingDisplayAnswer, streamingDisplayQuestion);
-  const newestResponse = responsesLocal[0];
-  const newestResponseMatchesStreaming =
-    !!newestResponse?.answer
-    && !!streamingDisplayAnswer
-    && (
-      normalizeForDedup(newestResponse.answer) === normalizeForDedup(streamingDisplayAnswer)
-      || normalizeForDedup(newestResponse.question || "") === normalizeForDedup(streamingDisplayQuestion)
-    );
-  const shouldShowStreamingCard =
-    isAwaitingFirstChunk
-    || ((!!streamingAnswer || !!pendingResponse?.answer) && (!newestResponseMatchesStreaming || isStreaming));
+  const streamingDisplayQuestion = useMemo(
+    () => streamingQuestion || pendingResponse?.question || "",
+    [streamingQuestion, pendingResponse?.question],
+  );
+  const streamingDisplayAnswer = useMemo(
+    () => streamingAnswer || pendingResponse?.answer || "",
+    [streamingAnswer, pendingResponse?.answer],
+  );
+  const streamingDisplayAsCode = useMemo(
+    () => shouldDisplayAnswerAsCode(streamingDisplayQuestion, streamingDisplayAnswer),
+    [shouldDisplayAnswerAsCode, streamingDisplayQuestion, streamingDisplayAnswer],
+  );
+  const streamingRenderedAnswer = useMemo(() => {
+    if (!streamingDisplayAnswer) return "";
+    return streamingDisplayAsCode
+      ? enforceCodeOnlyDisplay(streamingDisplayAnswer, streamingDisplayQuestion)
+      : streamingDisplayAnswer;
+  }, [enforceCodeOnlyDisplay, streamingDisplayAnswer, streamingDisplayAsCode, streamingDisplayQuestion]);
+  const newestResponseMatchesStreaming = useMemo(() => {
+    const newestResponse = responsesLocal[0];
+    return !!newestResponse?.answer
+      && !!streamingDisplayAnswer
+      && (
+        normalizeForDedup(newestResponse.answer) === normalizeForDedup(streamingDisplayAnswer)
+        || normalizeForDedup(newestResponse.question || "") === normalizeForDedup(streamingDisplayQuestion)
+      );
+  }, [responsesLocal, streamingDisplayAnswer, streamingDisplayQuestion]);
+  const shouldShowStreamingCard = useMemo(
+    () => isAwaitingFirstChunk
+      || ((!!streamingAnswer || !!pendingResponse?.answer) && (!newestResponseMatchesStreaming || isStreaming)),
+    [isAwaitingFirstChunk, streamingAnswer, pendingResponse?.answer, newestResponseMatchesStreaming, isStreaming],
+  );
+  const selectedResponse = useMemo(
+    () => responsesLocal.find((response) => response.id === selectedResponseId) || responsesLocal[0] || null,
+    [responsesLocal, selectedResponseId],
+  );
+  const selectedResponseRenderedAnswer = useMemo(() => {
+    if (!selectedResponse) return "";
+    return shouldDisplayAnswerAsCode(selectedResponse.question, selectedResponse.answer)
+      ? enforceCodeOnlyDisplay(selectedResponse.answer, selectedResponse.question)
+      : selectedResponse.answer;
+  }, [selectedResponse, shouldDisplayAnswerAsCode, enforceCodeOnlyDisplay]);
 
   const buildSpeechPhraseHints = useCallback((): string[] => {
     const baseHints = [
@@ -3254,6 +3283,19 @@ export default function MeetingSession() {
   }, [responsesLocal]);
 
   useEffect(() => {
+    if (!responsesLocal.length) {
+      if (selectedResponseId !== null) {
+        setSelectedResponseId(null);
+      }
+      return;
+    }
+    if (selectedResponseId && responsesLocal.some((response) => response.id === selectedResponseId)) {
+      return;
+    }
+    setSelectedResponseId(responsesLocal[0].id);
+  }, [responsesLocal, selectedResponseId]);
+
+  useEffect(() => {
     streamingAnswerRef.current = streamingAnswer;
   }, [streamingAnswer]);
 
@@ -3323,7 +3365,7 @@ export default function MeetingSession() {
     if (!el) return;
     // Always keep newest transcript at the top.
     el.scrollTop = 0;
-  }, [transcriptSegments, interimText]);
+  }, [displayTranscriptSegments, interimText, stagedTranscriptText, pendingTranscriptLine]);
 
   useEffect(() => {
     isAwaitingFirstChunkRef.current = isAwaitingFirstChunk;
@@ -3383,7 +3425,12 @@ export default function MeetingSession() {
 
   const highlightAndScrollResponse = useCallback((responseId: string) => {
     if (!responseId) return;
+    setSelectedResponseId(responseId);
     setHighlightResponseId(responseId);
+    const selected = responsesLocalRef.current.find((response) => response.id === responseId);
+    if (selected?.question) {
+      setSelectedQuestionFilter(selected.question);
+    }
     const el = responseCardRefs.current[responseId];
     if (el) {
       el.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -4691,43 +4738,6 @@ export default function MeetingSession() {
     startFirstChunkWatchdog,
   ]);
 
-  const setupAudioAnalyser = useCallback((stream: MediaStream) => {
-    try {
-      const ctx = new AudioContext();
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 256;
-      const source = ctx.createMediaStreamSource(stream);
-      source.connect(analyser);
-      audioContextRef.current = ctx;
-      analyserRef.current = analyser;
-
-      const dataArray = new Uint8Array(analyser.frequencyBinCount);
-      const updateLevel = () => {
-        if (!analyserRef.current) return;
-        analyserRef.current.getByteFrequencyData(dataArray);
-        const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
-        setAudioLevel(Math.min(100, Math.round(avg * 1.5)));
-        animFrameRef.current = requestAnimationFrame(updateLevel);
-      };
-      updateLevel();
-    } catch (e) {
-      console.error("Audio analyser setup failed:", e);
-    }
-  }, []);
-
-  const cleanupAudioAnalyser = useCallback(() => {
-    if (animFrameRef.current) {
-      cancelAnimationFrame(animFrameRef.current);
-      animFrameRef.current = 0;
-    }
-    if (audioContextRef.current) {
-      try { audioContextRef.current.close(); } catch (e) {}
-      audioContextRef.current = null;
-    }
-    analyserRef.current = null;
-    setAudioLevel(0);
-  }, []);
-
   const startAzureRecognizer = useCallback(async (mode: "mic" | "system", stream?: MediaStream, speaker: "interviewer" | "candidate" | "unknown" = "unknown") => {
     setSttStatus("connecting");
     setSttError("");
@@ -4929,7 +4939,6 @@ export default function MeetingSession() {
           azureRecognizerRef.current = recognizer;
           await recognizer.startFromMixedStreams(streamsToMix);
 
-          setupAudioAnalyser(micStream);
           setIsListening(true);
           setAudioMode("mic");
           updateStatusMutation.mutate({ status: "active" });
@@ -4978,8 +4987,6 @@ export default function MeetingSession() {
 
       recognitionAlive.current = true;
       recognitionRestartCount.current = 0;
-      setupAudioAnalyser(stream);
-
       stream.getAudioTracks()[0].onended = () => {
         stopListening();
       };
@@ -5044,7 +5051,7 @@ export default function MeetingSession() {
         toast({ title: "Failed to start microphone", description: error.message, variant: "destructive" });
       }
     }
-  }, [toast, setupAudioAnalyser, sttLanguage, sttProvider, azureAvailable, startAzureRecognizer, handleFinalTurn, handleBargeIn, updateDraftFromPartial, buildSpeechPhraseHints]);
+  }, [toast, sttLanguage, sttProvider, azureAvailable, startAzureRecognizer, handleFinalTurn, handleBargeIn, updateDraftFromPartial, buildSpeechPhraseHints]);
 
   // ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ Start Session (paid ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â deducts minutes) ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬
   const handleStartSession = useCallback(async () => {
@@ -5138,8 +5145,6 @@ export default function MeetingSession() {
       systemAudioAlive.current = true;
       setSttStatus("connected");
 
-      setupAudioAnalyser(audioStream);
-
       audioTracks[0].onended = () => {
         stopListening();
       };
@@ -5193,7 +5198,6 @@ export default function MeetingSession() {
         displayCaptureStreamRef.current = null;
       }
       systemAudioStreamRef.current = null;
-      cleanupAudioAnalyser();
       setSttStatus("error");
       setSttError("Live system-audio transcription requires Azure Speech.");
       toast({
@@ -5211,7 +5215,7 @@ export default function MeetingSession() {
         toast({ title: "Failed to capture system audio", description: error.message, variant: "destructive" });
       }
     }
-  }, [azureAvailable, cleanupAudioAnalyser, setupAudioAnalyser, startAzureRecognizer, sttLanguage, sttProvider, toast, handleFinalTurn]);
+  }, [azureAvailable, startAzureRecognizer, sttLanguage, sttProvider, toast, handleFinalTurn]);
 
   const stopListening = useCallback(() => {
     recognitionAlive.current = false;
@@ -5265,7 +5269,6 @@ export default function MeetingSession() {
       tabAudioStreamRef.current = null;
     }
 
-    cleanupAudioAnalyser();
     setIsListening(false);
     setSttStatus("idle");
     setSttError("");
@@ -5280,7 +5283,7 @@ export default function MeetingSession() {
     void flushTranscriptPersistQueue();
     stopFreeSessionTick();
     stopFreeCountdown();
-  }, [cleanupAudioAnalyser, flushTranscriptPersistQueue, stopFreeSessionTick, stopFreeCountdown]);
+  }, [flushTranscriptPersistQueue, stopFreeSessionTick, stopFreeCountdown]);
 
   const persistPaidSessionUsage = useCallback(() => {
     if (!id || !hasFullAccess || elapsedSeconds <= 0 || sessionUsagePersistedRef.current) return;
@@ -7446,10 +7449,6 @@ export default function MeetingSession() {
         visionCaptureStreamRef.current = null;
       }
       (window as ScreenShareWindow).__zoommateVisionStream = null;
-      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
-      if (audioContextRef.current) {
-        try { audioContextRef.current.close(); } catch (e) {}
-      }
       if (transcriptPersistTimerRef.current) {
         clearTimeout(transcriptPersistTimerRef.current);
         transcriptPersistTimerRef.current = null;
@@ -7465,10 +7464,10 @@ export default function MeetingSession() {
     askStreamingQuestion(question);
   }, [askStreamingQuestion]);
 
-  const handleCopilotAsk = () => {
+  const handleCopilotAsk = useCallback(() => {
     console.log("[submit] send icon clicked");
     submitCurrentQuestion("send_icon");
-  };
+  }, [submitCurrentQuestion]);
 
   // Retry: re-sends the last interpreted question
   const handleRetry = useCallback(() => {
@@ -8097,17 +8096,74 @@ export default function MeetingSession() {
     syncScreenPreviewTargets();
   }, [screenShareLabel, syncScreenPreviewTargets, toast]);
 
-  const copyToClipboard = (text: string, responseId: string) => {
+  const copyToClipboard = useCallback((text: string, responseId: string) => {
     navigator.clipboard.writeText(text);
     setCopiedId(responseId);
     setTimeout(() => setCopiedId(null), 2000);
-  };
+  }, []);
+
+  const cancelActiveStream = useCallback(() => {
+    abortCurrentStream();
+    fetch(`/api/meetings/${id}/cancel-stream`, { method: "POST", credentials: "include" }).catch(() => {});
+  }, [abortCurrentStream, id]);
 
   const formatTime = (seconds: number) => {
     const m = Math.floor(seconds / 60);
     const s = seconds % 60;
     return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
   };
+  const freeResetText = freeResetSeconds !== null ? formatMmSs(freeResetSeconds) : "";
+  const transcriptTimerLabel = !hasFullAccess && freeSecondsRemaining !== null
+    ? `${formatMmSs(freeSecondsRemaining)} left`
+    : formatMmSs(elapsedSeconds);
+  const transcriptTimerWarning = !hasFullAccess && freeSecondsRemaining !== null && freeSecondsRemaining <= 60;
+
+  const handleSubmitManualQuestion = useCallback(() => {
+    if (!manualTypeText.trim()) return;
+    submitExplicitQuestion(manualTypeText.trim());
+    setManualTypeText("");
+  }, [manualTypeText, submitExplicitQuestion]);
+
+  const handleUpgradePricing = useCallback(() => {
+    window.location.href = "/pricing";
+  }, []);
+
+  const handleDismissUpgradeBanner = useCallback(() => {
+    setShowUpgradeBanner(false);
+  }, []);
+
+  const handleClearMultiCapture = useCallback(() => {
+    setMultiCaptureQueue([]);
+  }, []);
+
+  const handleToggleSidebarScreenShare = useCallback(() => {
+    if (isScreenShareReady) {
+      stopVisionScreenShare();
+      return;
+    }
+    handleStartScreenShare();
+  }, [isScreenShareReady, stopVisionScreenShare, handleStartScreenShare]);
+
+  const handleSelectRecentQuestion = useCallback((question: string) => {
+    setSelectedQuestionFilter(question);
+    const matchingResponse = responsesLocalRef.current.find(
+      (response) => normalizeForDedup(response.question || "") === normalizeForDedup(question),
+    );
+    if (matchingResponse) {
+      setSelectedResponseId(matchingResponse.id);
+    }
+  }, []);
+
+  const handleReanswerQuestion = useCallback((question: string) => {
+    submitExplicitQuestion(question);
+  }, [submitExplicitQuestion]);
+
+  const formatSidebarHistoryAnswer = useCallback((question: string | null | undefined, answer: string) => {
+    const normalizedQuestion = question || undefined;
+    return shouldDisplayAnswerAsCode(normalizedQuestion, answer)
+      ? enforceCodeOnlyDisplay(answer, normalizedQuestion)
+      : answer;
+  }, [shouldDisplayAnswerAsCode, enforceCodeOnlyDisplay]);
 
   if (meetingLoading) {
     return (
@@ -8161,7 +8217,7 @@ export default function MeetingSession() {
           {(streamingAnswer || pendingResponse?.answer) && (
             <div className="p-2 rounded-md border border-primary/20 text-xs bg-primary/5">
               {streamingDisplayAsCode ? (
-                <MarkdownRenderer content={enforceCodeOnlyDisplay(streamingDisplayAnswer, streamingDisplayQuestion)} className="text-xs leading-relaxed" />
+                <MarkdownRenderer content={streamingRenderedAnswer} className="text-xs leading-relaxed" />
               ) : (
                 <pre className="whitespace-pre-wrap text-xs leading-relaxed font-sans">
                   {streamingDisplayAnswer}
@@ -8450,6 +8506,27 @@ export default function MeetingSession() {
           </div>
           <div className="flex-1 flex overflow-hidden">
             <div className="w-full flex flex-col lg:flex-row overflow-hidden">
+              <SessionTranscriptPanel
+                timerLabel={transcriptTimerLabel}
+                timerWarning={transcriptTimerWarning}
+                isListening={isListening}
+                displayTranscriptSegments={displayTranscriptSegments}
+                displayTranscriptSegmentKeys={displayTranscriptSegmentKeys}
+                interimText={interimText}
+                stagedTranscriptText={stagedTranscriptText}
+                pendingTranscriptLine={pendingTranscriptLine}
+                showUpgradeBanner={showUpgradeBanner}
+                freeResetText={freeResetText}
+                lastSessionUsageMinutes={lastSessionUsageMinutes}
+                onUpgrade={handleUpgradePricing}
+                onDismissUpgradeBanner={handleDismissUpgradeBanner}
+                audioMode={audioMode}
+                onSendTranscript={handleSendTranscript}
+                onCopilotAsk={handleCopilotAsk}
+                isStreaming={isStreaming}
+                scrollRef={transcriptScrollRef}
+              />
+              {false && (
               <div
                 className="lg:w-[360px] xl:w-[400px] lg:min-w-[280px] lg:max-w-[640px] shrink-0 border-b lg:border-b-0 lg:border-r flex flex-col lg:resize-x lg:overflow-auto"
                 style={{ minHeight: 0 }}
@@ -8459,9 +8536,9 @@ export default function MeetingSession() {
                     <Eye className="w-3 h-3" />
                     Live Transcript
                     {isListening && (
-                      <span className={`font-mono text-[10px] px-1.5 py-0.5 rounded ${!hasFullAccess && freeSecondsRemaining !== null && freeSecondsRemaining <= 60 ? "bg-destructive/10 text-destructive" : "bg-muted text-muted-foreground"}`}>
+                      <span className={`font-mono text-[10px] px-1.5 py-0.5 rounded ${!hasFullAccess && (freeSecondsRemaining ?? 61) <= 60 ? "bg-destructive/10 text-destructive" : "bg-muted text-muted-foreground"}`}>
                         {!hasFullAccess && freeSecondsRemaining !== null
-                          ? `${formatMmSs(freeSecondsRemaining)} left`
+                          ? `${formatMmSs(freeSecondsRemaining ?? 0)} left`
                           : formatMmSs(elapsedSeconds)}
                       </span>
                     )}
@@ -8483,7 +8560,7 @@ export default function MeetingSession() {
                       <p className="text-xs text-muted-foreground">
                         Your 6-minute free session is over.
                         {freeResetSeconds !== null && (
-                          <> Free trial resets in {formatMmSs(freeResetSeconds)}.</>
+                          <> Free trial resets in {formatMmSs(freeResetSeconds ?? 0)}.</>
                         )}
                       </p>
                       {lastSessionUsageMinutes !== null && (
@@ -8580,7 +8657,7 @@ export default function MeetingSession() {
                           <Button
                             className="w-full text-xs h-9 bg-amber-500 hover:bg-amber-600 text-white"
                             onClick={handleFreeSession}
-                            disabled={!micGranted || (freeSecondsRemaining !== null && freeSecondsRemaining <= 0)}
+                            disabled={!micGranted || (freeSecondsRemaining ?? 1) <= 0}
                             data-testid="button-free-session"
                           >
                             <Mic className="w-3.5 h-3.5 mr-1.5" />
@@ -8592,7 +8669,7 @@ export default function MeetingSession() {
                             {(freeSecondsRemaining ?? 0) > 0
                               ? `${formatMmSs(360 - (freeSecondsRemaining ?? 0))} used - ${formatMmSs(freeSecondsRemaining ?? 0)} left`
                               : (freeResetSeconds !== null
-                                ? `Free trial resets in ${formatMmSs(freeResetSeconds)}`
+                                ? `Free trial resets in ${formatMmSs(freeResetSeconds ?? 0)}`
                                 : "Free trial used - upgrade for full access")}
                           </p>
                         )}
@@ -8617,7 +8694,7 @@ export default function MeetingSession() {
                         Start listening to capture interviewer audio.
                         {!hasFullAccess && freeSecondsRemaining !== null && (
                           <span className="block mt-1 font-medium text-primary">
-                            Free session: {formatMmSs(360 - freeSecondsRemaining)} / 6:00 used
+                            Free session: {formatMmSs(360 - (freeSecondsRemaining ?? 0))} / 6:00 used
                           </span>
                         )}
                       </p>
@@ -8744,6 +8821,7 @@ export default function MeetingSession() {
                   </p>
                 </div>
               </div>
+              )}
 
               {(meeting as any)?.sessionMode === "coding" && (
                 <div
@@ -8760,6 +8838,38 @@ export default function MeetingSession() {
                 </div>
               )}
 
+              <SessionInsightsPanel
+                isScreenShareReady={isScreenShareReady}
+                onToggleScreenShare={isScreenShareReady ? stopVisionScreenShare : handleStartScreenShare}
+                isScreenAnalyzing={isScreenAnalyzing}
+                onScreenCapture={handleScreenCapture}
+                isMultiAnalyzing={isMultiAnalyzing}
+                onAddToMultiCapture={handleAddToMultiCapture}
+                multiCaptureQueueLength={multiCaptureQueue.length}
+                onSubmitMultiScreenAnalysis={submitMultiScreenAnalysis}
+                onClearMultiCapture={handleClearMultiCapture}
+                onGenerate={handleSendTranscript}
+                generateDisabled={isStreaming || !isListening}
+                shouldShowStreamingCard={shouldShowStreamingCard}
+                isStreaming={isStreaming}
+                isAwaitingFirstChunk={isAwaitingFirstChunk}
+                streamingQuestion={streamingDisplayQuestion}
+                streamingAnswer={streamingRenderedAnswer}
+                streamingRenderAsCode={streamingDisplayAsCode}
+                isRefining={isRefining}
+                onCancelStream={cancelActiveStream}
+                selectedResponse={selectedResponse}
+                selectedResponseRenderedAnswer={selectedResponseRenderedAnswer}
+                copiedId={copiedId}
+                onDeepRerun={handleDeepRerun}
+                onCopyResponse={copyToClipboard}
+                scrollRef={scrollRef}
+                manualQuestion={manualTypeText}
+                onManualQuestionChange={setManualTypeText}
+                onSubmitManualQuestion={handleSubmitManualQuestion}
+                manualQuestionDisabled={isStreaming || !manualTypeText.trim()}
+              />
+              {false && (
               <div className="flex-1 flex flex-col overflow-hidden">
                 <div className="shrink-0 border-b px-4 py-1.5 flex items-center justify-between">
                   <div className="flex items-center gap-2">
@@ -8881,7 +8991,7 @@ export default function MeetingSession() {
                                 <div className="font-bold mb-2 text-foreground/90 pb-2 border-b border-primary/10">Q: {streamingDisplayQuestion}</div>
                               )}
                               {streamingDisplayAsCode ? (
-                                <MarkdownRenderer content={enforceCodeOnlyDisplay(streamingDisplayAnswer, streamingDisplayQuestion)} />
+                                <MarkdownRenderer content={streamingRenderedAnswer} />
                               ) : (
                                 <pre className="whitespace-pre-wrap text-sm font-sans">
                                   {streamingDisplayAnswer}
@@ -8977,7 +9087,27 @@ export default function MeetingSession() {
                   </Button>
                 </div>
               </div>
+              )}
 
+              <SessionSidebarPanel
+                isScreenShareReady={isScreenShareReady}
+                isScreenPreviewPopupOpen={isScreenPreviewPopupOpen}
+                onTogglePreviewPopup={handleToggleScreenPreviewPopup}
+                screenShareLabel={screenShareLabel}
+                screenShareThumbnail={screenShareThumbnail}
+                previewVideoRef={sharedScreenPreviewVideoRef}
+                onToggleScreenShare={handleToggleSidebarScreenShare}
+                isScreenAnalyzing={isScreenAnalyzing}
+                onScreenCapture={handleScreenCapture}
+                recentQuestions={recentQuestions}
+                selectedQuestionFilter={selectedQuestionFilter}
+                onSelectQuestion={handleSelectRecentQuestion}
+                onReanswerQuestion={handleReanswerQuestion}
+                reanswerDisabled={isStreaming}
+                responses={responsesLocal}
+                formatHistoryAnswer={formatSidebarHistoryAnswer}
+              />
+              {false && (
               <div
                 className="lg:w-[300px] xl:w-[340px] lg:min-w-[260px] lg:max-w-[560px] shrink-0 border-l flex flex-col lg:resize-x lg:overflow-auto"
                 style={{ minHeight: 0 }}
@@ -9069,6 +9199,12 @@ export default function MeetingSession() {
                           type="button"
                           onClick={() => {
                             setSelectedQuestionFilter(text);
+                            const matchingResponse = responsesLocal.find(
+                              (response) => normalizeForDedup(response.question || "") === normalizeForDedup(text),
+                            );
+                            if (matchingResponse) {
+                              setSelectedResponseId(matchingResponse.id);
+                            }
                           }}
                           className={`flex-1 text-left text-xs leading-relaxed transition-colors ${
                             normalizeForDedup(text) === normalizeForDedup(selectedQuestionFilter)
@@ -9112,6 +9248,7 @@ export default function MeetingSession() {
                   )}
                 </div>
               </div>
+              )}
 
               <AnimatePresence>
                 {showMemory && (
