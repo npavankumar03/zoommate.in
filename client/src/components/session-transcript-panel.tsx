@@ -20,6 +20,9 @@ type SessionTranscriptPanelProps = {
   timerLabel: string;
   timerWarning: boolean;
   isListening: boolean;
+  micGranted: boolean;
+  sttStatus: "idle" | "connecting" | "connected" | "error";
+  sttError: string;
   displayTranscriptSegments: string[];
   displayTranscriptSegmentKeys: string[];
   interimText: string;
@@ -31,6 +34,7 @@ type SessionTranscriptPanelProps = {
   onUpgrade: () => void;
   onDismissUpgradeBanner: () => void;
   audioMode: "mic" | "system";
+  onRequestMicPermission: () => void;
   onSendTranscript: () => void;
   onCopilotAsk: () => void;
   isStreaming: boolean;
@@ -41,6 +45,9 @@ function SessionTranscriptPanelComponent({
   timerLabel,
   timerWarning,
   isListening,
+  micGranted,
+  sttStatus,
+  sttError,
   displayTranscriptSegments,
   displayTranscriptSegmentKeys,
   interimText,
@@ -52,6 +59,7 @@ function SessionTranscriptPanelComponent({
   onUpgrade,
   onDismissUpgradeBanner,
   audioMode,
+  onRequestMicPermission,
   onSendTranscript,
   onCopilotAsk,
   isStreaming,
@@ -121,6 +129,34 @@ function SessionTranscriptPanelComponent({
             </Button>
             <Button size="sm" variant="ghost" className="w-full text-xs" onClick={onDismissUpgradeBanner}>
               Dismiss
+            </Button>
+          </div>
+        )}
+
+        {audioMode === "mic" && (
+          <div className="mb-3 rounded-lg border bg-card p-3 space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-xs font-medium">Microphone Access</p>
+              <Badge variant="secondary" className="text-[10px] h-4 px-1.5">
+                {micGranted ? sttStatus : "required"}
+              </Badge>
+            </div>
+            <p className="text-[11px] text-muted-foreground">
+              {!micGranted
+                ? "Allow microphone so Zoommate can capture your interview audio."
+                : sttError
+                  ? sttError
+                  : "If the transcript stays empty, re-check microphone access and start listening again."}
+            </p>
+            <Button
+              size="sm"
+              variant="outline"
+              className="w-full text-xs h-8"
+              onClick={onRequestMicPermission}
+              data-testid="button-grant-mic-inline"
+            >
+              <Mic className="w-3.5 h-3.5 mr-1.5" />
+              {micGranted ? "Re-check Microphone Access" : "Grant Microphone Access"}
             </Button>
           </div>
         )}

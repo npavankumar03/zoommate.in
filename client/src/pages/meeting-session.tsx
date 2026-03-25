@@ -8729,6 +8729,9 @@ export default function MeetingSession() {
                 timerLabel={transcriptTimerLabel}
                 timerWarning={transcriptTimerWarning}
                 isListening={isListening}
+                micGranted={micGranted}
+                sttStatus={sttStatus}
+                sttError={sttError}
                 displayTranscriptSegments={displayTranscriptSegments}
                 displayTranscriptSegmentKeys={displayTranscriptSegmentKeys}
                 interimText={interimText}
@@ -8740,6 +8743,7 @@ export default function MeetingSession() {
                 onUpgrade={handleUpgradePricing}
                 onDismissUpgradeBanner={handleDismissUpgradeBanner}
                 audioMode={audioMode}
+                onRequestMicPermission={() => { void handleRequestMicPermission(); }}
                 onSendTranscript={handleSendTranscript}
                 onCopilotAsk={handleCopilotAsk}
                 isStreaming={isStreaming}
