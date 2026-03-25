@@ -247,6 +247,10 @@ export class DeepgramRecognizer {
         }
         if (!this.running) return;
         this.running = false;
+        if (event.code !== 1000) {
+          const reason = event.reason ? ` reason=${event.reason}` : "";
+          this.callbacks.onError(`Deepgram connection closed unexpectedly (code=${event.code}${reason})`);
+        }
         this.callbacks.onStatusChange("disconnected");
       };
     });

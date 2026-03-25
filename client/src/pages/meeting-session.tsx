@@ -405,6 +405,9 @@ export default function MeetingSession() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const transcriptScrollRef = useRef<HTMLDivElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const stopListeningRef = useRef<() => void>(() => {});
+  const isListeningRef = useRef(false);
+  const isStoppingSttRef = useRef(false);
   const recognitionRestartCount = useRef(0);
   const recognitionAlive = useRef(true);
   const systemAudioStreamRef = useRef<MediaStream | null>(null);
@@ -3352,6 +3355,10 @@ export default function MeetingSession() {
   }, [streamingAnswer]);
 
   useEffect(() => {
+    isListeningRef.current = isListening;
+  }, [isListening]);
+
+  useEffect(() => {
     interpretedQuestionRef.current = interpretedQuestion;
   }, [interpretedQuestion]);
 
@@ -4816,6 +4823,19 @@ export default function MeetingSession() {
       } else if (status === "error" || status === "disconnected") {
         console.log(`[${providerLabel}] Status:`, status);
         setSttStatus(status === "error" ? "error" : "idle");
+        if (
+          speaker !== "candidate"
+          && status === "disconnected"
+          && isListeningRef.current
+          && !isStoppingSttRef.current
+        ) {
+          toast({
+            title: "Transcription stopped",
+            description: `${providerLabel} disconnected. Switch the transcription engine or restart listening.`,
+            variant: "destructive",
+          });
+          stopListeningRef.current();
+        }
       }
     },
   }), [handleBargeIn, updateDraftFromPartial, handleFinalTurn, toast]);
@@ -5394,6 +5414,7 @@ export default function MeetingSession() {
   }, [azureAvailable, deepgramAvailable, startAzureRecognizer, startDeepgramRecognizer, sttProvider, toast, handleFinalTurn]);
 
   const stopListening = useCallback(() => {
+    isStoppingSttRef.current = true;
     recognitionAlive.current = false;
     systemAudioAlive.current = false;
 
@@ -5464,7 +5485,12 @@ export default function MeetingSession() {
     void flushTranscriptPersistQueue();
     stopFreeSessionTick();
     stopFreeCountdown();
+    isStoppingSttRef.current = false;
   }, [flushTranscriptPersistQueue, stopFreeSessionTick, stopFreeCountdown]);
+
+  useEffect(() => {
+    stopListeningRef.current = stopListening;
+  }, [stopListening]);
 
   const persistPaidSessionUsage = useCallback(() => {
     if (!id || !hasFullAccess || elapsedSeconds <= 0 || sessionUsagePersistedRef.current) return;
