@@ -776,10 +776,21 @@ export default function MeetingSession() {
       }
     }
     if (!skipDedup && displaySegmentsRef.current.some((seg) => normalizeForDedup(seg) === nextNorm)) return;
+    const nextWords = nextNorm.split(/\s+/).filter(Boolean);
+    // Drop short incoming segments (≤2 words) that are a suffix of an existing longer segment.
+    // e.g. "yourself" arriving after "Tell me about yourself." is already in display → drop it.
+    if (nextWords.length <= 2) {
+      const isStrayOfExisting = displaySegmentsRef.current.some((seg) => {
+        const eNorm = normalizeForDedup(seg || "");
+        const eWords = eNorm.split(/\s+/).filter(Boolean);
+        if (eWords.length <= nextWords.length) return false;
+        return eWords.slice(-nextWords.length).join(" ") === nextWords.join(" ");
+      });
+      if (isStrayOfExisting) return;
+    }
     // Evict any existing short stray fragment (≤2 words) whose words all appear
     // at the tail of the incoming segment — e.g. evict "yourself" when
     // "Tell me about yourself." arrives so it doesn't wall off earlier questions.
-    const nextWords = nextNorm.split(/\s+/).filter(Boolean);
     const strayIndices: number[] = [];
     displaySegmentsRef.current.forEach((seg, i) => {
       const eNorm = normalizeForDedup(seg || "");
@@ -6290,7 +6301,9 @@ export default function MeetingSession() {
       };
     }
     if (unansweredOrdered.length > 1) {
-      const seedText = unansweredOrdered.join(" ");
+      // Join with "? " separator so server's extractInterviewerQuestions (which splits on "?")
+      // correctly identifies each question as a separate item in multi-question mode.
+      const seedText = unansweredOrdered.map(q => q.replace(/\?\s*$/, "").trim()).join("? ") + "?";
       const displayQuestion = unansweredOrdered.join(" / ");
       return { seedText, displayQuestion, source: "transcript" };
     }
@@ -6483,9 +6496,9 @@ export default function MeetingSession() {
         return { seedText: latestRawExplicit[0], displayQuestion: latestRawExplicit[0], source: "transcript" };
       }
       if (latestRawExplicit.length > 1) {
-        // Send all questions joined — server's extractInterviewerQuestions splits on "?" and
-        // builds a multiQuestionBlock so the AI answers every question, not just the last one.
-        const seedText = latestRawExplicit.join(" ");
+        // Send all questions joined with "? " separator so server's extractInterviewerQuestions
+        // (which splits on "?") correctly identifies each as a separate question.
+        const seedText = latestRawExplicit.map(q => q.replace(/\?\s*$/, "").trim()).join("? ") + "?";
         const displayQuestion = latestRawExplicit.join(" / ");
         return { seedText, displayQuestion, source: "transcript" };
       }
@@ -6617,7 +6630,7 @@ export default function MeetingSession() {
       return { seedText: latestLineExplicitQuestions[0], displayQuestion: latestLineExplicitQuestions[0], source: "transcript" };
     }
     if (latestLineExplicitQuestions.length > 1) {
-      const seedText = latestLineExplicitQuestions.join(" ");
+      const seedText = latestLineExplicitQuestions.map(q => q.replace(/\?\s*$/, "").trim()).join("? ") + "?";
       const displayQuestion = latestLineExplicitQuestions.join(" / ");
       return { seedText, displayQuestion, source: "transcript" };
     }
