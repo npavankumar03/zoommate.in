@@ -510,6 +510,8 @@ export default function MeetingSession() {
   const transcriptPersistQueueRef = useRef<Array<{ text: string; startMs?: number; endMs?: number }>>([]);
   const transcriptPersistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const firstChunkWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const streamingStuckWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastStreamingChunkAtRef = useRef<number>(0);
   const refineBufferRef = useRef<string>("");
   const interviewerQuestionMemoryRef = useRef<Array<{ text: string; answered: boolean; ts: number }>>([]);
   const spokenReplyMemoryRef = useRef<Array<{ text: string; ts: number }>>([]);
@@ -522,6 +524,10 @@ export default function MeetingSession() {
   const interimKeywordMemoryRef = useRef<Array<{ token: string; ts: number }>>([]);
   const latestPartialQuestionCandidateRef = useRef<string>("");
   const latestPartialQuestionCandidateTsRef = useRef<number>(0);
+  // ASR gap merge buffer: holds a question-start fragment ("Tell me about", "Can you explain")
+  // while waiting up to 3s for the rest of the sentence to arrive as the next ASR final.
+  const pendingGapQuestionRef = useRef<{ text: string; ts: number } | null>(null);
+  const pendingGapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // State machine: prevents duplicate triggers, noisy post-answer triggers, and races
   type InterviewState = "listening" | "partial_detected" | "answering" | "cooldown";
@@ -741,22 +747,23 @@ export default function MeetingSession() {
     setTranscriptSegmentKeys((prev) => [`${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, ...prev]);
   }, [wordOverlap]);
 
-  const upsertDisplayTranscriptSegment = useCallback((text: string) => {
+  const upsertDisplayTranscriptSegment = useCallback((text: string, skipDedup = false) => {
     const next = String(text || "").trim();
     if (!next) return;
     // Defer display updates for 300ms after an AI answer ends to prevent
     // late finals and echo bleed from visibly mutating the transcript.
-    // Instead of dropping, schedule a retry so real questions aren't lost.
-    if (lastAnswerDoneTimestampRef.current && (Date.now() - lastAnswerDoneTimestampRef.current) < 300) {
+    // Instead of dropping, schedule a retry with skipDedup=true so real questions
+    // that arrive right after an answer are never lost to the dedup check.
+    if (!skipDedup && lastAnswerDoneTimestampRef.current && (Date.now() - lastAnswerDoneTimestampRef.current) < 300) {
       const remaining = 300 - (Date.now() - lastAnswerDoneTimestampRef.current);
-      setTimeout(() => upsertDisplayTranscriptSegment(next), remaining + 10);
+      setTimeout(() => upsertDisplayTranscriptSegment(next, true), remaining + 10);
       return;
     }
     const nextNorm = normalizeForDedup(next);
     if (!nextNorm) return;
     const latestDisplay = String(displaySegmentsRef.current[0] || "").trim();
     const latestNorm = normalizeForDedup(latestDisplay);
-    if (latestNorm) {
+    if (!skipDedup && latestNorm) {
       if (latestNorm.startsWith(nextNorm) && nextNorm.length >= 8 && nextNorm.split(/\s+/).length <= latestNorm.split(/\s+/).length) {
         return;
       }
@@ -768,7 +775,7 @@ export default function MeetingSession() {
         return;
       }
     }
-    if (displaySegmentsRef.current.some((seg) => normalizeForDedup(seg) === nextNorm)) return;
+    if (!skipDedup && displaySegmentsRef.current.some((seg) => normalizeForDedup(seg) === nextNorm)) return;
     // Evict any existing short stray fragment (≤2 words) whose words all appear
     // at the tail of the incoming segment — e.g. evict "yourself" when
     // "Tell me about yourself." arrives so it doesn't wall off earlier questions.
@@ -4013,6 +4020,19 @@ export default function MeetingSession() {
           setIsAwaitingFirstChunk(true);
           triggerMetricRef.current.t_assistant_start_rendered = Date.now();
           isAwaitingFirstChunkRef.current = true;
+          lastStreamingChunkAtRef.current = Date.now();
+          // Start stuck-watchdog: if isStreaming stays true for 30s with no chunks, force-reset
+          if (streamingStuckWatchdogRef.current) clearTimeout(streamingStuckWatchdogRef.current);
+          streamingStuckWatchdogRef.current = setTimeout(() => {
+            if (lastStreamingChunkAtRef.current && (Date.now() - lastStreamingChunkAtRef.current) >= 30_000) {
+              console.warn("[ws] streaming_stuck_timeout on start — force-resetting");
+              setIsStreaming(false);
+              setIsAwaitingFirstChunk(false);
+              isAwaitingFirstChunkRef.current = false;
+              lastAnswerDoneTimestampRef.current = Date.now();
+              streamingStuckWatchdogRef.current = null;
+            }
+          }, 30_000);
           setStreamingQuestion(interpretedQuestionRef.current || "Live answer");
           setPendingResponse(null);
           setStreamingAnswer("");
@@ -4030,6 +4050,21 @@ export default function MeetingSession() {
           const chunk = String(msg.text || "");
           if (!chunk) return;
           console.log("[ws] assistant_chunk received", { requestId: msg.requestId, chars: chunk.length });
+          // Reset streaming-stuck watchdog on every chunk
+          lastStreamingChunkAtRef.current = Date.now();
+          if (streamingStuckWatchdogRef.current) {
+            clearTimeout(streamingStuckWatchdogRef.current);
+            streamingStuckWatchdogRef.current = setTimeout(() => {
+              if (lastStreamingChunkAtRef.current && (Date.now() - lastStreamingChunkAtRef.current) >= 30_000) {
+                console.warn("[ws] streaming_stuck_timeout — force-resetting streaming state");
+                setIsStreaming(false);
+                setIsAwaitingFirstChunk(false);
+                isAwaitingFirstChunkRef.current = false;
+                lastAnswerDoneTimestampRef.current = Date.now();
+                streamingStuckWatchdogRef.current = null;
+              }
+            }, 30_000);
+          }
           if (isAwaitingFirstChunkRef.current) {
             const now = Date.now();
             clearFirstChunkWatchdog();
@@ -4101,6 +4136,7 @@ export default function MeetingSession() {
               activeWsStreamIdRef.current = "";
             }
             if (cooldownTimerRef.current) clearTimeout(cooldownTimerRef.current);
+            if (streamingStuckWatchdogRef.current) { clearTimeout(streamingStuckWatchdogRef.current); streamingStuckWatchdogRef.current = null; }
             interviewStateRef.current = "listening";
             lastAnswerDoneTimestampRef.current = Date.now();
             triggerMetricRef.current = {};
@@ -4115,6 +4151,7 @@ export default function MeetingSession() {
           activeWsStreamIdRef.current = "";
           interpretedQuestionRef.current = "";
           triggerMetricRef.current.t_stream_done_rendered = Date.now();
+          if (streamingStuckWatchdogRef.current) { clearTimeout(streamingStuckWatchdogRef.current); streamingStuckWatchdogRef.current = null; }
           // Go straight back to listening ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â no cooldown delay so next question
           // from the interviewer is captured immediately after the answer ends.
           if (cooldownTimerRef.current) clearTimeout(cooldownTimerRef.current);
@@ -4696,39 +4733,84 @@ export default function MeetingSession() {
     lastFinalizedTextRef.current = trimmed;
     lastFinalizedAtRef.current = Date.now();
 
-    const isIncompleteFinal = isLikelyIncompleteFragment(trimmed) && !keepAsMeaningfulFragment;
+    // ASR gap merge: if a pending gap-question exists from within 3s, prepend it.
+    // This handles interviewer pauses (300-500ms) that split one question into two ASR finals.
+    const ASR_GAP_MERGE_MS = 3_000;
+    const QUESTION_STARTER_RE = /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are|tell|walk|explain|give|describe|share|suppose|assume)\b/i;
+    let effectiveTrimmed = trimmed;
+    if (pendingGapQuestionRef.current) {
+      const gap = pendingGapQuestionRef.current;
+      const age = Date.now() - gap.ts;
+      if (age <= ASR_GAP_MERGE_MS) {
+        // Merge: pending start + current continuation
+        const merged = `${gap.text.replace(/[,.]?\s*$/, "")} ${trimmed}`.trim();
+        effectiveTrimmed = merged;
+        console.log(`[asr-gap] merged gap fragment: "${gap.text}" + "${trimmed}" → "${merged}"`);
+      }
+      if (pendingGapTimerRef.current) clearTimeout(pendingGapTimerRef.current);
+      pendingGapQuestionRef.current = null;
+      pendingGapTimerRef.current = null;
+    }
+    const trimmed_orig = trimmed; // keep original for speaker label / conversation context
+    // Use merged text for question detection
+    const trimmedForDetect = effectiveTrimmed;
+
+    const isIncompleteFinal = isLikelyIncompleteFragment(trimmedForDetect) && !keepAsMeaningfulFragment;
+    // If fragment starts with a question-starter and is short/incomplete, park it in
+    // the gap buffer so the next ASR final can complete it.
+    const wordCount = trimmedForDetect.split(/\s+/).filter(Boolean).length;
+    const startsWithQuestionWord = QUESTION_STARTER_RE.test(trimmedForDetect);
+    if (isIncompleteFinal && startsWithQuestionWord && wordCount <= 6 && selfTalkICount === 0) {
+      if (pendingGapTimerRef.current) clearTimeout(pendingGapTimerRef.current);
+      pendingGapQuestionRef.current = { text: trimmedForDetect, ts: Date.now() };
+      pendingGapTimerRef.current = setTimeout(() => {
+        pendingGapQuestionRef.current = null;
+        pendingGapTimerRef.current = null;
+      }, ASR_GAP_MERGE_MS);
+      console.log(`[asr-gap] parked incomplete starter: "${trimmedForDetect}"`);
+    }
+
     // No "I" pronoun → very likely interviewer: use higher confidence threshold (interviewer asks direct questions);
     // when "I" is present the speaker may be the candidate, so use a lower threshold.
     const noFirstPerson = selfTalkICount === 0;
     const confidenceThreshold = noFirstPerson ? 0.6 : 0.45;
     const minWords = noFirstPerson ? 2 : 3;
-    const finalIsQuestion = (detectQuestion(trimmed) || (advanced.isQuestion && advanced.confidence >= confidenceThreshold)) && !isIncompleteFinal;
+    // Short question-starter fragments (3-8 words, no "I", not incomplete) are treated as
+    // questions even if detectQuestion scores them low — covers "What is Java?", "Tell me about Python"
+    const shortQuestionStarterBoost =
+      !isIncompleteFinal
+      && noFirstPerson
+      && wordCount >= 3
+      && wordCount <= 8
+      && startsWithQuestionWord
+      && !isLikelyNoiseSegment(trimmedForDetect);
+    const finalIsQuestion = (detectQuestion(trimmedForDetect) || (advanced.isQuestion && advanced.confidence >= confidenceThreshold) || shortQuestionStarterBoost) && !isIncompleteFinal;
     const isSubstantiveStatement = !finalIsQuestion && !isIncompleteFinal && !isLikelyNoiseSegment(trimmed) &&
       trimmed.split(/\s+/).filter(Boolean).length >= minWords;
     if (finalIsQuestion || isSubstantiveStatement) {
       pendingContinuationTopicsRef.current = [];
-      rememberBoundaryQuestionCandidate(trimmed, Date.now());
+      rememberBoundaryQuestionCandidate(trimmedForDetect, Date.now());
       interviewerQuestionMemoryRef.current = [
-        { text: trimmed, answered: false, ts: Date.now() },
+        { text: trimmedForDetect, answered: false, ts: Date.now() },
         ...interviewerQuestionMemoryRef.current,
       ].slice(0, 30);
       // Invalidate stale interpreted question when a newer transcript question arrives.
       const currentInterpreted = interpretedQuestionRef.current?.trim() || "";
       if (!currentInterpreted || levenshteinSimilarity(
         normalizeQuestionForSimilarity(currentInterpreted),
-        normalizeQuestionForSimilarity(trimmed),
+        normalizeQuestionForSimilarity(trimmedForDetect),
       ) < SIM_DEDUP_BLOCK) {
-        setInterpretedQuestion(trimmed);
+        setInterpretedQuestion(trimmedForDetect);
       }
     } else {
       if (keepAsMeaningfulFragment) {
-        rememberBoundaryQuestionCandidate(trimmed, Date.now());
+        rememberBoundaryQuestionCandidate(trimmedForDetect, Date.now());
       }
-      spokenReplyMemoryRef.current = [{ text: trimmed, ts: Date.now() }, ...spokenReplyMemoryRef.current].slice(0, 30);
+      spokenReplyMemoryRef.current = [{ text: trimmedForDetect, ts: Date.now() }, ...spokenReplyMemoryRef.current].slice(0, 30);
     }
     // No "I" and not noise → treat as interviewer in conversation context too
     const speakerLabel: "Interviewer" | "Candidate" = (finalIsQuestion || noFirstPerson) ? "Interviewer" : "Candidate";
-    appendConversationContextLine(speakerLabel, trimmed);
+    appendConversationContextLine(speakerLabel, trimmed_orig);
 
     // Stage B: reconcile speculative trigger with final transcript.
     const speculative = speculativeQuestionRef.current;
@@ -5978,11 +6060,14 @@ export default function MeetingSession() {
       }
     }
 
-    if (sourceFingerprint && isNearDuplicateAskedQuestion(sourceText)) {
+    // Enter key = explicit user intent: skip similarity-based duplicate checks.
+    // Auto-trigger modes still use dedup to prevent rapid re-firing.
+    if (mode !== "enter" && sourceFingerprint && isNearDuplicateAskedQuestion(sourceText)) {
       return null;
     }
 
-    const sameRecentTrigger = sourceFingerprint
+    const sameRecentTrigger = mode !== "enter"
+      && sourceFingerprint
       && lastTriggeredNormalizedTextRef.current
       && levenshteinSimilarity(sourceFingerprint, lastTriggeredNormalizedTextRef.current) >= SIM_DEDUP_BLOCK
       && (now - lastTriggerTimestampRef.current) <= 12000;
@@ -6161,7 +6246,13 @@ export default function MeetingSession() {
     // Collect ALL unanswered interviewer questions since the last AI answer.
     // Uses interviewerQuestionMemoryRef (not displaySegmentsRef) so candidate speech
     // segments between questions don't break the chain.
-    const sinceTs = lastAnswerDoneTimestampRef.current || 0;
+    // Grace period: subtract 8s from answer-done time so questions asked WHILE the
+    // previous answer was still streaming are not excluded. Also cap at 90s lookback
+    // so a brand-new session doesn't sweep in questions from 10+ minutes ago.
+    const rawSinceTs = lastAnswerDoneTimestampRef.current || 0;
+    const sinceTs = rawSinceTs > 0
+      ? Math.max(rawSinceTs - 8_000, Date.now() - 90_000)
+      : Date.now() - 90_000;
     const unansweredQuestions = interviewerQuestionMemoryRef.current
       .filter((q) => !q.answered && q.ts >= sinceTs)
       .map((q) => q.text.trim())
@@ -6204,7 +6295,9 @@ export default function MeetingSession() {
       return { seedText, displayQuestion, source: "transcript" };
     }
 
-    const transcriptQuestions = segmentsRef.current.filter((seg) => isStrongInterviewerQuestion(seg || ""));
+    // Limit fallback scan to the most recent 15 segments to avoid picking up questions
+    // from 10+ minutes ago. segmentsRef is newest-first so slice(0,15) = last ~2 minutes.
+    const transcriptQuestions = segmentsRef.current.slice(0, 15).filter((seg) => isStrongInterviewerQuestion(seg || ""));
     const latestTranscriptQuestion = transcriptQuestions[0] || "";
     const now = Date.now();
 
@@ -7596,13 +7689,20 @@ export default function MeetingSession() {
 
     if (
       sourceLabel !== "enter_key"
-      && 
+      &&
       seedFingerprint
       && !safeSeed.multiQuestionMode
       && !allowsSameTurnFollowup
       && isRecentDuplicateIntent(seedFingerprint, "enter", now)
     ) {
       // Silent duplicate suppression: keep current UI/stream state unchanged.
+      return;
+    }
+
+    // If Enter was pressed but no question could be resolved, preserve the existing
+    // answer display instead of blanking it or sending an empty question to the server.
+    if (!safeSeed.seedText.trim() && sourceLabel === "enter_key") {
+      console.log("[submit] Enter with no question found — preserving current answer");
       return;
     }
 
