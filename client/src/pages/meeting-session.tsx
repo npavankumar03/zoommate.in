@@ -396,6 +396,8 @@ export default function MeetingSession() {
   const lastAnswerWasCodeRef = useRef<boolean>(false);
   const lastAppendedFpRef = useRef<string>("");
   const streamingAnswerRef = useRef<string>("");
+  const wsTextQueueRef = useRef<string>("");   // WS text waiting to be smoothly revealed
+  const displayedAccRef = useRef<string>("");  // text actually revealed to UI so far
   const streamingAccumulatorRef = useRef<string>("");
   const interpretedQuestionRef = useRef<string>("");
   const streamingQuestionRef = useRef<string>("");
@@ -3829,6 +3831,28 @@ export default function MeetingSession() {
     flushStreamBuffer();
   }, [flushStreamBuffer]);
 
+  // Smooth streaming animation: drains wsTextQueueRef character-by-character at 60fps.
+  // Adaptive speed: slow typewriter feel when the buffer is small (queue nearly caught up),
+  // faster catch-up when the LLM is sending faster than 60fps can reveal.
+  const startStreamAnimation = useCallback(() => {
+    if (rafPendingRef.current) return; // animation loop already running
+    const step = () => {
+      rafPendingRef.current = null;
+      const queue = wsTextQueueRef.current;
+      if (!queue) return;
+      // Reveal 3 chars/frame normally (~180 char/s at 60fps — smooth typewriter),
+      // ramp up to 8 then 22 when the queue builds to avoid visible lag.
+      const speed = queue.length > 200 ? 22 : queue.length > 60 ? 8 : 3;
+      displayedAccRef.current += queue.slice(0, speed);
+      wsTextQueueRef.current = queue.slice(speed);
+      setStreamingAnswer(sanitizeDisplayedAnswerText(displayedAccRef.current));
+      if (wsTextQueueRef.current) {
+        rafPendingRef.current = requestAnimationFrame(step);
+      }
+    };
+    rafPendingRef.current = requestAnimationFrame(step);
+  }, [sanitizeDisplayedAnswerText]);
+
   const showOptimisticAssistantState = useCallback((questionHint?: string) => {
     setIsStreaming(true);
     setIsAwaitingFirstChunk(true);
@@ -3933,6 +3957,8 @@ export default function MeetingSession() {
           setStreamingAnswer("");
           streamBufferRef.current = "";
           streamingAccumulatorRef.current = "";
+          wsTextQueueRef.current = "";
+          displayedAccRef.current = "";
           clearStreamingRenderTimer();
           startFirstChunkWatchdog("assistant_start");
           return;
@@ -3956,21 +3982,18 @@ export default function MeetingSession() {
             const ttfb = now - tRequestSent;
             console.log(`[perf][client] ws_ttft=${now - tDetected}ms request_to_first_token=${ttfb}ms`);
             setDebugMeta((prev) => ({ ...prev, ttfb, sessionState: interviewStateRef.current }));
-            streamBufferRef.current += chunk;
-            streamingAccumulatorRef.current += streamBufferRef.current;
-            setStreamingAnswer(sanitizeDisplayedAnswerText(streamingAccumulatorRef.current));
-            streamBufferRef.current = "";
+            // First chunk: render immediately so TTFT feels instant
+            streamingAccumulatorRef.current += chunk;
+            displayedAccRef.current += chunk;
+            setStreamingAnswer(sanitizeDisplayedAnswerText(displayedAccRef.current));
             setIsAwaitingFirstChunk(false);
             isAwaitingFirstChunkRef.current = false;
             return;
           }
+          // Subsequent chunks: accumulate full WS text, queue for smooth reveal
           streamingAccumulatorRef.current += chunk;
-          if (!rafPendingRef.current) {
-            rafPendingRef.current = requestAnimationFrame(() => {
-              rafPendingRef.current = null;
-              setStreamingAnswer(sanitizeDisplayedAnswerText(streamingAccumulatorRef.current));
-            });
-          }
+          wsTextQueueRef.current += chunk;
+          startStreamAnimation();
           return;
         }
 
@@ -3984,6 +4007,11 @@ export default function MeetingSession() {
           if (flushTimerRef.current) {
             window.clearTimeout(flushTimerRef.current);
             flushTimerRef.current = null;
+          }
+          // Flush any text still in the animation queue so the full answer shows immediately
+          if (wsTextQueueRef.current) {
+            displayedAccRef.current += wsTextQueueRef.current;
+            wsTextQueueRef.current = "";
           }
           clearFirstChunkWatchdog();
           const buffered = streamBufferRef.current;
@@ -4131,6 +4159,8 @@ export default function MeetingSession() {
           if (cooldownTimerRef.current) clearTimeout(cooldownTimerRef.current);
           interviewStateRef.current = "listening";
           streamBufferRef.current = "";
+          wsTextQueueRef.current = "";
+          displayedAccRef.current = "";
           if (rafPendingRef.current) {
             cancelAnimationFrame(rafPendingRef.current);
             rafPendingRef.current = null;
@@ -8965,30 +8995,53 @@ export default function MeetingSession() {
                 >
                   {responsesLocal.length > 0 || shouldShowStreamingCard ? (
                     <div className="space-y-3">
-                      {shouldShowStreamingCard && (
-                        <div className="py-2" data-testid="card-streaming-response">
-                          {(streamingAnswer || pendingResponse?.answer) ? (
-                            <div className="text-sm leading-relaxed">
-                              {streamingDisplayAsCode ? (
-                                <MarkdownRenderer content={enforceCodeOnlyDisplay(streamingDisplayAnswer, streamingDisplayQuestion)} streaming={isStreaming} />
-                              ) : (
-                                <MarkdownRenderer content={streamingDisplayAnswer} streaming={isStreaming} />
-                              )}
-                              {isRefining
-                                ? <span className="text-[10px] text-muted-foreground ml-1 animate-pulse">Refining...</span>
-                                : <span className="inline-block w-0.5 h-4 bg-primary animate-pulse ml-0.5 align-text-bottom" />
-                              }
-                            </div>
-                          ) : (
-                            <div className="flex items-center gap-1.5 py-1" data-testid="badge-streaming-status">
-                              <span className="inline-block w-2 h-2 rounded-full bg-primary animate-bounce" style={{ animationDelay: "0ms" }} />
-                              <span className="inline-block w-2 h-2 rounded-full bg-primary animate-bounce" style={{ animationDelay: "120ms" }} />
-                              <span className="inline-block w-2 h-2 rounded-full bg-primary animate-bounce" style={{ animationDelay: "240ms" }} />
-                              <span className="text-xs text-muted-foreground ml-1">Thinking...</span>
-                            </div>
-                          )}
-                        </div>
-                      )}
+                      <AnimatePresence>
+                        {shouldShowStreamingCard && (
+                          <motion.div
+                            key="streaming-card"
+                            initial={{ opacity: 0, y: 8 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            exit={{ opacity: 0, y: -4 }}
+                            transition={{ duration: 0.18, ease: "easeOut" }}
+                            className={`relative py-2 pl-3 transition-colors ${isStreaming ? "border-l-2 border-primary/50" : "border-l-2 border-transparent"}`}
+                            data-testid="card-streaming-response"
+                          >
+                            {(streamingAnswer || pendingResponse?.answer) ? (
+                              <div className="text-sm leading-relaxed">
+                                {streamingDisplayAsCode ? (
+                                  <MarkdownRenderer content={enforceCodeOnlyDisplay(streamingDisplayAnswer, streamingDisplayQuestion)} streaming={isStreaming} />
+                                ) : (
+                                  <MarkdownRenderer content={streamingDisplayAnswer} streaming={isStreaming} />
+                                )}
+                                {isStreaming && !isRefining && (
+                                  <span className="stream-cursor" />
+                                )}
+                                {isRefining && (
+                                  <span className="text-[10px] text-primary/70 ml-1.5 font-medium tracking-wide" style={{ animation: "thinking-pulse 1.2s ease-in-out infinite" }}>refining</span>
+                                )}
+                              </div>
+                            ) : (
+                              <div className="flex items-center gap-2 py-1.5" data-testid="badge-streaming-status">
+                                <div className="flex items-center gap-1">
+                                  {[0, 1, 2].map((i) => (
+                                    <span
+                                      key={i}
+                                      className="inline-block w-1.5 h-1.5 rounded-full bg-primary"
+                                      style={{ animation: "thinking-pulse 1.2s ease-in-out infinite", animationDelay: `${i * 0.15}s` }}
+                                    />
+                                  ))}
+                                </div>
+                                <span className="text-xs text-muted-foreground">Generating answer...</span>
+                              </div>
+                            )}
+                            {isStreaming && (
+                              <div className="absolute bottom-0 left-0 right-0 h-px overflow-hidden rounded-full opacity-60">
+                                <div className="h-full bg-primary stream-shimmer-bar" />
+                              </div>
+                            )}
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
 
                       {(showResponseHistory ? responsesLocal.slice(0, 6) : responsesLocal.slice(0, 1))
                         .map((resp) => {
