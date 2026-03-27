@@ -121,8 +121,8 @@ Return ONLY valid JSON:
 
 Classification Rules:
 - Determine if interviewer asked candidate a question in this turn.
-- If yes: set is_question=true and return the single best question in question_span (clean and concise).
-- If multiple questions exist, return ONLY the LAST actionable question in question_span.
+- If yes: set is_question=true and return the best complete actionable ask in question_span (clean and concise).
+- If multiple tightly-related questions exist in the same turn, preserve all actionable parts in order inside one concise combined question_span instead of dropping earlier parts.
 - If is_question=false then question_span must be an empty string.
 - Explicitly allow missing punctuation and very short follow-ups ("Why?", "How so?", "Which one?").
 - is_question=true ONLY for questions asked BY the interviewer TO the candidate.
@@ -379,6 +379,22 @@ function selectBestQuestion(
 
   // Fallback: cleaned raw text
   return cleanRaw;
+}
+
+function combineExtractedQuestions(questions: ExtractedQuestion[]): string {
+  const deduped: string[] = [];
+  const seen = new Set<string>();
+  for (const item of questions) {
+    const text = String(item?.text || "").trim();
+    const norm = normalizeForDedup(text);
+    if (!text || !norm || seen.has(norm)) continue;
+    seen.add(norm);
+    deduped.push(text.endsWith("?") ? text : `${text}?`);
+    if (deduped.length >= 5) break;
+  }
+  if (!deduped.length) return "";
+  if (deduped.length === 1) return deduped[0];
+  return deduped.map((q, i) => `${i + 1}) ${q}`).join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -731,6 +747,35 @@ export async function runDetectionPipeline(
   }
 
   const extracted = await extractQuestionsWithLLM(rawText, recentTurns, sessionId);
+  const combinedExtracted = combineExtractedQuestions(extracted);
+  if (extracted.length > 1 && combinedExtracted) {
+    const normalizedForDedup = normalizeForDedup(combinedExtracted);
+    if (isDuplicateQuestion(sessionId, normalizedForDedup)) {
+      return {
+        isQuestion: false,
+        rawText,
+        questionSpan: combinedExtracted,
+        cleanQuestion: combinedExtracted,
+        type: classifyQuestion(extracted[extracted.length - 1]?.text || combinedExtracted),
+        confidence: Math.max(0.75, Math.min(0.95, extracted.reduce((max, q) => Math.max(max, q.confidence || 0), 0.75))),
+        notes: "Duplicate suppressed",
+        passedRuleGate: true,
+        passedLLMClassifier: true,
+      };
+    }
+
+    return {
+      isQuestion: true,
+      rawText,
+      questionSpan: combinedExtracted,
+      cleanQuestion: combinedExtracted,
+      type: classifyQuestion(extracted[extracted.length - 1]?.text || combinedExtracted),
+      confidence: Math.max(0.75, Math.min(0.95, extracted.reduce((max, q) => Math.max(max, q.confidence || 0), 0.75))),
+      notes: "Multi-question extraction fast-path",
+      passedRuleGate: true,
+      passedLLMClassifier: true,
+    };
+  }
   const fallback = (extractQuestionFromSegment(rawText) || rawText).trim();
   const candidate = selectBestQuestion(extracted, fallback, sessionFacts).trim() || fallback;
 
