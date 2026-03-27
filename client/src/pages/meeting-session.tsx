@@ -7775,6 +7775,9 @@ export default function MeetingSession() {
     if (ENTER_ONLY_ANSWER_MODE) return;
     if (!isListening || !autoAnswerEnabled) return;
     if (!transcriptSegments[0]) return;
+    // If handleFinalTurn already has a debounce pending (multi-question accumulation mode),
+    // skip this effect-based trigger entirely — the debounce will fire with all questions.
+    if (autoTriggerDebounceRef.current) return;
     void triggerQuestionExtraction("final");
   }, [transcriptSegments, isListening, autoAnswerEnabled, triggerQuestionExtraction, ENTER_ONLY_ANSWER_MODE]);
 
