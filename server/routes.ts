@@ -2775,7 +2775,8 @@ Return ONLY valid JSON. No explanation, no markdown, no code fences. Just the JS
 
       const advanced = detectQuestionAdvanced(text);
       const cleanQuestion = text.trim();
-      const isLikelyQuestion = detectQuestion(text) || (advanced.isQuestion && advanced.confidence >= 0.6);
+      // detectQuestionAdvanced is a superset of detectQuestion — use it exclusively to avoid double evaluation
+      const isLikelyQuestion = advanced.isQuestion && advanced.confidence >= 0.6;
       const normalizedTurn = text.toLowerCase().replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim();
       const isShortAck = /^(yes|yeah|yep|yup|correct|right|sure|i do|i did|absolutely|of course|exactly)$/i.test(normalizedTurn);
 

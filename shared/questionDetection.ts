@@ -101,7 +101,13 @@ export const INTERVIEW_SIGNAL_RE = /\b(your\s+(thoughts?|opinion|take|approach|p
 export const STANDALONE_TECH_RE = /\b(react|angular|vue|svelte|nextjs|nuxtjs|gatsby|remix|astro|ember|backbone|jquery|bootstrap|tailwind|tailwindcss|chakra|antd|shadcn|materialui|storybook|nodejs|node|express|fastapi|flask|django|spring|springboot|rails|laravel|aspnet|nestjs|fastify|hapi|koa|gin|echo|fiber|phoenix|sinatra|tornado|sanic|aiohttp|typescript|javascript|python|java|golang|go|rust|kotlin|swift|scala|csharp|cpp|php|ruby|dart|elixir|clojure|haskell|fsharp|julia|perl|lua|bash|powershell|shell|cobol|matlab|postgres|postgresql|mysql|sqlite|mongodb|redis|cassandra|dynamodb|elasticsearch|solr|neo4j|influxdb|cockroachdb|mariadb|oracle|sqlserver|firestore|supabase|planetscale|fauna|couchbase|hbase|aurora|aws|azure|gcp|heroku|vercel|netlify|cloudflare|digitalocean|linode|railway|render|docker|kubernetes|k8s|terraform|ansible|chef|puppet|jenkins|githubactions|gitlabci|circleci|argocd|helm|vagrant|packer|kafka|rabbitmq|sqs|sns|pubsub|nats|zeromq|activemq|celery|tensorflow|pytorch|keras|sklearn|scikit|pandas|numpy|opencv|nltk|spacy|huggingface|langchain|llamaindex|llm|gpt|bert|transformers|xgboost|lightgbm|rag|spark|hadoop|airflow|flink|databricks|snowflake|dbt|looker|tableau|powerbi|redshift|bigquery|hive|presto|trino|graphql|grpc|websocket|rest|restful|http|https|tcp|udp|mqtt|amqp|oauth|jwt|saml|openid|microservices|monolith|serverless|eventdriven|cqrs|ddd|tdd|bdd|git|github|gitlab|bitbucket|jira|confluence|figma|postman|swagger|openapi|webpack|vite|rollup|babel|eslint|prettier|devops|sre|cicd|agile|scrum|kanban|dotnet|blazor|xamarin|unity|wpf|winforms|api|sdk|cli|oop|solid|mvc|mvvm|spa|pwa|ssr|csr|cdn|dns|vpn|ssl|tls|microservice|containerization|orchestration|html|css|sass|less|json|xml|yaml|toml|markdown|linux|ubuntu|debian|centos|macos|unix|stripe|twilio|sendgrid|datadog|sentry|pagerduty|splunk|newrelic|grafana|prometheus|sqlalchemy|alembic|pydantic|nginx|apache|gunicorn|uvicorn|wipro|anthem|tcs|infosys|cognizant|accenture|capgemini|deloitte|ibm|microsoft|google|amazon|meta|apple|netflix|uber|airbnb|backend|frontend|fullstack|devops|sysadmin|architect|engineer|developer|programmer)\b|\.NET\b/i;
 
 function hasSecondPersonDeclarativeQuestionIntent(text: string): boolean {
-  return SECOND_PERSON_DECLARATIVE.test(text) && INTERVIEW_INTENT_KEYWORDS.test(text);
+  if (!SECOND_PERSON_DECLARATIVE.test(text) || !INTERVIEW_INTENT_KEYWORDS.test(text)) return false;
+  // Guard: only treat as a question if the sentence ends with "?" (direct question)
+  // OR if there is aux-verb inversion (verb before subject: "have you", "did you", "do you")
+  // — not just "you have" (subject before verb) which is a declarative statement.
+  if (/\?\s*$/.test(text)) return true;
+  if (/\b(have|has|did|do|does|is|are|was|were|can|could|would|will|should)\s+you\b/i.test(text)) return true;
+  return false;
 }
 
 function hasQuestionPunctuationSignal(text: string): boolean {
@@ -218,7 +224,8 @@ const ASR_FIXES: Array<[RegExp, string]> = [
   [/\bjson(?:\s+)?web(?:\s+)?token\b/gi, "JWT"],
   [/\boath\b/gi, "OAuth"],
   // ── Indian accent: Celery mishears (sounds like "salary") ──
-  [/\bsalary\b/gi, "Celery"],
+  // Note: /\bsalary\b/ is intentionally NOT here — it's context-guarded in ASR_CONTEXTUAL_FIXES
+  // to avoid converting real salary mentions to "Celery".
   [/\bsillary\b/gi, "Celery"],
   [/\bsel(?:e|a)ry\b/gi, "Celery"],
   [/\bsell(?:e|a)ry\b/gi, "Celery"],
@@ -429,7 +436,11 @@ export function applyAsrCorrections(raw: string): string {
   return text;
 }
 
-const FILLER_WORD_RE = /\b(uh+|um+|erm|hmm+|like|you know|sort of|kind of|basically|actually|literally|so|okay|ok)\b/g;
+// "like" is stripped only when surrounded by other fillers (um like, you know like, like um)
+// "so" is stripped only when it appears at the very start of the text as a pause filler
+const FILLER_WORD_RE = /\b(uh+|um+|erm|hmm+|you know|sort of|kind of|basically|actually|literally|okay|ok)\b/g;
+const FILLER_LIKE_RE = /\b(um+|uh+|erm|hmm+|you know)\s+like\b|\blike\s+(um+|uh+|erm|hmm+|you know)\b/gi;
+const FILLER_SO_RE = /^so\s+/i;
 const STOPWORDS = new Set([
   "a", "an", "the", "is", "are", "am", "was", "were", "be", "been", "being",
   "do", "does", "did", "to", "for", "of", "in", "on", "at", "by", "with",
@@ -438,7 +449,11 @@ const STOPWORDS = new Set([
 ]);
 
 function stripRepeatedFillers(input: string): string {
+  // Strip "like" only when flanked by other filler words (e.g. "um like", "like um")
+  // Strip "so" only when it starts the sentence as a pause filler
   return input
+    .replace(FILLER_LIKE_RE, " ")
+    .replace(FILLER_SO_RE, "")
     .replace(FILLER_WORD_RE, " ")
     .replace(/\b(\w+)(\s+\1){1,}\b/g, "$1")
     .replace(/\s+/g, " ")
@@ -524,7 +539,11 @@ export function detectQuestionAdvanced(text: string): {
   if (/\b(difference between|walk me through|tell me about|explain|what happens if|how would you)\b/.test(normalized)) score += 0.5;
   if (/\b(do you have experience|have you worked with|have you used|have you ever|are you familiar with|are you comfortable with|what was your|when did you|can you share|could you share|your experience with|your background in|your experience in|describe a time|give me an example|give an example|your thoughts on|your opinion on|your take on|your approach to|any experience with|any experience in|familiar with|comfortable with|thoughts on)\b/.test(normalized)) score += 0.35;
   // Standalone tech term with no other signals still warrants a small boost
-  if (STANDALONE_TECH_RE.test(normalized) && words.length <= 5) score += 0.3;
+  // Guard: only boost if a question word or "?" is present
+  if (STANDALONE_TECH_RE.test(normalized) && words.length <= 5) {
+    const hasQWord = /[?]\s*$/.test(normalized) || /\b(what|how|why|when|where|which|who|can|could|would|will|do|did|does|is|are|have|has|tell|explain|describe)\b/i.test(normalized);
+    if (hasQWord) score += 0.3;
+  }
 
   if (words.length > 8) score += 0.2;
   if (/\b(you|your)\b/.test(normalized)) score += 0.2;
@@ -611,7 +630,7 @@ export function detect(
   const cues: string[] = [];
   let score = 0;
 
-  if (/\?$/.test(text)) { score += 0.55; cues.push("ends_with_qmark"); }
+  if (/\?\s*$/.test(text)) { score += 0.55; cues.push("ends_with_qmark"); }
   if (hasQuestionPunctuationSignal(span) && !cues.includes("ends_with_qmark")) { score += 0.18; cues.push("punctuation_backup"); }
   if (/^(what|why|how|when|where|who|which|can|could|would|should|is|are|do|does|did|have|has|will|was|were)\b/.test(text)) {
     score += 0.45; cues.push("starts_interrogative");
@@ -620,8 +639,10 @@ export function detect(
     score += 0.35; cues.push("imperative_prompt");
   }
   // Standalone tech term (≤5 words) — "Flask", "React and Vue"
+  // Guard: only boost if the segment also contains a question word or ends with "?"
   if (STANDALONE_TECH_RE.test(text) && text.split(/\s+/).filter(Boolean).length <= 5) {
-    score += 0.3; cues.push("standalone_tech");
+    const hasQuestionWord = /\?\s*$/.test(text) || /\b(what|how|why|when|where|which|who|can|could|would|will|do|did|does|is|are|have|has|tell|explain|describe)\b/i.test(text);
+    if (hasQuestionWord) { score += 0.3; cues.push("standalone_tech"); }
   }
 
   const words = text.split(/\s+/).filter(Boolean);
@@ -651,7 +672,7 @@ export function detect(
   const confidence = Math.max(0, Math.min(1, score));
   const isQuestion = confidence >= 0.6;
   let kind: "direct" | "imperative" | "implicit" | "unknown" = "unknown";
-  if (/\?$/.test(text)) kind = "direct";
+  if (/\?\s*$/.test(text)) kind = "direct";
   else if (/\b(explain|describe|walk me through|tell me about|tell us about|talk me through|share|give me an example|compare|have you worked|have you used|have you ever|are you familiar|are you comfortable|your experience|your background|describe a time|your thoughts|your opinion|your take|your approach|any experience|familiar with|comfortable with|thoughts on|background in|knowledge of)\b/.test(text) || cues.includes("standalone_tech")) kind = "imperative";
   else if (/^(what|why|how|when|where|who|which|can|could|would|should|is|are|do|does|did|have|has|will|was|were)\b/.test(text)) kind = "implicit";
 
@@ -686,7 +707,9 @@ export function detectQuestion(text: string): boolean {
 
   const auxVerbs = ["have", "has", "was", "were", "is", "are", "do", "does", "did", "will", "shall", "may", "might", "can", "could", "would", "should"];
   if (INTERROGATIVE_STARTERS.includes(firstWord)) {
-    const minWords = auxVerbs.includes(firstWord) ? 3 : 3;
+    // Allow 2-word questions when ending with "?" (e.g. "Have you?", "Are you?")
+    const endsWithQ = normalized.endsWith("?");
+    const minWords = endsWithQ ? 2 : 3;
     if (words.length >= minWords) {
       if (auxVerbs.includes(firstWord)) {
         const secondWord = words[1] || "";
@@ -712,7 +735,11 @@ export function detectQuestion(text: string): boolean {
   if (INTERVIEW_SIGNAL_RE.test(normalized)) return true;
 
   // Standalone tech term — widened to 10 words (e.g. "tell me about your Docker experience")
-  if (words.length <= 10 && STANDALONE_TECH_RE.test(normalized)) return true;
+  // Guard: only fire if the segment also contains a question word or ends with "?"
+  if (words.length <= 10 && STANDALONE_TECH_RE.test(normalized)) {
+    const hasQuestionWord = /\?\s*$/.test(normalized) || /\b(what|how|why|when|where|which|who|can|could|would|will|do|did|does|is|are|have|has|tell|explain|describe)\b/i.test(normalized);
+    if (hasQuestionWord) return true;
+  }
 
   // Interview-intent statement without explicit question word
   // e.g. "Previous experience", "Python background", "AWS knowledge"
@@ -744,7 +771,11 @@ export function likelyContainsQuestion(text: string): boolean {
   if (INTERVIEW_SIGNAL_RE.test(normalized)) return true;
 
   // Standalone tech term (1–5 words) — interviewer says "Flask" or "React and Vue"
-  if (words.length <= 5 && STANDALONE_TECH_RE.test(normalized)) return true;
+  // Guard: only fire if the segment also contains a question word or ends with "?"
+  if (words.length <= 5 && STANDALONE_TECH_RE.test(normalized)) {
+    const hasQuestionWord = /\?\s*$/.test(normalized) || /\b(what|how|why|when|where|which|who|can|could|would|will|do|did|does|is|are|have|has|tell|explain|describe)\b/i.test(normalized);
+    if (hasQuestionWord) return true;
+  }
 
   return false;
 }

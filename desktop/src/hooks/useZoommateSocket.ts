@@ -379,7 +379,7 @@ function isLikelyIncompleteFragment(raw: string): boolean {
   const words = normalized.split(" ").filter(Boolean);
   if (words.length <= 3) return true;
   if (/\?$/.test(text)) return false;
-  if (words.length <= 6 && /\b(in|on|for|with|about|to|from|and|or|also)\s*$/.test(normalized)) return true;
+  if (words.length <= 6 && /\b(on|for|with|to|from|or|also)\s*$/.test(normalized)) return true;
   return false;
 }
 
@@ -1219,14 +1219,16 @@ export function useZoommateSocket(meetingId: string) {
           if (prevIsQlike && isContinuationTail) {
             const prevNoQ = prevNorm.replace(/\?\s*$/, "").trim();
             const stitched = `${prevNoQ} ${text}`.replace(/\s+/g, " ").trim();
-            if (detectQuestion(stitched) || detectQuestionAdvanced(stitched).confidence >= 0.5)
+            const stitchedAdv1 = detectQuestionAdvanced(stitched);
+            if (stitchedAdv1.isQuestion && stitchedAdv1.confidence >= 0.5)
               text = stitched.endsWith("?") ? stitched : `${stitched}?`;
           }
           if (text === applyAsrCorrections(raw) && prevIsQlike && curWc <= 4 && STANDALONE_TECH_RE.test(text)) {
             const prevNoQ = prevNorm.replace(/\?\s*$/, "").trim();
             const joiner  = /\b(in|with|on|for|and)\s*$/i.test(prevNoQ) ? "" : " and";
             const stitched = `${prevNoQ}${joiner} ${text}`.replace(/\s+/g, " ").trim();
-            if (detectQuestion(stitched) || detectQuestionAdvanced(stitched).confidence >= 0.5)
+            const stitchedAdv2 = detectQuestionAdvanced(stitched);
+            if (stitchedAdv2.isQuestion && stitchedAdv2.confidence >= 0.5)
               text = stitched.endsWith("?") ? stitched : `${stitched}?`;
           }
         }

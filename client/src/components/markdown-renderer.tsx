@@ -100,42 +100,18 @@ const CodeBlock = memo(function CodeBlock({ language, children }: { language: st
   );
 });
 
-// Streaming renderer — uses the same ReactMarkdown pipeline as the final render
-// so bullets, bold, code blocks all format correctly from the first token.
-const STREAMING_COMPONENTS = {
-  code({ node, className: codeClassName, children, ...props }: any) {
-    const match = /language-(\w+)/.exec(codeClassName || "");
-    const lang = match?.[1] || "";
-    const isInline = !match && !String(children).includes("\n");
-    if (/^(text|plain|plaintext)$/i.test(lang)) {
-      return <p className="mb-3 last:mb-0 whitespace-pre-wrap">{children}</p>;
-    }
-    if (isInline) {
-      return <code className="px-1 py-0.5 bg-muted rounded text-xs font-mono" {...props}>{children}</code>;
-    }
-    return <CodeBlock language={lang} children={String(children)} />;
-  },
-  p({ children }: any) { return <p className="mb-3 last:mb-0">{children}</p>; },
-  strong({ children }: any) { return <strong className="font-semibold">{children}</strong>; },
-  ul({ children }: any) { return <ul className="list-disc pl-4 mb-1.5 space-y-0.5">{children}</ul>; },
-  ol({ children }: any) { return <ol className="list-decimal pl-4 mb-1.5 space-y-0.5">{children}</ol>; },
-  li({ children }: any) { return <li className="leading-relaxed">{children}</li>; },
-  h1({ children }: any) { return <h1 className="text-base font-bold mb-1">{children}</h1>; },
-  h2({ children }: any) { return <h2 className="text-sm font-bold mb-1">{children}</h2>; },
-  h3({ children }: any) { return <h3 className="text-sm font-semibold mb-1">{children}</h3>; },
-};
-
+// Streaming renderer — plain text only, zero ReactMarkdown overhead.
+// No AST parsing = no DOM thrashing = no flicker. Markdown renders fully
+// on the committed ResponseCard after the stream ends.
 function StreamingMarkdown({ content, className }: { content: string; className?: string }) {
-  const completed = useMemo(() => {
-    const stripped = content.replace(/^[\u2026.]{1,3}\s*/, "");
-    return completePartialMarkdown(stripped);
-  }, [content]);
-
+  const text = content.replace(/^[\u2026.]{1,3}\s*/, "");
+  // Split on newlines so paragraphs / line-breaks are preserved
+  const lines = text.split("\n");
   return (
-    <div className={className} style={{ minWidth: 0, width: "100%" }}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={STREAMING_COMPONENTS}>
-        {completed}
-      </ReactMarkdown>
+    <div className={`streaming-prose${className ? ` ${className}` : ""}`} style={{ minWidth: 0, width: "100%" }}>
+      {lines.map((line, i) =>
+        line === "" ? <br key={i} /> : <span key={i} className="streaming-line">{line}{i < lines.length - 1 ? null : null}</span>
+      )}
     </div>
   );
 }

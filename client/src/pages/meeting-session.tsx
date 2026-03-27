@@ -680,10 +680,15 @@ export default function MeetingSession() {
   const STABLE_MS = 350;
   const CONTINUATION_MS = 10_000;
   const INTERIM_KEYWORD_TTL_MS = 3000;
-  const ENABLE_PARTIAL_AUTO_TRIGGER = false;
   const DUPLICATE_INTENT_WINDOW_MS = 15_000;
   const ENTER_AFTER_AUTO_SUPPRESS_MS = 5_000;
-  const ENTER_ONLY_ANSWER_MODE = true;
+  const enterOnlyAnswerModeRef = useRef(true); // useRef so it holds a stable reference across renders
+  const ENTER_ONLY_ANSWER_MODE = enterOnlyAnswerModeRef.current;
+  const SPECULATIVE_WINDOW_MS = 10_000;
+  // Named similarity threshold constants for consistency across detection logic
+  const SIM_SPECULATIVE_REUSE = 0.82;
+  const SIM_DEDUP_BLOCK = 0.85;
+  const SIM_REFINEMENT_MAX = 0.80;
   const INTERPRETED_PLACEHOLDER = "Listening for a clear speaker question. Press Enter to answer from transcript context.";
   const liveMode = isListening && socketConnected;
   const MAX_CONVERSATION_CONTEXT_LINES = 60;
@@ -818,7 +823,7 @@ export default function MeetingSession() {
     if (!fingerprint) return false;
     for (const prev of recentAutoTriggerFingerprintsRef.current) {
       if ((now - prev.ts) > 12000) continue;
-      if (levenshteinSimilarity(fingerprint, prev.fp) >= 0.85) {
+      if (levenshteinSimilarity(fingerprint, prev.fp) >= SIM_DEDUP_BLOCK) {
         return true;
       }
     }
@@ -830,7 +835,7 @@ export default function MeetingSession() {
     if (!fingerprint) return false;
     for (const prev of recentAskedFingerprintsRef.current) {
       const sim = levenshteinSimilarity(fingerprint, prev);
-      if (sim >= 0.85) return true;
+      if (sim >= SIM_DEDUP_BLOCK) return true;
     }
     return false;
   }, []);
@@ -3049,7 +3054,7 @@ export default function MeetingSession() {
     if (words.length <= 3) return true;
     if (/\?$/.test(text)) return false;
     // Only mark as incomplete if it's a short fragment ending mid-sentence (preposition/conjunction tail)
-    if (words.length <= 6 && /\b(in|on|for|with|about|to|from|and|or|also)\s*$/.test(normalized)) return true;
+    if (words.length <= 6 && /\b(on|for|with|to|from|or|also)\s*$/.test(normalized)) return true;
     return false;
   }, []);
 
@@ -3736,7 +3741,7 @@ export default function MeetingSession() {
     // full final text as the first partial of the next utterance, causing the same text to
     // appear twice ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â once in the live pulsing row and once in the committed segments list.
     if (segmentsRef.current.length > 0 && timeSinceFinal < 2000) {
-      const latestSegNorm = segmentsRef.current[0].toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+      const latestSegNorm = (segmentsRef.current[0] || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
       const draftNorm = fastDraft.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
       if (draftNorm.length > 0 && (latestSegNorm === draftNorm || latestSegNorm.startsWith(draftNorm))) return;
     }
@@ -4273,7 +4278,7 @@ export default function MeetingSession() {
           && levenshteinSimilarity(
             speculativePrepareRef.current.norm,
             normalizeQuestionForSimilarity(cleanedQuestion),
-          ) >= 0.82
+          ) >= SIM_SPECULATIVE_REUSE
             ? speculativePrepareRef.current.text
             : undefined;
         ws.send(JSON.stringify({
@@ -4333,10 +4338,12 @@ export default function MeetingSession() {
       return;
     }
 
-    // Mic-only: detect candidate self-talk — starts with "I" OR has more than 3 "I" words.
-    // Store in conversation memory for follow-up context but never trigger an answer.
+    // Mic-only heuristic: detect candidate self-talk — starts with "I" OR has many "I" words.
+    // Only apply this heuristic in mic-only mode (no speaker diarization).
+    // In system audio mode, never classify by "I" heuristic — only use explicit speaker labels.
+    // When speaker is "unknown", default to treating as interviewer (skip "I" heuristic).
     const selfTalkICount = (trimmed.match(/\bI\b/g) || []).length;
-    const isCandidateSpeech = /^i\b/i.test(trimmed.trim()) || selfTalkICount > 3;
+    const isCandidateSpeech = audioMode === "mic" && speaker !== "unknown" && (/^i\b/i.test(trimmed.trim()) || selfTalkICount > 5);
     if (isCandidateSpeech) {
       if (trimmed && isSubstantiveSegment(trimmed)) {
         appendConversationContextLine("Candidate", trimmed);
@@ -4356,16 +4363,22 @@ export default function MeetingSession() {
       detectQuestion(trimmed)
       || /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are)\b/i.test(normalizedTrimmedBase)
       || /\b(difference|compare|experience|explain|mean)\b/i.test(normalizedTrimmedBase);
+    let allowLowerThreshold = false;
     if (incompleteTail && questionLike) {
       const recovered = getRecentInterimKeywordForRestore(trimmed, Date.now());
       if (recovered) {
         trimmed = `${trimmed.replace(/\?\s*$/, "").trim()} ${recovered}`.replace(/\s+/g, " ").trim();
+      } else {
+        // Recovery failed: attempt detection on original trimmed with a lower confidence threshold
+        allowLowerThreshold = true;
       }
     }
     rememberContinuationTopics(trimmed, Date.now());
     if (pendingQuestionTailRef.current.length > 0 && trimmed) {
+      // Capture current tail before clearing timer and ref to avoid race condition
+      const capturedTail = pendingQuestionTailRef.current;
       if (pendingTailTimerRef.current) { clearTimeout(pendingTailTimerRef.current); pendingTailTimerRef.current = null; }
-      const base = pendingQuestionTailRef.current.join(" ").replace(/\?\s*$/, "").trim();
+      const base = capturedTail.join(" ").replace(/\?\s*$/, "").trim();
       trimmed = `${base} ${trimmed}`.replace(/\s+/g, " ").trim();
       pendingQuestionTailRef.current = [];
     }
@@ -4380,10 +4393,11 @@ export default function MeetingSession() {
       // treated as a joiner continuation ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â it would stitch garbage onto the question.
       const currentIsContinuationTail = /^(and|and also|also|plus|as well as|along with|including|in addition|regarding|about|specifically)\b/i.test(trimmed) && currentWordCount >= 2 && currentWordCount <= 10;
       const prevLooksFragment =
-        !detectQuestion(prevFinal) &&
         (
           /\b(about|with|on|for|to|in|of)\s*$/i.test(prevFinal)
           || /^(what|why|how|which|who|where|when|explain|describe|tell|walk|talk)\b/i.test(prevFinal)
+          // Dedicated partial-phrase patterns: these are fragments regardless of detectQuestion result
+          || /\b(tell me about|talk me through|walk me through|tell me|explain|describe|what about|how about)\s*$/i.test(prevFinal)
         );
       const prevIsQuestionLike = detectQuestion(prevFinal) || detectQuestionAdvanced(prevFinal).confidence >= 0.5;
       const currentLooksContinuation =
@@ -4408,7 +4422,7 @@ export default function MeetingSession() {
         const prevNoQ = prevFinal.replace(/\?\s*$/, "").trim();
         const stitchedTail = `${prevNoQ} ${trimmed}`.replace(/\s+/g, " ").trim();
         const stitchedTailAdv = detectQuestionAdvanced(stitchedTail);
-        if (detectQuestion(stitchedTail) || (stitchedTailAdv.isQuestion && stitchedTailAdv.confidence >= 0.5)) {
+        if (stitchedTailAdv.isQuestion && stitchedTailAdv.confidence >= 0.5) {
           trimmed = stitchedTail.endsWith("?") ? stitchedTail : `${stitchedTail}?`;
           stitchedFromFragment = true;
         }
@@ -4423,7 +4437,7 @@ export default function MeetingSession() {
         const joiner = /\b(in|with|on|for|and)\s*$/i.test(prevNoQ) ? "" : " and";
         const stitchedTopic = `${prevNoQ}${joiner} ${trimmed}`.replace(/\s+/g, " ").trim();
         const stitchedTopicAdv = detectQuestionAdvanced(stitchedTopic);
-        if (detectQuestion(stitchedTopic) || (stitchedTopicAdv.isQuestion && stitchedTopicAdv.confidence >= 0.5)) {
+        if (stitchedTopicAdv.isQuestion && stitchedTopicAdv.confidence >= 0.5) {
           trimmed = stitchedTopic.endsWith("?") ? stitchedTopic : `${stitchedTopic}?`;
           stitchedFromFragment = true;
         }
@@ -4432,7 +4446,7 @@ export default function MeetingSession() {
       if (prevLooksFragment && currentLooksContinuation && !currentIsNewQuestion) {
         const stitched = `${prevFinal} ${trimmed}`.replace(/\s+/g, " ").trim();
         const stitchedAdvanced = detectQuestionAdvanced(stitched);
-        const stitchedIsQuestion = detectQuestion(stitched) || (stitchedAdvanced.isQuestion && stitchedAdvanced.confidence >= 0.5);
+        const stitchedIsQuestion = stitchedAdvanced.isQuestion && stitchedAdvanced.confidence >= 0.5;
         if (stitchedIsQuestion) {
           trimmed = stitched;
           stitchedFromFragment = true;
@@ -4450,7 +4464,7 @@ export default function MeetingSession() {
           const joiner = /\b(in|with|on|for|and)\s*$/i.test(prevNoQ) ? "" : " and";
           const stitchedMem = `${prevNoQ}${joiner} ${trimmed}`.replace(/\s+/g, " ").trim();
           const stitchedMemAdv = detectQuestionAdvanced(stitchedMem);
-          if (detectQuestion(stitchedMem) || (stitchedMemAdv.isQuestion && stitchedMemAdv.confidence >= 0.5)) {
+          if (stitchedMemAdv.isQuestion && stitchedMemAdv.confidence >= 0.5) {
             trimmed = stitchedMem.endsWith("?") ? stitchedMem : `${stitchedMem}?`;
             stitchedFromFragment = true;
           }
@@ -4507,8 +4521,8 @@ export default function MeetingSession() {
     }
     if (
       !trimmed
-      || ((!isSubstantiveSegment(trimmed) && !maybeQ && !keepAsMeaningfulFragment))
-      || (isLikelyNoiseSegment(trimmed) && !maybeQ && !keepAsMeaningfulFragment)
+      || ((!isSubstantiveSegment(trimmed) && !maybeQ && !keepAsMeaningfulFragment && !allowLowerThreshold))
+      || (isLikelyNoiseSegment(trimmed) && !maybeQ && !keepAsMeaningfulFragment && !allowLowerThreshold)
       || (safetyGuardEnabled && isAiFeedbackLoop(trimmed))
     ) {
       // Dropped finals do NOT clear interimText ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â interimHasUnsavedContentRef stays true
@@ -4558,7 +4572,8 @@ export default function MeetingSession() {
     // Joiner phrases ("and also Flask", "and React", "also AWS") should always attach
     // to the previous line even across a long pause ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â use a 12 s window for them.
     const newSegStartsJoiner = /^(and also|and|also|plus)\b/i.test(segmentForDisplay.trim());
-    const joinerGroupingMs = newSegStartsJoiner ? 12_000 : TRANSCRIPT_GROUPING_MS;
+    const pendingSegmentIsQuestion = !!pendingTranscriptLineRef.current && detectQuestion(pendingTranscriptLineRef.current);
+    const joinerGroupingMs = (newSegStartsJoiner && pendingSegmentIsQuestion) ? 12_000 : TRANSCRIPT_GROUPING_MS;
     const combinedWordCount = `${pendingTranscriptLineRef.current} ${segmentForDisplay}`.split(/\s+/).filter(Boolean).length;
     const shouldGroupWithPending =
       pendingTranscriptLineRef.current
@@ -4625,9 +4640,10 @@ export default function MeetingSession() {
     lastFinalizedAtRef.current = Date.now();
 
     const isIncompleteFinal = isLikelyIncompleteFragment(trimmed) && !keepAsMeaningfulFragment;
-    // No "I" pronoun → very likely interviewer: lower confidence threshold so more gets detected as question
+    // No "I" pronoun → very likely interviewer: use higher confidence threshold (interviewer asks direct questions);
+    // when "I" is present the speaker may be the candidate, so use a lower threshold.
     const noFirstPerson = selfTalkICount === 0;
-    const confidenceThreshold = noFirstPerson ? 0.25 : 0.5;
+    const confidenceThreshold = noFirstPerson ? 0.6 : 0.45;
     const minWords = noFirstPerson ? 2 : 3;
     const finalIsQuestion = (detectQuestion(trimmed) || (advanced.isQuestion && advanced.confidence >= confidenceThreshold)) && !isIncompleteFinal;
     const isSubstantiveStatement = !finalIsQuestion && !isIncompleteFinal && !isLikelyNoiseSegment(trimmed) &&
@@ -4644,7 +4660,7 @@ export default function MeetingSession() {
       if (!currentInterpreted || levenshteinSimilarity(
         normalizeQuestionForSimilarity(currentInterpreted),
         normalizeQuestionForSimilarity(trimmed),
-      ) < 0.85) {
+      ) < SIM_DEDUP_BLOCK) {
         setInterpretedQuestion(trimmed);
       }
     } else {
@@ -4662,8 +4678,9 @@ export default function MeetingSession() {
     if (speculative) {
       const finalNorm = normalizeQuestionForSimilarity(trimmed);
       const similarity = finalNorm ? levenshteinSimilarity(speculative.norm, finalNorm) : 0;
-      const withinWindow = Date.now() - speculative.ts <= 12000;
-      const shouldRefine = withinWindow && !speculative.refined && similarity < 0.8 && maybeQ;
+      const elapsed = Math.max(0, Date.now() - (speculative.ts || Date.now()));
+      const withinWindow = elapsed <= SPECULATIVE_WINDOW_MS;
+      const shouldRefine = withinWindow && !speculative.refined && similarity < SIM_REFINEMENT_MAX && maybeQ;
       if (shouldRefine && !isNearDuplicateAskedQuestion(trimmed)) {
         speculative.refined = true;
         if (finalNorm) {
@@ -4672,7 +4689,10 @@ export default function MeetingSession() {
         // Do not start a second stream. Tier-1 refinement is already scheduled
         // after Tier-0 completion in the server streaming pipeline.
         setInterpretedQuestion(trimmed);
-      } else if (similarity >= 0.8 || !withinWindow) {
+      } else if (shouldRefine && isNearDuplicateAskedQuestion(trimmed)) {
+        // shouldRefine is true but it's a near-duplicate — clear to prevent deadlock
+        speculativeQuestionRef.current = null;
+      } else if (similarity >= SIM_REFINEMENT_MAX || !withinWindow) {
         speculativeQuestionRef.current = null;
       }
     }
@@ -4721,6 +4741,9 @@ export default function MeetingSession() {
             jobDescription: conversationHistory || undefined,
           },
         }));
+      } else {
+        // WS not open: reset state so it doesn't lock forever
+        interviewStateRef.current = "listening";
       }
       triggerMetricRef.current.t_request_sent = Date.now();
     }
@@ -5658,7 +5681,7 @@ export default function MeetingSession() {
       && levenshteinSimilarity(
         speculativePrepareRef.current.norm,
         normalizeQuestionForSimilarity(cleanedOverride),
-      ) >= 0.82
+      ) >= SIM_SPECULATIVE_REUSE
         ? speculativePrepareRef.current.text
         : undefined;
     ws.send(JSON.stringify({
@@ -5717,7 +5740,7 @@ export default function MeetingSession() {
     const norm = normalizeQuestionForSimilarity(cleanedQuestion);
     if (!norm) return;
     const existing = speculativePrepareRef.current;
-    if (existing && existing.norm === norm && (Date.now() - existing.ts) <= 12000) {
+    if (existing && existing.norm === norm && (Date.now() - existing.ts) <= SPECULATIVE_WINDOW_MS) {
       return;
     }
 
@@ -5759,7 +5782,7 @@ export default function MeetingSession() {
     // preposition/conjunction like "in", "with", "about"), prefer the latest final segment
     // which is the complete previous sentence, rather than sending a truncated interim.
     if (mode === "enter" && latestFinal) {
-      const endsIncomplete = /\b(in|with|on|for|to|of|at|by|from|about|and|or|that|a|an|the|is|are|was|have|has)\s*$/i.test(sourceText);
+      const endsIncomplete = /\b(with|on|for|to|of|at|by|from|or|that|a|an|the|is|are|was|have|has)\s*$/i.test(sourceText);
       if (endsIncomplete && latestFinal.split(/\s+/).filter(Boolean).length > sourceText.split(/\s+/).filter(Boolean).length) {
         sourceText = latestFinal;
       }
@@ -5862,7 +5885,7 @@ export default function MeetingSession() {
 
     const sameRecentTrigger = sourceFingerprint
       && lastTriggeredNormalizedTextRef.current
-      && levenshteinSimilarity(sourceFingerprint, lastTriggeredNormalizedTextRef.current) >= 0.85
+      && levenshteinSimilarity(sourceFingerprint, lastTriggeredNormalizedTextRef.current) >= SIM_DEDUP_BLOCK
       && (now - lastTriggerTimestampRef.current) <= 12000;
     if (sameRecentTrigger) {
       return null;
@@ -5926,7 +5949,7 @@ export default function MeetingSession() {
     if (!questionToAnswer) return null;
     const normalized = normalizeForDedup(questionToAnswer);
     const duplicateByTime = normalized === lastAnsweredQuestionHashRef.current && (now - lastAnsweredQuestionTsRef.current) <= 12000;
-    const duplicateByOverlap = lastAnsweredQuestionHashRef.current && wordOverlap(normalized, lastAnsweredQuestionHashRef.current) > 0.82 && (now - lastAnsweredQuestionTsRef.current) <= 12000;
+    const duplicateByOverlap = lastAnsweredQuestionHashRef.current && wordOverlap(normalized, lastAnsweredQuestionHashRef.current) > SIM_SPECULATIVE_REUSE && (now - lastAnsweredQuestionTsRef.current) <= 12000;
     if (duplicateByTime || duplicateByOverlap) return null;
 
     const canAutoAnswer = (mode === "enter") || (!ENTER_ONLY_ANSWER_MODE && autoAnswerEnabled);
@@ -6096,9 +6119,13 @@ export default function MeetingSession() {
     // it is a question EXTENSION to be combined with the prior transcript question, NOT a follow-up
     // on the previous AI answer. Skip follow-up detection entirely for these phrases.
     const liveStartsJoiner = /^(and\b|and also\b|also\b|plus\b|or\b)/i.test(currentLiveText.trim());
+    const hasRecentAnswerContext = lastAssistantAnswerRef.current.trim().length > 0 || responsesLocalRef.current.length > 0;
     if (currentLiveText && lastAssistantAnswerRef.current.trim() && !liveStartsJoiner) {
       const fuResult = isFollowUp(currentLiveText);
-      if (fuResult.isFollowUp) {
+      // Guard: single follow-up words like "more", "next", "proceed" should only trigger
+      // if there is a recent answered question to provide context.
+      const isSingleWordNoContext = fuResult.reason === "very_short_followup_cue" && !hasRecentAnswerContext;
+      if (fuResult.isFollowUp && !isSingleWordNoContext) {
         return {
           seedText: currentLiveText,
           displayQuestion: currentLiveText,
@@ -7577,30 +7604,6 @@ export default function MeetingSession() {
   }, []);
 
   useEffect(() => {
-    if (!ENABLE_PARTIAL_AUTO_TRIGGER) return;
-    if (ENTER_ONLY_ANSWER_MODE) return;
-    if (!isListening || !autoAnswerEnabled) return;
-    const timer = setInterval(() => {
-      const now = Date.now();
-      const draft = questionDraftRef.current.trim();
-      if (!draft) return;
-      const draftWordCount = draft.split(/\s+/).filter(Boolean).length;
-      if (draftWordCount < 1) return;
-      if (isLikelyNoiseSegment(draft)) return;
-
-      const paused = now - lastPartialTsRef.current >= AUTO_PAUSE_MS;
-      const stable = now - stableSinceTsRef.current >= STABLE_MS;
-      if (!paused || !stable) return;
-
-      void triggerQuestionExtraction("pause");
-      stableSinceTsRef.current = now;
-      lastPartialTsRef.current = now;
-    }, 200);
-
-    return () => clearInterval(timer);
-  }, [isListening, autoAnswerEnabled, triggerQuestionExtraction, ENTER_ONLY_ANSWER_MODE, ENABLE_PARTIAL_AUTO_TRIGGER, isLikelyNoiseSegment]);
-
-  useEffect(() => {
     if (!id || !isListening) return;
     const timer = setInterval(() => {
       const now = Date.now();
@@ -7613,7 +7616,7 @@ export default function MeetingSession() {
       // like a sentence tail ("one over the other", "into your application"), prefer the
       // last finalized segment so speculative starts with a complete question.
       const draftEndsIncomplete =
-        /\b(in|with|on|for|to|of|at|by|from|about|and|or|that|a|an|the|is|are|was|have|has)\s*$/i.test(draft)
+        /\b(with|on|for|to|of|at|by|from|or|that|a|an|the|is|are|was|have|has)\s*$/i.test(draft)
         || /\b(one over the other|into your application|in your application|in your project|over the other|each other|one another|than the other)\s*$/i.test(draft);
       const latestFinalForSpec = segmentsRef.current[0]?.trim();
       if (draftEndsIncomplete && latestFinalForSpec && latestFinalForSpec.split(/\s+/).filter(Boolean).length > draft.split(/\s+/).filter(Boolean).length) {
@@ -7632,7 +7635,7 @@ export default function MeetingSession() {
       const normalizedDraft = normalizeQuestionForSimilarity(draft);
       if (!normalizedDraft) return;
       const existing = speculativePrepareRef.current;
-      if (existing && existing.norm === normalizedDraft && (now - existing.ts) <= 12000) return;
+      if (existing && existing.norm === normalizedDraft && (now - existing.ts) <= SPECULATIVE_WINDOW_MS) return;
       void warmSpeculativeAnswerPath(draft);
     }, 250);
     return () => clearInterval(timer);
