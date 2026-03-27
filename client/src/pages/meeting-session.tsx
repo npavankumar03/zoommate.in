@@ -685,7 +685,7 @@ export default function MeetingSession() {
   const INTERIM_KEYWORD_TTL_MS = 3000;
   const DUPLICATE_INTENT_WINDOW_MS = 15_000;
   const ENTER_AFTER_AUTO_SUPPRESS_MS = 5_000;
-  const enterOnlyAnswerModeRef = useRef(false); // false = allow auto-trigger; true = Enter-only
+  const enterOnlyAnswerModeRef = useRef(true); // true = answers only fire on Enter key press
   const ENTER_ONLY_ANSWER_MODE = enterOnlyAnswerModeRef.current;
   const SPECULATIVE_WINDOW_MS = 10_000;
   // Named similarity threshold constants for consistency across detection logic
