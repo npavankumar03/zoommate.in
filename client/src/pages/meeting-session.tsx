@@ -6149,46 +6149,49 @@ export default function MeetingSession() {
       return s.includes("?") || QUESTION_START_RE.test(q);
     };
 
-    // Collect ALL consecutive question segments from the front of the display array
-    // (newest first). Stop as soon as we hit a non-question or candidate-speech segment
-    // so we only grab the current interviewer turn, not stale earlier questions.
+    // Collect ALL unanswered interviewer questions since the last AI answer.
+    // Uses interviewerQuestionMemoryRef (not displaySegmentsRef) so candidate speech
+    // segments between questions don't break the chain.
+    const sinceTs = lastAnswerDoneTimestampRef.current || 0;
+    const unansweredQuestions = interviewerQuestionMemoryRef.current
+      .filter((q) => !q.answered && q.ts >= sinceTs)
+      .map((q) => q.text.trim())
+      .filter(Boolean);
+    // De-duplicate by normalised text while preserving chronological order (oldest first)
+    const unansweredNormSeen = new Set<string>();
+    const unansweredOrdered: string[] = [];
+    for (const q of unansweredQuestions.slice().reverse()) {
+      const norm = normalizeForDedup(q);
+      if (!norm || unansweredNormSeen.has(norm)) continue;
+      unansweredNormSeen.add(norm);
+      unansweredOrdered.push(q);
+    }
+    // Also include the latest display question if it's not yet in memory
+    // (it may have just arrived and not been committed to memory yet).
     const CANDIDATE_SEG_RE = /^Candidate:\s+/i;
-    const consecutiveQuestions: string[] = [];
-    let straySkips = 0;
-    for (const seg of displaySegmentsRef.current.slice(0, 10)) {
+    const latestDisplayQ = displaySegmentsRef.current.find((seg) => {
       const s = String(seg || "").trim();
-      if (!s) continue;
-      if (CANDIDATE_SEG_RE.test(s)) break; // candidate spoke → end of interviewer turn
-      if (isStrongInterviewerQuestion(s) || isExplicitQuestion(s)) {
-        consecutiveQuestions.push(s);
-        straySkips = 0; // reset after finding a real question
-      } else {
-        // Allow up to 2 skips for short stray ASR fragments (e.g. "yourself", "okay", "hmm")
-        // so they don't wall off valid questions sitting behind them.
-        const wc = s.split(/\s+/).filter(Boolean).length;
-        if (wc <= 2 && straySkips < 2) {
-          straySkips++;
-        } else {
-          break;
-        }
+      return s && !CANDIDATE_SEG_RE.test(s) && (isStrongInterviewerQuestion(s) || isExplicitQuestion(s));
+    });
+    if (latestDisplayQ) {
+      const latestNorm = normalizeForDedup(latestDisplayQ);
+      if (latestNorm && !unansweredNormSeen.has(latestNorm)) {
+        unansweredOrdered.push(latestDisplayQ.trim());
       }
     }
-    if (consecutiveQuestions.length > 0) {
-      // Reverse to chronological order (oldest → newest)
-      const ordered = consecutiveQuestions.slice().reverse();
-      if (ordered.length === 1) {
-        const sanitizedVisible = rewriteMixedTopicQuestion(
-          cleanDetectedInterviewQuestion(dedupeExperienceTopics(sanitizeQuestionCandidate(ordered[0]))),
-        );
-        return {
-          seedText: sanitizedVisible || ordered[0],
-          displayQuestion: sanitizedVisible || ordered[0],
-          source: "transcript",
-        };
-      }
-      // Multiple questions in this interviewer turn — join and send all to the AI
-      const seedText = ordered.join(" ");
-      const displayQuestion = ordered.join(" / ");
+    if (unansweredOrdered.length === 1) {
+      const sanitizedVisible = rewriteMixedTopicQuestion(
+        cleanDetectedInterviewQuestion(dedupeExperienceTopics(sanitizeQuestionCandidate(unansweredOrdered[0]))),
+      );
+      return {
+        seedText: sanitizedVisible || unansweredOrdered[0],
+        displayQuestion: sanitizedVisible || unansweredOrdered[0],
+        source: "transcript",
+      };
+    }
+    if (unansweredOrdered.length > 1) {
+      const seedText = unansweredOrdered.join(" ");
+      const displayQuestion = unansweredOrdered.join(" / ");
       return { seedText, displayQuestion, source: "transcript" };
     }
 
