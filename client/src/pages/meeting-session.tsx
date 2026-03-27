@@ -446,7 +446,7 @@ export default function MeetingSession() {
   const animFrameRef = useRef<number>(0);
   const systemTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const askedQuestionsRef = useRef<string[]>([]);
-  const recentAskedFingerprintsRef = useRef<string[]>([]);
+  const recentAskedFingerprintsRef = useRef<Array<{ fp: string; ts: number }>>([]);
   const lastProcessedSegmentRef = useRef("");
   const lastSentSegmentIndexRef = useRef(-1);
   const displaySegmentsRef = useRef<string[]>([]);
@@ -685,12 +685,12 @@ export default function MeetingSession() {
   const INTERIM_KEYWORD_TTL_MS = 3000;
   const DUPLICATE_INTENT_WINDOW_MS = 15_000;
   const ENTER_AFTER_AUTO_SUPPRESS_MS = 5_000;
-  const enterOnlyAnswerModeRef = useRef(true); // useRef so it holds a stable reference across renders
+  const enterOnlyAnswerModeRef = useRef(false); // false = allow auto-trigger; true = Enter-only
   const ENTER_ONLY_ANSWER_MODE = enterOnlyAnswerModeRef.current;
   const SPECULATIVE_WINDOW_MS = 10_000;
   // Named similarity threshold constants for consistency across detection logic
   const SIM_SPECULATIVE_REUSE = 0.82;
-  const SIM_DEDUP_BLOCK = 0.85;
+  const SIM_DEDUP_BLOCK = 0.90;
   const SIM_REFINEMENT_MAX = 0.80;
   const INTERPRETED_PLACEHOLDER = "Listening for a clear speaker question. Press Enter to answer from transcript context.";
   const liveMode = isListening && socketConnected;
@@ -744,9 +744,14 @@ export default function MeetingSession() {
   const upsertDisplayTranscriptSegment = useCallback((text: string) => {
     const next = String(text || "").trim();
     if (!next) return;
-    // Suppress display updates for 300ms after an AI answer ends to prevent
+    // Defer display updates for 300ms after an AI answer ends to prevent
     // late finals and echo bleed from visibly mutating the transcript.
-    if (lastAnswerDoneTimestampRef.current && (Date.now() - lastAnswerDoneTimestampRef.current) < 300) return;
+    // Instead of dropping, schedule a retry so real questions aren't lost.
+    if (lastAnswerDoneTimestampRef.current && (Date.now() - lastAnswerDoneTimestampRef.current) < 300) {
+      const remaining = 300 - (Date.now() - lastAnswerDoneTimestampRef.current);
+      setTimeout(() => upsertDisplayTranscriptSegment(next), remaining + 10);
+      return;
+    }
     const nextNorm = normalizeForDedup(next);
     if (!nextNorm) return;
     const latestDisplay = String(displaySegmentsRef.current[0] || "").trim();
@@ -793,7 +798,8 @@ export default function MeetingSession() {
 
   const rememberAskedFingerprint = useCallback((fingerprint: string) => {
     if (!fingerprint) return;
-    const next = [fingerprint, ...recentAskedFingerprintsRef.current.filter((x) => x !== fingerprint)];
+    const now = Date.now();
+    const next = [{ fp: fingerprint, ts: now }, ...recentAskedFingerprintsRef.current.filter((x) => x.fp !== fingerprint)];
     recentAskedFingerprintsRef.current = next.slice(0, 20);
   }, []);
 
@@ -853,8 +859,11 @@ export default function MeetingSession() {
   const isNearDuplicateAskedQuestion = useCallback((text: string): boolean => {
     const fingerprint = normalizeQuestionForSimilarity(text);
     if (!fingerprint) return false;
+    const now = Date.now();
     for (const prev of recentAskedFingerprintsRef.current) {
-      const sim = levenshteinSimilarity(fingerprint, prev);
+      // Allow re-asking after 60 seconds — questions decay out of dedup
+      if ((now - prev.ts) > 60_000) continue;
+      const sim = levenshteinSimilarity(fingerprint, prev.fp);
       if (sim >= SIM_DEDUP_BLOCK) return true;
     }
     return false;
@@ -4751,7 +4760,7 @@ export default function MeetingSession() {
       && autoAnswerEnabled
       && !isStreaming
       && advanced.isQuestion
-      && advanced.confidence >= 0.65
+      && advanced.confidence >= 0.55
       && !!finalFingerprint
       && !isDuplicateRecentAutoTrigger(finalFingerprint, Date.now())
       && !isNearDuplicateAskedQuestion(trimmed)
