@@ -543,8 +543,9 @@ export default function MeetingSession() {
     t_first_token_rendered?: number;
     t_stream_done_rendered?: number;
   }>({});
-  const transcriptPersistQueueRef = useRef<Array<{ text: string; startMs?: number; endMs?: number }>>([]);
+  const transcriptPersistQueueRef = useRef<Array<{ text: string; startMs?: number; endMs?: number; speaker?: "interviewer" | "candidate" | "unknown" }>>([]);
   const transcriptPersistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const transcriptPersistInFlightRef = useRef<boolean>(false);
   const firstChunkWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const streamingStuckWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastStreamingChunkAtRef = useRef<number>(0);
@@ -4042,29 +4043,46 @@ export default function MeetingSession() {
   }, [clearFirstChunkWatchdog, toast]);
 
   const flushTranscriptPersistQueue = useCallback(async () => {
-    if (!id) return;
+    if (!id || transcriptPersistInFlightRef.current) return;
     const batch = transcriptPersistQueueRef.current.splice(0, transcriptPersistQueueRef.current.length);
     if (!batch.length) return;
-    for (const turn of batch) {
-      try {
-        await fetch(`/api/meetings/${id}/transcript-turn`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          credentials: "include",
-          body: JSON.stringify(turn),
-        });
-      } catch (e) {
-        console.error("[meeting] transcript turn persist failed", e);
+    transcriptPersistInFlightRef.current = true;
+    try {
+      for (let index = 0; index < batch.length; index += 1) {
+        const turn = batch[index];
+        try {
+          const res = await fetch(`/api/meetings/${id}/transcript-turn`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            credentials: "include",
+            body: JSON.stringify(turn),
+          });
+          if (!res.ok) {
+            throw new Error(`status=${res.status}`);
+          }
+        } catch (e) {
+          console.error("[meeting] transcript turn persist failed", e);
+          transcriptPersistQueueRef.current = batch.slice(index).concat(transcriptPersistQueueRef.current);
+          break;
+        }
+      }
+    } finally {
+      transcriptPersistInFlightRef.current = false;
+      if (transcriptPersistQueueRef.current.length > 0 && !transcriptPersistTimerRef.current) {
+        transcriptPersistTimerRef.current = setTimeout(() => {
+          transcriptPersistTimerRef.current = null;
+          void flushTranscriptPersistQueue();
+        }, 1500);
       }
     }
   }, [id]);
 
-  const scheduleTranscriptPersistFlush = useCallback(() => {
+  const scheduleTranscriptPersistFlush = useCallback((delayMs = 4000) => {
     if (transcriptPersistTimerRef.current) return;
     transcriptPersistTimerRef.current = setTimeout(() => {
       transcriptPersistTimerRef.current = null;
       void flushTranscriptPersistQueue();
-    }, 4000);
+    }, delayMs);
   }, [flushTranscriptPersistQueue]);
 
   useEffect(() => {
@@ -4572,9 +4590,9 @@ export default function MeetingSession() {
     let stitchedFromFragment = false;
     if (trimmed && prevFinal && prevFinal !== trimmed) {
       const currentWordCount = trimmed.split(/\s+/).filter(Boolean).length;
+      const enableTranscriptQuestionCarryover = false;
       // Require at least 2 words so bare noise like "And." or "And. And." is never
       // treated as a joiner continuation ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â it would stitch garbage onto the question.
-      const currentIsContinuationTail = /^(and|and also|also|plus|as well as|along with|including|in addition|regarding|about|specifically)\b/i.test(trimmed) && currentWordCount >= 2 && currentWordCount <= 10;
       const prevLooksFragment =
         (
           /\b(about|with|on|for|to|in|of)\s*$/i.test(prevFinal)
@@ -4582,7 +4600,8 @@ export default function MeetingSession() {
           // Dedicated partial-phrase patterns: these are fragments regardless of detectQuestion result
           || /\b(tell me about|talk me through|walk me through|tell me|explain|describe|what about|how about)\s*$/i.test(prevFinal)
         );
-      const prevIsQuestionLike = detectQuestion(prevFinal) || detectQuestionAdvanced(prevFinal).confidence >= 0.5;
+      const prevIsQuestionLike = enableTranscriptQuestionCarryover && (detectQuestion(prevFinal) || detectQuestionAdvanced(prevFinal).confidence >= 0.5);
+      const currentIsContinuationTail = enableTranscriptQuestionCarryover && /^(and|and also|also|plus|as well as|along with|including|in addition|regarding|about|specifically)\b/i.test(trimmed) && currentWordCount >= 2 && currentWordCount <= 10;
       const currentLooksContinuation =
         startsWithContinuationJoiner(trimmed)
         || currentWordCount <= 4;
@@ -4614,7 +4633,7 @@ export default function MeetingSession() {
       // Merge bare short tech-topic fragments (e.g. "AWS", "Django", ".NET") within 10s.
       // Also merge any very short fragment (≤3 words) arriving within 4s of a question —
       // e.g. "roughly", "at peak", "in production", "for this project".
-      const isQuickShortFragment = currentWordCount <= 3 && msSinceLastSegment <= 4_000 && !currentIsNewQuestion;
+      const isQuickShortFragment = enableTranscriptQuestionCarryover && currentWordCount <= 3 && msSinceLastSegment <= 4_000 && !currentIsNewQuestion;
       if (!stitchedFromFragment && !currentIsNewQuestion && prevIsQuestionLike && currentWordCount <= 4 && (keepAsMeaningfulFragment || isQuickShortFragment) && msSinceLastSegment <= 10_000) {
         const prevNoQ = prevFinal.replace(/\?\s*$/, "").trim();
         const joiner = /\b(in|with|on|for|and)\s*$/i.test(prevNoQ) ? "" : " and";
@@ -4626,7 +4645,7 @@ export default function MeetingSession() {
         }
       }
 
-      if (prevLooksFragment && currentLooksContinuation && !currentIsNewQuestion) {
+      if (prevLooksFragment && currentLooksContinuation && !currentIsNewQuestion && msSinceLastSegment <= 3_500) {
         const stitched = `${prevFinal} ${trimmed}`.replace(/\s+/g, " ").trim();
         const stitchedAdvanced = detectQuestionAdvanced(stitched);
         const stitchedIsQuestion = stitchedAdvanced.isQuestion && stitchedAdvanced.confidence >= 0.5;
@@ -4639,7 +4658,7 @@ export default function MeetingSession() {
       // #8 Fallback: bare tech topic + most recent unanswered question from memory.
       // Only fires when the previous question is also tech-related (has extractable topics)
       // to avoid absurd combinations like "tell me about yourself" + "java".
-      if (!stitchedFromFragment && !currentIsNewQuestion && keepAsMeaningfulFragment && meaningfulTopics.length > 0) {
+      if (enableTranscriptQuestionCarryover && !stitchedFromFragment && !currentIsNewQuestion && keepAsMeaningfulFragment && meaningfulTopics.length > 0) {
         const recentMemQ = interviewerQuestionMemoryRef.current
           .find(q => !q.answered && (Date.now() - q.ts) <= 15_000);
         if (recentMemQ && extractMeaningfulInterviewTopics(recentMemQ.text).length > 0) {
@@ -5037,18 +5056,9 @@ export default function MeetingSession() {
           audioMode,
         });
       }
-      const turn = { text: trimmed, startMs, endMs };
-      if (socketConnected) {
-        transcriptPersistQueueRef.current.push(turn);
-        scheduleTranscriptPersistFlush();
-      } else {
-        await fetch(`/api/meetings/${id}/transcript-turn`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          credentials: "include",
-          body: JSON.stringify(turn),
-        });
-      }
+      const turn = { text: trimmed, startMs, endMs, speaker };
+      transcriptPersistQueueRef.current.push(turn);
+      scheduleTranscriptPersistFlush(socketConnected ? 4000 : 250);
     } catch (e) {
       console.error("[meeting] turn finalize/detect failed", e);
     }

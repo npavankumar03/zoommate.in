@@ -2780,7 +2780,10 @@ Return ONLY valid JSON. No explanation, no markdown, no code fences. Just the JS
       const normalizedTurn = text.toLowerCase().replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim();
       const isShortAck = /^(yes|yeah|yep|yup|correct|right|sure|i do|i did|absolutely|of course|exactly)$/i.test(normalizedTurn);
 
-      const speaker = isLikelyQuestion ? "interviewer" : "candidate";
+      const requestedSpeaker = String(req.body?.speaker || "").trim().toLowerCase();
+      const speaker = requestedSpeaker === "interviewer" || requestedSpeaker === "candidate" || requestedSpeaker === "unknown"
+        ? requestedSpeaker
+        : (isLikelyQuestion ? "interviewer" : "unknown");
       const created = await storage.createTranscriptTurn({
         meetingId: req.params.id,
         turnIndex: nextTurnIndex,
@@ -2796,7 +2799,7 @@ Return ONLY valid JSON. No explanation, no markdown, no code fences. Just the JS
 
       if (isLikelyQuestion) {
         recordInterviewerQuestion(req.params.id, cleanQuestion || text);
-      } else if (isSubstantiveSegment(text) || isShortAck || text.split(/\s+/).filter(Boolean).length <= 40) {
+      } else if (speaker === "candidate" && (isSubstantiveSegment(text) || isShortAck || text.split(/\s+/).filter(Boolean).length <= 40)) {
         recordSpokenReply(req.params.id, text);
       }
 

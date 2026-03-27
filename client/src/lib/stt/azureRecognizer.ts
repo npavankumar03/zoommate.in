@@ -454,6 +454,8 @@ export class AzureRecognizer {
     if (this.audioContext?.audioWorklet) {
       void this.audioContext.audioWorklet.addModule("/pcm-processor.js").then(() => {
         if (!this.audioContext || !this.running || !this.audioStream) return;
+        const workletFrameMs = Math.max(1, Math.round((64 / this.audioContext.sampleRate) * 1000));
+        const preRollFrames = Math.max(0, Math.min(30, Math.round((this.options.preRollMs ?? 120) / workletFrameMs)));
         const workletNode = new AudioWorkletNode(this.audioContext, "pcm-processor");
         workletNode.port.postMessage({
           noiseFloor,
@@ -461,7 +463,7 @@ export class AzureRecognizer {
           maxGain: this.options.maxGain ?? 4,
           limiter: this.options.clippingThreshold ?? 0.92,
           silenceHoldFrames: this.options.silenceHoldFrames ?? 8,
-          preRollFrames: this.options.preRollFrames ?? 5,
+          preRollFrames,
         });
         workletNode.port.onmessage = (ev: MessageEvent) => {
           if (!this.audioStream || !this.running) return;
