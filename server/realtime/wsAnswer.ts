@@ -561,18 +561,32 @@ export function setupWsAnswer(httpServer: Server): void {
             }
           }
 
-          // #4: If the text isn't a clear question, wrap it so LLM infers and answers the implied question.
-          // This handles statements like "microservices and distributed systems" or "React experience" where
-          // the interviewer is implying a topic without an explicit question mark.
+          // #4: Be conservative with ambiguous transcript.
+          // Auto-triggered vague/noisy fragments should not be force-expanded into an invented question.
+          // Manual submits may still pass through literally so the user can explicitly choose to answer them.
           const isExplicitQuestion = questionForStream.includes("?") || QUESTION_WORD_RE.test(questionForStream.trim())
             || /^(tell|walk|explain|describe|share|give|talk|show|write|implement|build|create|design)\b/i.test(questionForStream.trim());
+          const isAmbiguousImplicit =
+            !isExplicitQuestion
+            && questionForStream !== "[Continue]"
+            && !questionForStream.startsWith("Continue answering:")
+            && !questionForStream.startsWith("[Continue")
+            && questionForStream.trim().length > 0
+            && (isVagueQuestion(questionForStream) || looksLikeInterviewNoise(questionForStream));
+          if (isAmbiguousImplicit && !force) {
+            console.log(`[ws/answer] suppressed_ambiguous_auto sessionId=${sessionId}`, {
+              raw: questionForStream,
+            });
+            return;
+          }
           if (!isExplicitQuestion
+            && !isAmbiguousImplicit
             && questionForStream !== "[Continue]"
             && !questionForStream.startsWith("Continue answering:")
             && !questionForStream.startsWith("[Continue")
             && questionForStream.trim().length > 0) {
-            questionForStream = `Interview context: "${questionForStream.trim()}". Infer the most likely interview question from this and give a strong first-person answer.`;
-            console.log(`[ws/answer] inferred_question sessionId=${sessionId} wrapped="${questionForStream.slice(0, 100)}"`);
+            questionForStream = `Interview topic or prompt: "${questionForStream.trim()}". Answer only what is directly supported here. Do not infer a more specific question than this text supports.`;
+            console.log(`[ws/answer] grounded_topic_prompt sessionId=${sessionId} wrapped="${questionForStream.slice(0, 120)}"`);
           }
 
           // #5: Recency amplification — boost detection of topic that appeared in last answer

@@ -55,8 +55,9 @@ const RESPONSE_STYLE_RULE = [
   "- Never invent facts, companies, years, or metrics.",
   "- Never mention being an AI assistant.",
   "- Answer directly without refusal/meta preambles.",
-  "- NEVER ask for clarification. If the question is vague or incomplete, infer the most likely intent from the recent conversation context and answer directly.",
-  "- If the transcript is ambiguous, bind your answer to the most recent interviewer topic and respond as if that topic was asked.",
+  "- Do NOT ask clarification questions in the answer.",
+  "- If the selected interviewer text is fragmentary but still answerable, answer conservatively at the literal surface level.",
+  "- Use recent conversation context only to resolve obvious follow-ups. Do not invent a more specific question than the transcript supports.",
 ].join("\n");
 
 function extractPromptProfileContext(raw: string): { resume: string; jobDescription: string } {
