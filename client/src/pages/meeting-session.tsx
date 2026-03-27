@@ -6059,17 +6059,38 @@ export default function MeetingSession() {
       return s.includes("?") || QUESTION_START_RE.test(q);
     };
 
-    const latestVisibleQuestion =
-      displaySegmentsRef.current.find((seg) => isStrongInterviewerQuestion(seg || "") || isExplicitQuestion(seg || "")) || "";
-    if (latestVisibleQuestion) {
-      const sanitizedVisible = rewriteMixedTopicQuestion(
-        cleanDetectedInterviewQuestion(dedupeExperienceTopics(sanitizeQuestionCandidate(latestVisibleQuestion))),
-      );
-      return {
-        seedText: sanitizedVisible || latestVisibleQuestion,
-        displayQuestion: sanitizedVisible || latestVisibleQuestion,
-        source: "transcript",
-      };
+    // Collect ALL consecutive question segments from the front of the display array
+    // (newest first). Stop as soon as we hit a non-question or candidate-speech segment
+    // so we only grab the current interviewer turn, not stale earlier questions.
+    const CANDIDATE_SEG_RE = /^Candidate:\s+/i;
+    const consecutiveQuestions: string[] = [];
+    for (const seg of displaySegmentsRef.current.slice(0, 8)) {
+      const s = String(seg || "").trim();
+      if (!s) continue;
+      if (CANDIDATE_SEG_RE.test(s)) break; // candidate spoke → end of interviewer turn
+      if (isStrongInterviewerQuestion(s) || isExplicitQuestion(s)) {
+        consecutiveQuestions.push(s);
+      } else {
+        break;
+      }
+    }
+    if (consecutiveQuestions.length > 0) {
+      // Reverse to chronological order (oldest → newest)
+      const ordered = consecutiveQuestions.slice().reverse();
+      if (ordered.length === 1) {
+        const sanitizedVisible = rewriteMixedTopicQuestion(
+          cleanDetectedInterviewQuestion(dedupeExperienceTopics(sanitizeQuestionCandidate(ordered[0]))),
+        );
+        return {
+          seedText: sanitizedVisible || ordered[0],
+          displayQuestion: sanitizedVisible || ordered[0],
+          source: "transcript",
+        };
+      }
+      // Multiple questions in this interviewer turn — join and send all to the AI
+      const seedText = ordered.join(" ");
+      const displayQuestion = ordered.join(" / ");
+      return { seedText, displayQuestion, source: "transcript" };
     }
 
     const transcriptQuestions = segmentsRef.current.filter((seg) => isStrongInterviewerQuestion(seg || ""));
