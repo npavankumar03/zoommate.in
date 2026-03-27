@@ -761,6 +761,23 @@ export default function MeetingSession() {
       }
     }
     if (displaySegmentsRef.current.some((seg) => normalizeForDedup(seg) === nextNorm)) return;
+    // Evict any existing short stray fragment (≤2 words) whose words all appear
+    // at the tail of the incoming segment — e.g. evict "yourself" when
+    // "Tell me about yourself." arrives so it doesn't wall off earlier questions.
+    const nextWords = nextNorm.split(/\s+/).filter(Boolean);
+    const strayIndices: number[] = [];
+    displaySegmentsRef.current.forEach((seg, i) => {
+      const eNorm = normalizeForDedup(seg || "");
+      const eWords = eNorm.split(/\s+/).filter(Boolean);
+      if (eWords.length >= 1 && eWords.length <= 2) {
+        const tail = nextWords.slice(-eWords.length);
+        if (tail.join(" ") === eWords.join(" ")) strayIndices.push(i);
+      }
+    });
+    if (strayIndices.length > 0) {
+      displaySegmentsRef.current = displaySegmentsRef.current.filter((_, i) => !strayIndices.includes(i));
+      displaySegmentKeysRef.current = displaySegmentKeysRef.current.filter((_, i) => !strayIndices.includes(i));
+    }
     displaySegmentsRef.current = [next, ...displaySegmentsRef.current];
     displaySegmentKeysRef.current = [`${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, ...displaySegmentKeysRef.current];
     setDisplayTranscriptSegments([...displaySegmentsRef.current]);
@@ -2714,7 +2731,7 @@ export default function MeetingSession() {
     if (!last) return false;
     if ((now - last.ts) > DUPLICATE_INTENT_WINDOW_MS) return false;
     const sim = levenshteinSimilarity(fingerprint, last.fp);
-    if (sim < 0.88) return false;
+    if (sim < 0.92) return false; // raised from 0.88 — rephrased questions at ~85-91% similarity now pass through
     if (mode === "enter" && last.mode !== "enter" && (now - last.ts) <= ENTER_AFTER_AUTO_SUPPRESS_MS) {
       return true;
     }
@@ -2808,6 +2825,8 @@ export default function MeetingSession() {
     const buildQuestionFromMeaningfulFragment = useCallback((raw: string): string => {
       const fragment = String(raw || "")
         .replace(/^(and also|and|also|plus|as well as|along with|including|in addition)\b\s*/i, "")
+        // Strip leading pause fillers: "So…", "Hmm…", "Okay…", "Right…", "Well…"
+        .replace(/^(so|hmm|hm|okay|ok|right|well|uh|um|ah|now)\b[\s\u2026,.]+/i, "")
         .replace(/[?.,;:!]+$/g, "")
         .replace(/\b(and also)(?:\s+\1)+\b/gi, "and also")
         .replace(/\b(and)(?:\s+and)+\b/gi, "and")
@@ -2859,6 +2878,32 @@ export default function MeetingSession() {
     if (/\byour name\b/i.test(v)) return "What is your name?";
     if (/^(what|why|how|when|where|who|which)\b/i.test(v)) {
       return fragment.endsWith("?") ? fragment : `${fragment}?`;
+    }
+
+    // Resume-pointer: "I see Node.js here", "You mentioned microservices", "Looking at your X"
+    const resumeMatch = v.match(/^(i see|you mentioned|looking at your|looking at|i noticed|i notice|i see that|you said)\s+(.+)/i);
+    if (resumeMatch) {
+      const topic = (resumeMatch[2] || "")
+        .replace(/\b(here|there|on your resume|in your profile|on the resume)\s*\.?\s*$/i, "")
+        .trim();
+      if (topic) {
+        const aliasedTopic = normalizeInterviewTopicLabel(topic);
+        if (isLikelyInterviewTopic(aliasedTopic)) return `Can you tell me more about your experience with ${aliasedTopic}?`;
+        return `Can you elaborate on ${topic}?`;
+      }
+    }
+
+    // Declarative pushback: "That sounds expensive", "But that seems risky", "That's a lot"
+    if (/^(that|this|but that|but this)\b.{0,40}\b(sounds|seems|looks|appears|feels|is|was)\b/i.test(v) && !fragment.includes("?")) {
+      const concern = fragment.replace(/^but\s+/i, "").trim();
+      return `${concern} — how would you address or justify that?`;
+    }
+
+    // Broad-to-narrow instruction: "Focus on X", "Just talk about X", "Only discuss X"
+    const narrowMatch = v.match(/^(?:focus on|just (?:talk about|focus on|discuss|explain)|only (?:talk about|discuss|explain)|concentrate on|stick to|narrow down to)\s+(.+)/i);
+    if (narrowMatch) {
+      const topic = (narrowMatch[1] || "").trim();
+      if (topic) return `Focus specifically on ${topic} — explain that part in detail.`;
     }
 
     const aliased = normalizeInterviewTopicLabel(fragment);
@@ -5992,7 +6037,7 @@ export default function MeetingSession() {
     const LONG_CONTINUATION_MS = 30_000;
     const PARTIAL_CANDIDATE_TTL_MS = 6_000;
     const REOPEN_CUE_RE = /\b(coming back to|as asked earlier|again about|revisit)\b/i;
-    const QUESTION_START_RE = /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are|tell|walk|explain)\b/i;
+    const QUESTION_START_RE = /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are|tell|walk|explain|give|describe|share|suppose|assume)\b/i;
     // resolveEnterSeed is always called from the Enter key path.
     // Keep hybrid follow-up bundling conservative to avoid packaging noisy transcript into one prompt.
     const maybeWrapHybridFollowups = (baseQuestion: string): { seedText: string; displayQuestion: string; source: "transcript"; multiQuestionMode?: boolean } | null => {
@@ -6041,7 +6086,7 @@ export default function MeetingSession() {
       const chunks = line.includes("?")
         ? line.split("?").map((p) => p.trim()).filter(Boolean).map((p) => `${p}?`)
         : line
-          .split(/(?=\b(?:what|why|how|when|where|who|which|do you|does|did|can you|could you|would you|have you|has|is|are|tell me|walk me|explain)\b)/gi)
+          .split(/(?=\b(?:what|why|how|when|where|who|which|do you|does|did|can you|could you|would you|have you|has|is|are|tell me|walk me|explain|give me|describe|share|suppose|assume)\b)/gi)
           .map((p) => p.trim())
           .filter(Boolean);
       return chunks.filter((chunk) => {
@@ -6064,14 +6109,23 @@ export default function MeetingSession() {
     // so we only grab the current interviewer turn, not stale earlier questions.
     const CANDIDATE_SEG_RE = /^Candidate:\s+/i;
     const consecutiveQuestions: string[] = [];
-    for (const seg of displaySegmentsRef.current.slice(0, 8)) {
+    let straySkips = 0;
+    for (const seg of displaySegmentsRef.current.slice(0, 10)) {
       const s = String(seg || "").trim();
       if (!s) continue;
       if (CANDIDATE_SEG_RE.test(s)) break; // candidate spoke → end of interviewer turn
       if (isStrongInterviewerQuestion(s) || isExplicitQuestion(s)) {
         consecutiveQuestions.push(s);
+        straySkips = 0; // reset after finding a real question
       } else {
-        break;
+        // Allow up to 2 skips for short stray ASR fragments (e.g. "yourself", "okay", "hmm")
+        // so they don't wall off valid questions sitting behind them.
+        const wc = s.split(/\s+/).filter(Boolean).length;
+        if (wc <= 2 && straySkips < 2) {
+          straySkips++;
+        } else {
+          break;
+        }
       }
     }
     if (consecutiveQuestions.length > 0) {

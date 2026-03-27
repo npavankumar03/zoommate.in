@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/npava/.claude/**)",
+      "Read(//c/Users/npava/.claude/plugins/**)",
+      "Bash(git clone:*)",
+      "Bash(npm run:*)",
+      "Bash(xargs grep:*)",
+      "Bash(npx tsc:*)",
+      "Bash(python3:*)",
+      "Bash(python3 -c \"print\\(repr\\(b''\\\\\\\\b''\\)\\)\")",
+      "Bash(python3 -c \"print\\(repr\\(b''\\\\b''\\)\\)\")"
+    ]
+  }
+}
