@@ -292,7 +292,7 @@ export function ReadingPane({
           </>
         ) : (
           <p style={{ color: "rgba(255,255,255,0.18)", fontSize: "12px" }}>
-            {isPaused ? "Detection paused — press Space to resume." : "Waiting for interviewer question…"}
+            {isPaused ? "Detection paused — press Space to resume." : "Waiting for speaker question…"}
           </p>
         )}
       </div>

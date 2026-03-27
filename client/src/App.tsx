@@ -6,7 +6,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { ThemeProvider } from "@/lib/theme-provider";
 import NotFound from "@/pages/not-found";
 import Landing from "@/pages/landing";
-import { LoginPage, SignupPage, VerifyEmailPage } from "@/pages/auth";
+import { LoginPage, SignupPage } from "@/pages/auth";
 import Dashboard from "@/pages/dashboard";
 import MeetingSession from "@/pages/meeting-session";
 import AdminPanel from "@/pages/admin";
@@ -20,7 +20,6 @@ function Router() {
       <Route path="/" component={Landing} />
       <Route path="/login" component={LoginPage} />
       <Route path="/signup" component={SignupPage} />
-      <Route path="/verify-email" component={VerifyEmailPage} />
       <Route path="/dashboard" component={Dashboard} />
       <Route path="/meeting/:id" component={MeetingSession} />
       <Route path="/session/:id" component={SessionDetail} />

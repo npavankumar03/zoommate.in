@@ -19,7 +19,6 @@ export const users = pgTable("users", {
   password: text("password").notNull().default(""),
   googleId: text("google_id").unique(),
   email: text("email"),
-  emailVerified: boolean("email_verified").notNull().default(false),
   firstName: text("first_name"),
   lastName: text("last_name"),
   role: text("role").notNull().default("user"),
@@ -33,16 +32,6 @@ export const users = pgTable("users", {
   lastLoginAt: timestamp("last_login_at"),
   practiceWindowStart: timestamp("practice_window_start"),
   practiceMinutesUsed: integer("practice_minutes_used").notNull().default(0),
-  createdAt: timestamp("created_at").defaultNow(),
-});
-
-export const emailVerificationCodes = pgTable("email_verification_codes", {
-  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
-  userId: varchar("user_id").notNull(),
-  email: text("email").notNull(),
-  code: text("code").notNull(),
-  expiresAt: timestamp("expires_at").notNull(),
-  attempts: integer("attempts").notNull().default(0),
   createdAt: timestamp("created_at").defaultNow(),
 });
 
@@ -410,4 +399,3 @@ export type LLMCallMetric = typeof llmCallMetrics.$inferSelect;
 export type InsertLLMCallMetric = z.infer<typeof insertLLMCallMetricsSchema>;
 export type TranscriptTurn = typeof transcriptTurns.$inferSelect;
 export type InsertTranscriptTurn = z.infer<typeof insertTranscriptTurnSchema>;
-export type EmailVerificationCode = typeof emailVerificationCodes.$inferSelect;

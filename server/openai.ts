@@ -8,17 +8,15 @@ export { getAvailableModels } from "./llmRouter";
 
 function resolveVisionModel(model: string | undefined | null): string {
   const value = String(model || "").trim();
-  if (!value || value === "automatic") return "gpt-4o-mini";
+  if (!value || value === "automatic") return "gpt-4o";
   return value;
 }
 
 function resolveFastCodingVisionModel(model: string | undefined | null): string {
   const value = String(model || "").trim();
-  if (!value || value === "automatic") return "gpt-4o-mini";
-  // Keep coding screen capture on the low-latency vision path unless a mini-tier model
-  // was already selected explicitly.
-  if (/mini/i.test(value)) return value;
-  return "gpt-4o-mini";
+  // gpt-4o reads code in screenshots far better than gpt-4o-mini
+  if (!value || value === "automatic") return "gpt-4o";
+  return value;
 }
 
 export async function generateResponse(
@@ -190,7 +188,7 @@ Use only the currently visible screen as the source of truth. Provide a clear, a
         },
       ],
       ...(useMaxCompletionTokens(config.model) ? { max_completion_tokens: 2048 } : { max_tokens: 2048 }),
-      ...(supportsTemperature(config.model) ? { temperature: 0.7 } : {}),
+      ...(supportsTemperature(config.model) ? { temperature: 0.4 } : {}),
     }),
   });
 
@@ -293,7 +291,7 @@ Use only the currently visible screen as the source of truth. Provide a clear, a
         },
       ],
       ...(useMaxCompletionTokens(config.model) ? { max_completion_tokens: 2048 } : { max_tokens: 2048 }),
-      ...(supportsTemperature(config.model) ? { temperature: 0.7 } : {}),
+      ...(supportsTemperature(config.model) ? { temperature: 0.4 } : {}),
     }),
   });
 
@@ -400,7 +398,7 @@ ${documentContext ? `\n\nUser's background: ${documentContext}` : ""}${liveTrans
         { role: "user", content: userContent },
       ],
       ...(useMaxCompletionTokens(config.model) ? { max_completion_tokens: 3000 } : { max_tokens: 3000 }),
-      ...(supportsTemperature(config.model) ? { temperature: 0.7 } : {}),
+      ...(supportsTemperature(config.model) ? { temperature: 0.4 } : {}),
     }),
   });
 
@@ -432,59 +430,5 @@ ${documentContext ? `\n\nUser's background: ${documentContext}` : ""}${liveTrans
         } catch {}
       }
     }
-  }
-}
-
-export async function extractQuestionsWithLLM(transcript: string, model?: string): Promise<string[]> {
-  const defaultModel = await storage.getSetting("default_model");
-  const selectedModel = model || defaultModel || "gpt-4o-mini";
-  const config = await resolveLLMConfig(selectedModel);
-
-  const systemPrompt = `You are a transcript processor. Extract the core technical or behavioral questions from this messy audio transcript. Ignore filler words, stuttering, and rhetorical questions. 
-Return ONLY a valid JSON object with a single key "questions" containing an array of strings: {"questions": ["Question 1?", "Question 2?"]}. 
-If there are no substantive questions found, output {"questions": []}.`;
-
-  try {
-    if (config.provider === "gemini") {
-      const client = new GoogleGenerativeAI(config.apiKey);
-      const genModel = client.getGenerativeModel({
-        model: config.model,
-        systemInstruction: systemPrompt,
-        generationConfig: { responseMimeType: "application/json" }
-      });
-      const result = await genModel.generateContent(transcript || " ");
-      const text = result.response.text();
-      const parsed = JSON.parse(text);
-      return Array.isArray(parsed.questions) ? parsed.questions : [];
-    }
-
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${config.apiKey}`,
-      },
-      body: JSON.stringify({
-        model: config.model,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: transcript || " " },
-        ],
-        response_format: { type: "json_object" },
-        ...(useMaxCompletionTokens(config.model) ? { max_completion_tokens: 500 } : { max_tokens: 500 }),
-      }),
-    });
-
-    if (!response.ok) {
-      throw new Error(`OpenAI API error (${response.status})`);
-    }
-
-    const result = await response.json();
-    const content = result.choices?.[0]?.message?.content || '{"questions": []}';
-    const parsed = JSON.parse(content);
-    return Array.isArray(parsed.questions) ? parsed.questions : [];
-  } catch (err: any) {
-    console.error("[extractQuestionsWithLLM] Failed:", err);
-    return []; // Return empty array to fallback gracefully
   }
 }

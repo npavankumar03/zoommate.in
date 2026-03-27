@@ -325,8 +325,29 @@ export function buildInterviewerIntelligenceBlock(
 ): string {
   const history = getRecentQuestionHistory(meetingId, maxHistory);
   const patterns = summarizeInterviewerPatterns(meetingId);
-  const relevantPairs = selectRelevantQAPairs(meetingId, activeQuestion, 2, 700);
+  const relevantPairs = selectRelevantQAPairs(meetingId, activeQuestion, 3, 1200);
   const parts: string[] = [];
+
+  // Detect if current question was already answered (similarity >= 0.45)
+  const s = stateBySession.get(meetingId);
+  let previouslyAnsweredPair: QAPair | null = null;
+  if (s && s.qaPairs.length) {
+    const scored = s.qaPairs
+      .map((pair) => ({ pair, score: scoreSimilarity(activeQuestion, pair.q) }))
+      .filter((item) => item.score >= 0.45)
+      .sort((a, b) => b.score - a.score);
+    if (scored.length) previouslyAnsweredPair = scored[0].pair;
+  }
+
+  if (previouslyAnsweredPair) {
+    parts.push(
+      [
+        "⚠ REPEAT/FOLLOW-UP DETECTED — INSTRUCTION: Do NOT give the same answer again.",
+        "Build on what was said, go deeper, add a new angle, or acknowledge the prior answer briefly then expand.",
+        `Prior answer to a similar question: "${previouslyAnsweredPair.a.slice(0, 400)}${previouslyAnsweredPair.a.length > 400 ? "..." : ""}"`,
+      ].join("\n"),
+    );
+  }
 
   if (history.length) {
     parts.push(

@@ -92,10 +92,6 @@ function rangeLabel(count: number, noun: string) {
   return `Showing 1-${count} of ${count} ${noun}`;
 }
 
-function isUserUploadDocument(doc: Pick<Document, "type">) {
-  return doc.type !== "session_review" && doc.type !== "past_answers";
-}
-
 function AccountCenterDialog({
   user,
   open,
@@ -538,7 +534,7 @@ function DashboardHeader() {
 }
 
 const meetingTypes = [
-  { value: "interview", label: "Job Interview", icon: GraduationCap, desc: "General interview preparation" },
+  { value: "interview", label: "Job Meeting", icon: GraduationCap, desc: "General meeting preparation" },
   { value: "behavioral", label: "Behavioral", icon: Users, desc: "Behavioral & situational questions" },
   { value: "technical", label: "Technical", icon: Code, desc: "Technical & coding interviews" },
   { value: "sales", label: "Sales Call", icon: Briefcase, desc: "Client demos and sales presentations" },
@@ -759,12 +755,12 @@ function AssistantEditorDialog({
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="quick">Quick Interview (Recommended)</SelectItem>
+                    <SelectItem value="quick">Quick Meeting (Recommended)</SelectItem>
                     <SelectItem value="standard">Standard</SelectItem>
                   </SelectContent>
                 </Select>
                 <p className="text-xs text-muted-foreground">
-                  In Quick Interview mode, Target Role and Experience are required.
+                  In Quick Meeting mode, Target Role and Experience are required.
                 </p>
               </div>
 
@@ -874,7 +870,6 @@ function NewMeetingDialog({ hasCredits, onNeedCredits }: { hasCredits?: boolean;
   const { data: documents = [] } = useQuery<Document[]>({
     queryKey: ["/api/documents"],
   });
-  const uploadedDocuments = documents.filter(isUserUploadDocument);
 
   const [selectedDocs, setSelectedDocs] = useState<string[]>([]);
 
@@ -1019,12 +1014,12 @@ function NewMeetingDialog({ hasCredits, onNeedCredits }: { hasCredits?: boolean;
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="quick">Quick Interview (Recommended)</SelectItem>
+                    <SelectItem value="quick">Quick Meeting (Recommended)</SelectItem>
                     <SelectItem value="standard">Standard</SelectItem>
                   </SelectContent>
                 </Select>
                 <p className="text-xs text-muted-foreground">
-                  In Quick Interview mode, Target Role and Experience are required.
+                  In Quick Meeting mode, Target Role and Experience are required.
                 </p>
               </div>
 
@@ -1078,11 +1073,11 @@ function NewMeetingDialog({ hasCredits, onNeedCredits }: { hasCredits?: boolean;
           <div className="space-y-2">
             <Label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Additional Config</Label>
             <div className="space-y-3 rounded-md border p-3 bg-muted/10">
-              {uploadedDocuments.length > 0 && (
+              {documents.length > 0 && (
                 <div className="space-y-1.5">
                   <Label>Materials</Label>
                   <div className="space-y-2 max-h-32 overflow-y-auto">
-                    {uploadedDocuments.map((doc) => (
+                    {documents.map((doc) => (
                       <div
                         key={doc.id}
                         onClick={() => toggleDoc(doc.id)}
@@ -1366,7 +1361,7 @@ function MeetingsTab() {
         <Card className="p-12 text-center">
           <Mic className="w-12 h-12 mx-auto text-muted-foreground/30 mb-4" />
           <h3 className="font-semibold mb-1">No sessions yet</h3>
-          <p className="text-sm text-muted-foreground mb-4">Start your first AI-assisted interview session</p>
+          <p className="text-sm text-muted-foreground mb-4">Start your first AI-assisted meeting session</p>
           <NewMeetingDialog />
         </Card>
       )}
@@ -1435,7 +1430,6 @@ function DocumentsTab() {
   const { data: documents = [], isLoading } = useQuery<Document[]>({
     queryKey: ["/api/documents"],
   });
-  const uploadedDocuments = documents.filter(isUserUploadDocument);
 
   const deleteMutation = useMutation({
     mutationFn: async (id: string) => {
@@ -1461,9 +1455,9 @@ function DocumentsTab() {
 
   return (
     <div className="space-y-4">
-      {uploadedDocuments.length > 0 ? (
+      {documents.length > 0 ? (
         <div className="space-y-2">
-          {uploadedDocuments.map((doc) => (
+          {documents.map((doc) => (
             <Card key={doc.id} className="p-4" data-testid={`card-doc-${doc.id}`}>
               <div className="flex items-center justify-between gap-4 flex-wrap">
                 <div className="flex items-center gap-3 min-w-0">
@@ -1503,8 +1497,6 @@ function DocumentsTab() {
 function BillingTab() {
   const { toast } = useToast();
   const [portalLoading, setPortalLoading] = useState(false);
-  const [standardCheckoutLoading, setStandardCheckoutLoading] = useState(false);
-  const [selectedHours, setSelectedHours] = useState(1);
 
   const { data: user } = useQuery<{ id: string; plan: string; stripeCustomerId: string | null; stripeSubscriptionId: string | null }>({
     queryKey: ["/api/auth/me"],
@@ -1547,175 +1539,136 @@ function BillingTab() {
 
   const currentPlan = subscriptionData?.plan || user?.plan || "free";
   const hasSubscription = !!subscriptionData?.subscription;
-  const enterpriseProduct = products.find((p: any) =>
-    p.metadata && typeof p.metadata === "object" && (p.metadata as any).plan === "enterprise"
-  );
-  const enterprisePriceId = enterpriseProduct?.prices?.[0]?.id;
-  const standardMinutes = selectedHours * 60;
-  const standardTotalCents = resolveMinutePrice(standardMinutes);
-
-  const handleBuyStandard = async () => {
-    setStandardCheckoutLoading(true);
-    try {
-      const res = await apiRequest("POST", "/api/stripe/minutes-checkout", { minutes: standardMinutes });
-      const data = await res.json();
-      if (!data.url) {
-        throw new Error("Checkout session was not created");
-      }
-      window.location.href = data.url;
-    } catch (error: any) {
-      toast({ title: "Failed to start checkout", description: error.message, variant: "destructive" });
-    } finally {
-      setStandardCheckoutLoading(false);
-    }
-  };
 
   return (
     <div className="space-y-6">
       <Card className="p-6">
-        <div className="flex items-center justify-between gap-4 flex-wrap">
+        <div className="flex items-center justify-between gap-4 mb-4 flex-wrap">
           <div>
             <h3 className="font-semibold flex items-center gap-2">
               <CreditCard className="w-4 h-4 text-primary" />
-              Billing
+              Current Plan
             </h3>
-            <p className="text-sm text-muted-foreground mt-1">Standard billing follows the same pricing as the minutes section: {formatCurrency(resolveMinutePrice(60))} per hour.</p>
+            <p className="text-sm text-muted-foreground mt-1">Manage your subscription and billing</p>
           </div>
           <Badge variant={currentPlan === "free" ? "secondary" : "default"} className="text-sm capitalize" data-testid="badge-current-plan">
             {currentPlan}
           </Badge>
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mt-6">
-          <div className="rounded-md border p-4 bg-muted/10">
-            <p className="text-xs uppercase tracking-wider text-muted-foreground">Current Plan</p>
-            <p className="text-2xl font-bold mt-1 capitalize">{currentPlan}</p>
-          </div>
-          <div className="rounded-md border p-4 bg-muted/10">
-            <p className="text-xs uppercase tracking-wider text-muted-foreground">Free Tier</p>
-            <p className="text-2xl font-bold mt-1">5 min/hr</p>
-          </div>
-          <div className="rounded-md border p-4 bg-muted/10">
-            <p className="text-xs uppercase tracking-wider text-muted-foreground">Enterprise</p>
-            <p className="text-2xl font-bold mt-1">$699/mo</p>
-          </div>
-        </div>
-      </Card>
-
-      <Card className="p-6 space-y-6" data-testid="card-billing-standard">
-        <div>
-          <h3 className="text-xl font-semibold">Standard</h3>
-          <p className="text-sm text-muted-foreground mt-1">Buy time in hourly blocks using the same pricing as the minutes section.</p>
-        </div>
-
-        <div className="space-y-3">
-          <Label>Select Hours</Label>
-          <div className="flex items-center rounded-md border overflow-hidden max-w-xl">
-            <Button
-              type="button"
-              variant="ghost"
-              className="rounded-none px-5"
-              onClick={() => setSelectedHours((value) => Math.max(1, value - 1))}
-              data-testid="button-billing-hours-minus"
-            >
-              <Minus className="w-4 h-4" />
-            </Button>
-            <div className="flex-1 text-center text-2xl font-semibold py-3 border-x">
-              {selectedHours} {selectedHours === 1 ? "hour" : "hours"}
-            </div>
-            <Button
-              type="button"
-              variant="ghost"
-              className="rounded-none px-5"
-              onClick={() => setSelectedHours((value) => value + 1)}
-              data-testid="button-billing-hours-plus"
-            >
-              <Plus className="w-4 h-4" />
-            </Button>
-          </div>
-          <div className="flex gap-3 flex-wrap">
-            {[1, 5, 10].map((hours) => (
+        {hasSubscription && (
+          <div className="p-4 border rounded-md mb-4">
+            <div className="flex items-center justify-between gap-4 flex-wrap">
+              <div>
+                <p className="text-sm font-medium">Active Subscription</p>
+                <p className="text-xs text-muted-foreground">
+                  Status: {subscriptionData?.subscription?.status || "active"}
+                </p>
+              </div>
               <Button
-                key={hours}
-                type="button"
-                variant={selectedHours === hours ? "default" : "outline"}
-                onClick={() => setSelectedHours(hours)}
-                data-testid={`button-billing-hours-preset-${hours}`}
+                variant="outline"
+                size="sm"
+                onClick={handleManageBilling}
+                disabled={portalLoading}
+                data-testid="button-manage-billing"
               >
-                {hours} {hours === 1 ? "hour" : "hours"}
+                {portalLoading ? <Loader2 className="w-4 h-4 animate-spin mr-1" /> : <ExternalLink className="w-4 h-4 mr-1" />}
+                Manage Billing
               </Button>
-            ))}
-          </div>
-        </div>
-
-        <Card className="p-5 bg-muted/10">
-          <div className="space-y-4">
-            <h4 className="font-semibold flex items-center gap-2">
-              <CreditCard className="w-4 h-4 text-primary" />
-              Standard Summary
-            </h4>
-            <div className="space-y-3 text-sm">
-              <div className="flex items-center justify-between border-b pb-3">
-                <span className="text-muted-foreground">Time</span>
-                <span>{selectedHours} {selectedHours === 1 ? "hour" : "hours"} ({standardMinutes} minutes)</span>
-              </div>
-              <div className="flex items-center justify-between border-b pb-3">
-                <span className="text-muted-foreground">Per hour</span>
-                <span>{formatCurrency(resolveMinutePrice(60))}</span>
-              </div>
-              <div className="flex items-center justify-between font-semibold text-base">
-                <span>Total</span>
-                <span className="text-green-600">{formatCurrency(standardTotalCents)}</span>
-              </div>
             </div>
           </div>
-        </Card>
+        )}
 
-        <Button onClick={handleBuyStandard} disabled={standardCheckoutLoading} data-testid="button-buy-standard-hours">
-          {standardCheckoutLoading ? (
-            <>
-              <Loader2 className="w-4 h-4 animate-spin mr-2" />
-              Redirecting...
-            </>
-          ) : (
-            <>Buy {selectedHours} {selectedHours === 1 ? "hour" : "hours"}</>
-          )}
-        </Button>
-      </Card>
-
-      <Card className="p-6 space-y-6" data-testid="card-billing-enterprise">
-        <div className="flex items-start justify-between gap-4 flex-wrap">
-          <div>
-            <h3 className="text-xl font-semibold">Enterprise</h3>
-            <p className="text-sm text-muted-foreground mt-1">$699/month for unlimited hours, team access, and dedicated support.</p>
+        {!hasSubscription && currentPlan === "free" && (
+          <div className="p-4 border rounded-md border-dashed mb-4">
+            <p className="text-sm text-muted-foreground">You're on the free plan with 5 minutes per hour. Upgrade to unlock unlimited usage.</p>
           </div>
-          <Badge>Unlimited</Badge>
-        </div>
-
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-          {["Unlimited hours", "Team members", "Dedicated support"].map((feature) => (
-            <div key={feature} className="rounded-md border p-4 bg-muted/10 text-sm text-muted-foreground flex items-center gap-2">
-              <Zap className="w-4 h-4 text-primary shrink-0" />
-              <span>{feature}</span>
-            </div>
-          ))}
-        </div>
-
-        {currentPlan === "enterprise" && hasSubscription ? (
-          <Button variant="outline" onClick={handleManageBilling} disabled={portalLoading} data-testid="button-manage-enterprise">
-            {portalLoading ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : <ExternalLink className="w-4 h-4 mr-2" />}
-            Manage Billing
-          </Button>
-        ) : enterprisePriceId ? (
-          <Button onClick={() => handleSubscribe(enterprisePriceId)} data-testid="button-upgrade-enterprise">
-            Upgrade to Enterprise
-          </Button>
-        ) : (
-          <Button disabled data-testid="button-loading-enterprise">
-            Loading...
-          </Button>
         )}
       </Card>
+
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        {[
+          {
+            name: "Free",
+            price: "$0",
+            period: "forever",
+            desc: "5 minutes per hour",
+            plan: "free",
+            features: ["Real-time Transcription", "AI Responses", "Screen Analyzer"],
+          },
+          {
+            name: "Standard",
+            price: "$14.99",
+            period: "/month",
+            desc: "Unlimited usage",
+            plan: "standard",
+            popular: true,
+            features: ["Everything in Free", "Priority Support", "Minutes never expire"],
+          },
+          {
+            name: "Enterprise",
+            price: "$49.99",
+            period: "/month",
+            desc: "Team features",
+            plan: "enterprise",
+            features: ["Everything in Standard", "Team members", "Dedicated support"],
+          },
+        ].map((tier) => {
+          const isCurrentPlan = currentPlan === tier.plan;
+          const product = products.find((p: any) =>
+            p.metadata && typeof p.metadata === 'object' && (p.metadata as any).plan === tier.plan
+          );
+          const priceId = product?.prices?.[0]?.id;
+
+          return (
+            <Card key={tier.plan} className={`p-5 flex flex-col ${isCurrentPlan ? "border-primary" : ""}`} data-testid={`card-billing-${tier.plan}`}>
+              <div className="mb-4">
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <h4 className="font-semibold">{tier.name}</h4>
+                  {isCurrentPlan && <Badge variant="secondary" className="text-xs">Current</Badge>}
+                  {tier.popular && !isCurrentPlan && <Badge className="text-xs">Popular</Badge>}
+                </div>
+                <div className="flex items-baseline gap-1 mt-2 flex-wrap">
+                  <span className="text-2xl font-bold">{tier.price}</span>
+                  {tier.period !== "forever" && <span className="text-sm text-muted-foreground">{tier.period}</span>}
+                </div>
+                <p className="text-xs text-muted-foreground mt-1">{tier.desc}</p>
+              </div>
+              <ul className="space-y-2 flex-1 mb-4">
+                {tier.features.map((f, i) => (
+                  <li key={i} className="flex items-center gap-2 text-xs text-muted-foreground">
+                    <Zap className="w-3 h-3 text-primary shrink-0" />
+                    {f}
+                  </li>
+                ))}
+              </ul>
+              {isCurrentPlan ? (
+                hasSubscription ? (
+                  <Button variant="outline" size="sm" onClick={handleManageBilling} disabled={portalLoading} data-testid={`button-manage-${tier.plan}`}>
+                    Manage
+                  </Button>
+                ) : (
+                  <Button variant="outline" size="sm" disabled data-testid={`button-current-${tier.plan}`}>
+                    Current Plan
+                  </Button>
+                )
+              ) : tier.plan === "free" ? (
+                <Button variant="outline" size="sm" disabled data-testid={`button-free-${tier.plan}`}>
+                  Free Tier
+                </Button>
+              ) : priceId ? (
+                <Button size="sm" onClick={() => handleSubscribe(priceId)} data-testid={`button-upgrade-${tier.plan}`}>
+                  Upgrade
+                </Button>
+              ) : (
+                <Button size="sm" disabled data-testid={`button-loading-${tier.plan}`}>
+                  Loading...
+                </Button>
+              )}
+            </Card>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -2137,13 +2090,10 @@ export default function Dashboard() {
     queryKey: ["/api/auth/me"],
   });
 
-  const remainingPaidMinutes = Math.max(
-    0,
-    (me?.minutesPurchased ?? 0) + (me?.referralCredits ?? 0) - (me?.minutesUsed ?? 0),
-  );
   const hasCredits = !!(
     (me?.plan && me.plan !== "free") ||
-    remainingPaidMinutes > 0 ||
+    ((me?.minutesPurchased ?? 0) > (me?.minutesUsed ?? 0)) ||
+    ((me?.referralCredits ?? 0) > 0) ||
     me?.role === "admin"
   );
 
@@ -2243,19 +2193,19 @@ export default function Dashboard() {
                 </div>
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2 mb-1">
-                    <p className="font-semibold text-sm">Quick Interview</p>
+                    <p className="font-semibold text-sm">Quick Meeting</p>
                     <Badge variant="secondary" className="text-[10px] px-1.5 py-0">Live</Badge>
                   </div>
-                  <p className="text-xs text-muted-foreground leading-snug">Jump straight into a real-time interview session with AI assistance.</p>
+                  <p className="text-xs text-muted-foreground leading-snug">Jump straight into a real-time meeting session with AI assistance.</p>
                   <div className="flex gap-2 mt-3 flex-wrap">
                     <Button size="sm" className="h-7 text-xs px-3" disabled={quickLaunchMutation.isPending || freeSessionMutation.isPending}
-                      onClick={() => handleQuickLaunch({ title: "Quick Interview", sessionMode: "interview" })}>
+                      onClick={() => handleQuickLaunch({ title: "Quick Meeting", sessionMode: "interview" })}>
                       {quickLaunchMutation.isPending ? <Loader2 className="w-3 h-3 mr-1 animate-spin" /> : null}
                       Start Session
                     </Button>
                     <Button size="sm" variant="outline" className="h-7 text-xs px-3 text-amber-600 border-amber-500/40 hover:bg-amber-500/10"
                       disabled={quickLaunchMutation.isPending || freeSessionMutation.isPending}
-                      onClick={() => handleFreeSession({ title: "Quick Interview", sessionMode: "interview" })}>
+                      onClick={() => handleFreeSession({ title: "Quick Meeting", sessionMode: "interview" })}>
                       {freeSessionMutation.isPending ? <Loader2 className="w-3 h-3 mr-1 animate-spin" /> : null}
                       Free Session
                     </Button>
@@ -2275,7 +2225,7 @@ export default function Dashboard() {
                     <p className="font-semibold text-sm">Practice Mode</p>
                     <Badge variant="outline" className="text-[10px] px-1.5 py-0 border-amber-500/40 text-amber-600">6 min free / 30 min</Badge>
                   </div>
-                  <p className="text-xs text-muted-foreground leading-snug">Practice interviews for free — 6 minutes every 30 minutes, no credit needed.</p>
+                  <p className="text-xs text-muted-foreground leading-snug">Practice meetings for free — 6 minutes every 30 minutes, no credit needed.</p>
                   <div className="flex gap-2 mt-3 flex-wrap">
                     <Button size="sm" className="h-7 text-xs px-3" disabled={quickLaunchMutation.isPending || freeSessionMutation.isPending}
                       onClick={() => handleQuickLaunch({ title: "Practice Session", sessionMode: "interview", isPractice: true })}>
@@ -2299,18 +2249,18 @@ export default function Dashboard() {
                 </div>
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2 mb-1">
-                    <p className="font-semibold text-sm">Phone Interview</p>
+                    <p className="font-semibold text-sm">Phone Meeting</p>
                     <Badge variant="secondary" className="text-[10px] px-1.5 py-0">Mic only</Badge>
                   </div>
-                  <p className="text-xs text-muted-foreground leading-snug">Optimized for phone or audio-only interviews — mic input, no screen required.</p>
+                  <p className="text-xs text-muted-foreground leading-snug">Optimized for phone or audio-only meetings — mic input, no screen required.</p>
                   <div className="flex gap-2 mt-3 flex-wrap">
                     <Button size="sm" className="h-7 text-xs px-3" disabled={quickLaunchMutation.isPending || freeSessionMutation.isPending}
-                      onClick={() => handleQuickLaunch({ title: "Phone Interview", sessionMode: "phone" })}>
+                      onClick={() => handleQuickLaunch({ title: "Phone Meeting", sessionMode: "phone" })}>
                       Start Session
                     </Button>
                     <Button size="sm" variant="outline" className="h-7 text-xs px-3 text-amber-600 border-amber-500/40 hover:bg-amber-500/10"
                       disabled={quickLaunchMutation.isPending || freeSessionMutation.isPending}
-                      onClick={() => handleFreeSession({ title: "Phone Interview", sessionMode: "phone" })}>
+                      onClick={() => handleFreeSession({ title: "Phone Meeting", sessionMode: "phone" })}>
                       Free Session
                     </Button>
                   </div>

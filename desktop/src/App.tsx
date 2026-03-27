@@ -7,10 +7,12 @@ import { bridge, type User } from "./lib/bridge";
 type View = "login" | "settings" | "overlay";
 
 export default function App() {
-  const [view, setView]       = useState<View>("login");
-  const [user, setUser]       = useState<User | null>(null);
+  const [view, setView]           = useState<View>("login");
+  const [user, setUser]           = useState<User | null>(null);
   const [meetingId, setMeetingId] = useState<string | null>(null);
-  const [checking, setChecking]  = useState(true);
+  const [assistantName, setAssistantName] = useState<string>("General Meeting");
+  const [opacity, setOpacity]     = useState(0.92);
+  const [checking, setChecking]   = useState(true);
 
   // On startup check if we still have a valid session (WebView2 cookie persists)
   useEffect(() => {
@@ -80,8 +82,10 @@ export default function App() {
     return (
       <SettingsPanel
         user={user}
-        onStartSession={(id) => {
+        onStartSession={(id, name, op) => {
           setMeetingId(id);
+          setAssistantName(name);
+          setOpacity(op);
           setView("overlay");
         }}
         onLogout={async () => {
@@ -99,6 +103,8 @@ export default function App() {
     <OverlayWindow
       meetingId={meetingId}
       onOpenSettings={() => setView("settings")}
+      assistantName={assistantName}
+      opacity={opacity}
     />
   );
 }

@@ -55,7 +55,11 @@ export async function streamAssistantAnswer(
     emitTimer = null;
   };
 
-  const scheduleFlush = () => {
+  const scheduleFlush = (isFirstChunk = false) => {
+    if (isFirstChunk) {
+      flush();
+      return;
+    }
     if (emitTimer) return;
     emitTimer = setTimeout(flush, 20);
   };
@@ -76,7 +80,7 @@ export async function streamAssistantAnswer(
       }
       if (event.type === "chunk") {
         emitBuffer += event.text;
-        scheduleFlush();
+        scheduleFlush(!emitBuffer || emitBuffer === event.text);
         continue;
       }
       if (event.type === "end") {

@@ -18,7 +18,7 @@ export function getMaxTokensForFormat(format?: string, model?: string, tier0 = f
   const reasoningMultiplier = isReasoning ? 8 : 1;
 
   if (tier0) {
-    const base = format === "short" ? 100 : format === "detailed" ? 400 : format === "code_example" ? 500 : 300;
+    const base = format === "short" ? 100 : format === "detailed" ? 400 : format === "code_example" ? 2000 : 300;
     return base * reasoningMultiplier;
   }
 
@@ -27,10 +27,10 @@ export function getMaxTokensForFormat(format?: string, model?: string, tier0 = f
   else if (format === "concise") base = isFastModel ? 300 : 500;
   else if (format === "bullet") base = isFastModel ? 400 : 600;
   else if (format === "star") base = isFastModel ? 500 : 1000;
-  else if (format === "technical") base = isFastModel ? 600 : 1500;
-  else if (format === "code_example") base = isFastModel ? 800 : 1800;
+  else if (format === "technical") base = isFastModel ? 1500 : 2500;
+  else if (format === "code_example") base = isFastModel ? 3000 : 4000;
   else if (format === "detailed") base = 1500;
-  else if (format === "automatic") base = isFastModel ? 600 : 1200;
+  else if (format === "automatic") base = isFastModel ? 1000 : 1500;
   else base = isFastModel ? 300 : 500;
 
   return base * reasoningMultiplier;
@@ -44,6 +44,7 @@ Rules:
 - Use PROFILE/RESUME details only when they are relevant to the question. For generic theory questions, answer directly without forcing profile stories.
 - If input contains MULTIPLE questions (e.g. "What is Python? Explain Flask"), identify ALL questions and answer each one separately with clear structure
 - If you lack direct experience, say so briefly and answer with truthful transferable experience or correct conceptual knowledge
+- NEVER say "I'm sorry", NEVER ask for clarification, NEVER say "there seems to be confusion", NEVER say "could you clarify", NEVER say "I don't understand", NEVER say "the question got cut off", NEVER say "your question got cut off", NEVER say "it seems like the question", NEVER say "it looks like the question", NEVER say "could you please specify". If the question is a fragment or unclear, infer the most likely interview question from the words given and answer it directly and confidently as if the full question was asked.
 - Never use placeholders like [your field] or [company name]
 - Never mention you are an AI
 - Sound like a real human professional
@@ -52,6 +53,7 @@ Rules:
 - CRITICAL: NEVER invent fake names, fake companies, or fake projects. ONLY use information explicitly provided in YOUR PROFILE/RESUME. If profile is missing info, give a general professional answer WITHOUT inventing specific names or details
 - If interviewer asks to write/build/implement/create code: answer in this exact order: 1) Brief explanation of approach (2-3 sentences), 2) Complete runnable code block with proper language fence (e.g. \`\`\`python), 3) Short "Key points:" notes if helpful. NEVER give code alone without explanation. NEVER give explanation alone without code.
 - If interviewer asks to modify/fix/optimize/update/change/refactor existing code: 1) One sentence explaining what you changed and why, 2) Return the FULL complete code (not just the changed part) — every line must be present, 3) Mark every changed/added line with an inline comment: use \`// ← changed\` for JS/TS/Java/C#/Go/Rust, \`# ← changed\` for Python/Ruby/Shell, \`-- ← changed\` for SQL. Do NOT omit unchanged lines.
+- Code formatting: ALWAYS use proper newlines and indentation — NEVER put multiple statements on one line (e.g. \`def foo(): x = 1\` is WRONG — each statement must be on its own line with correct indentation).
 - NEVER wrap a prose/text answer inside a code block. Code blocks are ONLY for actual executable code. If the question is about experience, concepts, or opinion — answer in plain sentences with NO code fences, even if the topic mentions Python, Java, or any other language.
 Type: ${meetingType}
 Format: ${formatInstructions[format] || formatInstructions.concise}`;
@@ -319,7 +321,7 @@ Format: ${formatInstructions[format] || formatInstructions.automatic}`;
   }
 
   if (sessionIntelligenceContext) {
-    prompt += `\n\n=== MEETING INTELLIGENCE ===\nUse this to preserve question history, interviewer patterns, and company/JD focus when relevant.\n${sessionIntelligenceContext}\n===`;
+    prompt += `\n\n=== MEETING INTELLIGENCE ===\nUse this to preserve question history, interviewer patterns, and company/JD focus when relevant.\nCRITICAL: If a "REPEAT/FOLLOW-UP DETECTED" flag appears, you MUST NOT repeat the prior answer. Reference it briefly, then add new depth, a different angle, or a concrete example not used before.\n${sessionIntelligenceContext}\n===`;
   }
 
   prompt += buildInterviewResponseShapeBlock(meetingType);

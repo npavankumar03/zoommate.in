@@ -133,7 +133,7 @@ export default function OverlayPopup() {
           <MiniAnswer text={state.answer} />
         ) : (
           <p style={{ color: "rgba(255,255,255,0.18)", fontSize: 12, margin: 0 }}>
-            {state.isPaused ? "Detection paused." : "Waiting for interviewer question…"}
+            {state.isPaused ? "Detection paused." : "Waiting for speaker question…"}
           </p>
         )}
       </div>

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { Link, useLocation, useParams } from "wouter";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -12,9 +12,6 @@ import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { DebugPanel, type DebugPanelData } from "@/components/debug-panel";
 import { ReadingPane } from "@/components/reading-pane";
 import { LiveCodeEditor } from "@/components/live-code-editor";
-import { SessionInsightsPanel } from "@/components/session-insights-panel";
-import { SessionSidebarPanel } from "@/components/session-sidebar-panel";
-import { SessionTranscriptPanel } from "@/components/session-transcript-panel";
 import {
   detectQuestion,
   detectQuestionAdvanced,
@@ -25,8 +22,6 @@ import {
 } from "@shared/questionDetection";
 import { isFollowUp } from "@shared/followup";
 import { AzureRecognizer, checkAzureAvailability } from "@/lib/stt/azureRecognizer";
-import { DeepgramRecognizer } from "@/lib/stt/deepgramRecognizer";
-import { fetchSttConfig, type SttProvider } from "@/lib/stt/sttConfig";
 import { getSocket } from "@/realtime/socketClient";
 import {
   Zap, Mic, MicOff, Monitor, Send, Square,
@@ -65,8 +60,7 @@ type VideoFrameCallbackVideo = HTMLVideoElement & {
 
 const SCREEN_CAPTURE_MAX_WIDTH = 1400;
 const SCREEN_CAPTURE_JPEG_QUALITY = 0.72;
-const TRANSCRIPT_GROUPING_MS = 5_000;
-const DISPLAY_TRANSCRIPT_RENDER_LIMIT = 120;
+const TRANSCRIPT_GROUPING_MS = 10_000;
 
 function isLikelyInterviewTopic(raw: string): boolean {
   const text = String(raw || "").toLowerCase().replace(/[^\w\s.+#/-]/g, " ").replace(/\s+/g, " ").trim();
@@ -312,8 +306,8 @@ export default function MeetingSession() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [isAwaitingFirstChunk, setIsAwaitingFirstChunk] = useState(false);
   const [isRefining, setIsRefining] = useState(false);
-  const [compactMode, setCompactMode] = useState(false);
   const [conversationHistory, setConversationHistory] = useState("");
+  const [audioLevel, setAudioLevel] = useState(0);
   const [initializedFromMeeting, setInitializedFromMeeting] = useState(false);
   const [quickResponseMode, setQuickResponseMode] = useState(() => {
     const stored = localStorage.getItem("zoommate-quick-response");
@@ -336,16 +330,14 @@ export default function MeetingSession() {
   });
   const [socketConnected, setSocketConnected] = useState(false);
   const [responsesLocal, setResponsesLocal] = useState<Response[]>([]);
-  const [selectedResponseId, setSelectedResponseId] = useState<string | null>(null);
   const [showResponseHistory, setShowResponseHistory] = useState(false);
   const [highlightResponseId, setHighlightResponseId] = useState<string | null>(null);
   const [selectedQuestionFilter, setSelectedQuestionFilter] = useState<string>("");
   const [recentQuestions, setRecentQuestions] = useState<string[]>([]);
   const [azureAvailable, setAzureAvailable] = useState<boolean | null>(null);
-  const [deepgramAvailable, setDeepgramAvailable] = useState(false);
-  const [sttProvider, setSttProvider] = useState<SttProvider>(() => {
+  const [sttProvider, setSttProvider] = useState<"azure" | "browser">(() => {
     const saved = localStorage.getItem("zoommate-stt-engine");
-    if (saved === "azure" || saved === "deepgram" || saved === "browser") return saved;
+    if (saved === "azure" || saved === "browser") return saved;
     return "browser";
   });
   const [autoAnswerEnabled, setAutoAnswerEnabled] = useState(false);
@@ -373,6 +365,7 @@ export default function MeetingSession() {
   const lastAnswerWasCodeRef = useRef<boolean>(false);
   const lastAppendedFpRef = useRef<string>("");
   const streamingAnswerRef = useRef<string>("");
+  const streamingAccumulatorRef = useRef<string>("");
   const interpretedQuestionRef = useRef<string>("");
   const streamingQuestionRef = useRef<string>("");
   const isAwaitingFirstChunkRef = useRef<boolean>(false);
@@ -398,16 +391,15 @@ export default function MeetingSession() {
   const styleInitializedRef = useRef(false);
   const recognitionRef = useRef<any>(null);
   const azureRecognizerRef = useRef<AzureRecognizer | null>(null);
-  const deepgramRecognizerRef = useRef<DeepgramRecognizer | null>(null);
-  const azureMicShadowRef = useRef<AzureRecognizer | null>(null); // Dual-stream: candidate mic recognizer
+  const azureMicShadowRef = useRef<AzureRecognizer | null>(null);
+  const azureLastCallRef = useRef<{ mode: "mic" | "system"; stream?: MediaStream; speaker: "interviewer" | "candidate" | "unknown" } | null>(null);
+  const azureReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const azureStartFnRef = useRef<((mode: "mic" | "system", stream?: MediaStream, speaker?: "interviewer" | "candidate" | "unknown") => Promise<void>) | null>(null); // Dual-stream: candidate mic recognizer
   const timerRef = useRef<NodeJS.Timeout | null>(null);
   const segmentsRef = useRef<string[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const transcriptScrollRef = useRef<HTMLDivElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
-  const stopListeningRef = useRef<() => void>(() => {});
-  const isListeningRef = useRef(false);
-  const isStoppingSttRef = useRef(false);
   const recognitionRestartCount = useRef(0);
   const recognitionAlive = useRef(true);
   const systemAudioStreamRef = useRef<MediaStream | null>(null);
@@ -416,6 +408,9 @@ export default function MeetingSession() {
   const tabAudioStreamRef = useRef<MediaStream | null>(null);  // tab audio captured via getDisplayMedia for mixing
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const systemAudioAlive = useRef(false);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const animFrameRef = useRef<number>(0);
   const systemTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const askedQuestionsRef = useRef<string[]>([]);
   const recentAskedFingerprintsRef = useRef<string[]>([]);
@@ -485,6 +480,8 @@ export default function MeetingSession() {
   const refineBufferRef = useRef<string>("");
   const interviewerQuestionMemoryRef = useRef<Array<{ text: string; answered: boolean; ts: number }>>([]);
   const spokenReplyMemoryRef = useRef<Array<{ text: string; ts: number }>>([]);
+  // Rolling buffer of last 2 non-candidate transcript segments for multi-segment speculative
+  const recentInterviewerSegmentsRef = useRef<string[]>([]);
   const pendingQuestionTailRef = useRef<string[]>([]);
   const pendingTailTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const boundaryQuestionCandidatesRef = useRef<Array<{ text: string; ts: number }>>([]);
@@ -654,7 +651,7 @@ export default function MeetingSession() {
   const DUPLICATE_INTENT_WINDOW_MS = 15_000;
   const ENTER_AFTER_AUTO_SUPPRESS_MS = 5_000;
   const ENTER_ONLY_ANSWER_MODE = true;
-  const INTERPRETED_PLACEHOLDER = "Listening for a clear interviewer question. Press Enter to answer from transcript context.";
+  const INTERPRETED_PLACEHOLDER = "Listening for a clear speaker question. Press Enter to answer from transcript context.";
   const liveMode = isListening && socketConnected;
   const MAX_CONVERSATION_CONTEXT_LINES = 60;
   const HYBRID_FOLLOWUP_WINDOW_MS = 30_000;
@@ -706,15 +703,28 @@ export default function MeetingSession() {
   const upsertDisplayTranscriptSegment = useCallback((text: string) => {
     const next = String(text || "").trim();
     if (!next) return;
-    // Suppress display updates for 2.5s after an AI answer ends to prevent
+    // Suppress display updates for 300ms after an AI answer ends to prevent
     // late finals and echo bleed from visibly mutating the transcript.
-    if (lastAnswerDoneTimestampRef.current && (Date.now() - lastAnswerDoneTimestampRef.current) < 2500) return;
+    if (lastAnswerDoneTimestampRef.current && (Date.now() - lastAnswerDoneTimestampRef.current) < 300) return;
     const nextNorm = normalizeForDedup(next);
     if (!nextNorm) return;
+    const latestDisplay = String(displaySegmentsRef.current[0] || "").trim();
+    const latestNorm = normalizeForDedup(latestDisplay);
+    if (latestNorm) {
+      if (latestNorm.startsWith(nextNorm) && nextNorm.length >= 8 && nextNorm.split(/\s+/).length <= latestNorm.split(/\s+/).length) {
+        return;
+      }
+      if (nextNorm.startsWith(latestNorm) && latestNorm.length >= 8 && latestNorm.split(/\s+/).length < nextNorm.split(/\s+/).length) {
+        displaySegmentsRef.current = [next, ...displaySegmentsRef.current.slice(1)];
+        displaySegmentKeysRef.current = [displaySegmentKeysRef.current[0] || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, ...displaySegmentKeysRef.current.slice(1)];
+        setDisplayTranscriptSegments([...displaySegmentsRef.current]);
+        setDisplayTranscriptSegmentKeys([...displaySegmentKeysRef.current]);
+        return;
+      }
+    }
     if (displaySegmentsRef.current.some((seg) => normalizeForDedup(seg) === nextNorm)) return;
-    displaySegmentsRef.current = [next, ...displaySegmentsRef.current].slice(0, DISPLAY_TRANSCRIPT_RENDER_LIMIT);
-    displaySegmentKeysRef.current = [`${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, ...displaySegmentKeysRef.current]
-      .slice(0, DISPLAY_TRANSCRIPT_RENDER_LIMIT);
+    displaySegmentsRef.current = [next, ...displaySegmentsRef.current];
+    displaySegmentKeysRef.current = [`${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, ...displaySegmentKeysRef.current];
     setDisplayTranscriptSegments([...displaySegmentsRef.current]);
     setDisplayTranscriptSegmentKeys([...displaySegmentKeysRef.current]);
   }, []);
@@ -1407,48 +1417,21 @@ export default function MeetingSession() {
     return `\`\`\`${lang}\n${formatted}\n\`\`\``;
   }, [formatSingleLineCode, inferCodeLanguage, normalizeCodeFences]);
 
-  const streamingDisplayQuestion = useMemo(
-    () => streamingQuestion || pendingResponse?.question || "",
-    [streamingQuestion, pendingResponse?.question],
-  );
-  const streamingDisplayAnswer = useMemo(
-    () => streamingAnswer || pendingResponse?.answer || "",
-    [streamingAnswer, pendingResponse?.answer],
-  );
-  const streamingDisplayAsCode = useMemo(
-    () => shouldDisplayAnswerAsCode(streamingDisplayQuestion, streamingDisplayAnswer),
-    [shouldDisplayAnswerAsCode, streamingDisplayQuestion, streamingDisplayAnswer],
-  );
-  const streamingRenderedAnswer = useMemo(() => {
-    if (!streamingDisplayAnswer) return "";
-    return streamingDisplayAsCode
-      ? enforceCodeOnlyDisplay(streamingDisplayAnswer, streamingDisplayQuestion)
-      : streamingDisplayAnswer;
-  }, [enforceCodeOnlyDisplay, streamingDisplayAnswer, streamingDisplayAsCode, streamingDisplayQuestion]);
-  const newestResponseMatchesStreaming = useMemo(() => {
-    const newestResponse = responsesLocal[0];
-    return !!newestResponse?.answer
-      && !!streamingDisplayAnswer
-      && (
-        normalizeForDedup(newestResponse.answer) === normalizeForDedup(streamingDisplayAnswer)
-        || normalizeForDedup(newestResponse.question || "") === normalizeForDedup(streamingDisplayQuestion)
-      );
-  }, [responsesLocal, streamingDisplayAnswer, streamingDisplayQuestion]);
-  const shouldShowStreamingCard = useMemo(
-    () => isAwaitingFirstChunk
-      || ((!!streamingAnswer || !!pendingResponse?.answer) && (!newestResponseMatchesStreaming || isStreaming)),
-    [isAwaitingFirstChunk, streamingAnswer, pendingResponse?.answer, newestResponseMatchesStreaming, isStreaming],
-  );
-  const selectedResponse = useMemo(
-    () => responsesLocal.find((response) => response.id === selectedResponseId) || responsesLocal[0] || null,
-    [responsesLocal, selectedResponseId],
-  );
-  const selectedResponseRenderedAnswer = useMemo(() => {
-    if (!selectedResponse) return "";
-    return shouldDisplayAnswerAsCode(selectedResponse.question, selectedResponse.answer)
-      ? enforceCodeOnlyDisplay(selectedResponse.answer, selectedResponse.question)
-      : selectedResponse.answer;
-  }, [selectedResponse, shouldDisplayAnswerAsCode, enforceCodeOnlyDisplay]);
+  const streamingDisplayQuestion = streamingQuestion || pendingResponse?.question || "";
+  const streamingDisplayAnswer = streamingAnswer || pendingResponse?.answer || "";
+  const streamingDisplayAsCode = shouldDisplayAnswerAsCode(streamingDisplayQuestion, streamingDisplayAnswer);
+  const streamingDisplayAnswerNormalized = normalizeCodeFences(streamingDisplayAnswer, streamingDisplayQuestion);
+  const newestResponse = responsesLocal[0];
+  const newestResponseMatchesStreaming =
+    !!newestResponse?.answer
+    && !!streamingDisplayAnswer
+    && (
+      normalizeForDedup(newestResponse.answer) === normalizeForDedup(streamingDisplayAnswer)
+      || normalizeForDedup(newestResponse.question || "") === normalizeForDedup(streamingDisplayQuestion)
+    );
+  const shouldShowStreamingCard =
+    isAwaitingFirstChunk
+    || ((!!streamingAnswer || !!pendingResponse?.answer) && (!newestResponseMatchesStreaming || isStreaming));
 
   const buildSpeechPhraseHints = useCallback((): string[] => {
     const baseHints = [
@@ -2879,17 +2862,65 @@ export default function MeetingSession() {
     return synthesized || "";
   }, [buildQuestionFromMeaningfulFragment]);
 
+  const isLikelyNoiseSegment = useCallback((raw: string): boolean => {
+    const text = String(raw || "").trim();
+    if (!text) return true;
+    const normalized = text.toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
+    const words = normalized.split(" ").filter(Boolean);
+    const hasQuestionCue =
+      /\?/.test(text) ||
+      /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|tell|walk|explain)\b/.test(normalized);
+    const hasInterviewCue =
+      /\b(interview|experience|react|python|fastapi|fast api|fast apis|apis|flask|django|api|backend|frontend|project|wipro|anthem|resume|start date|end date|month|year|worked|java|javascript|typescript|nodejs|node js|angular|vue|nextjs|next js|spring|springboot|spring boot|aws|azure|gcp|google cloud|kubernetes|k8s|docker|terraform|ansible|jenkins|github|gitlab|bitbucket|ci cd|devops|microservice|microservices|sql|nosql|mongodb|postgres|postgresql|mysql|redis|kafka|rabbitmq|elasticsearch|graphql|rest|restful|grpc|oauth|jwt|agile|scrum|kanban|jira|confluence|linux|bash|shell|powershell|machine learning|deep learning|nlp|llm|openai|langchain|pandas|numpy|pytorch|tensorflow|spark|hadoop|airflow|dbt|snowflake|databricks|bigquery|data pipeline|etl|elt|data warehouse|data lake|data engineering|data science|full stack|fullstack|front end|back end|cloud native|serverless|lambda|s3|ec2|rds|dynamodb|sqs|sns|ecs|eks|iam|vpc|load balancer|ci|cd|unit test|integration test|selenium|cypress|jest|pytest|junit|tdd|bdd|agile|sprint|standup|code review|pull request|architecture|system design|scalability|performance|latency|throughput|availability|reliability|observability|monitoring|logging|alerting|grafana|prometheus|datadog|splunk|pagerduty)\b/.test(normalized);
+    if (words.length <= 1) {
+      return !(hasInterviewCue || hasQuestionCue);
+    }
+
+    if (/\b(hey cortana|open internet explorer|call mom|call dad|play music|download|road closed|downtown)\b/.test(normalized)) {
+      return true;
+    }
+
+    // Pure filler regardless of length
+    if (/^(okay|ok|right|alright|yeah|yes|no|hmm|uh|um|uh huh|so|and also|also)\b/.test(normalized) && words.length <= 4) return true;
+
+    // Very short non-interview phrases ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â aggressive gate
+    if (!hasInterviewCue && !hasQuestionCue && words.length <= 3) return true;
+
+    // WH-word starters too short to be real questions ("when building", "how about")
+    if (/^(what|why|how|when|where|who|which)/.test(normalized) && words.length <= 3 && !text.includes("?") && !hasInterviewCue) return true;
+
+    // Medium length (4-10 words): only drop if it has no semantic substance ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â
+    // no verb, no subject pronoun, and no known tech/role signal
+    if (!hasInterviewCue && !hasQuestionCue && words.length <= 10) {
+      const hasVerb = /\b(is|are|was|were|be|been|have|has|had|do|does|did|get|got|make|made|use|used|work|worked|know|knew|think|thought|say|said|see|saw|come|came|go|went|take|took|build|built|write|wrote|run|ran|implement|deploy|design|develop|create|handle|manage|integrate|configure|test|debug)\b/i.test(normalized);
+      const hasSubjectPronoun = /\b(i|we|you|they|he|she|it|my|our|your|their|this|that|these|those)\b/i.test(normalized);
+      const hasTechSignal = /\b(api|sdk|cloud|server|client|database|db|code|app|service|system|platform|tool|stack|framework|library|module|function|class|object|method|query|request|response|endpoint|deploy|build|test|debug|pipeline|repo|git|docker|ci|cd|devops|ml|ai|model|data|stream|queue|event|token|auth|ssl|tls|http|rest|graph|node|pod|cluster|container|instance|bucket|blob|vpc|subnet|lambda|trigger|hook|cron|job|task|worker|cache|session|cookie|jwt|oauth|saml|ldap|role|policy|permission|schema|table|index|join|migration|orm|crud|react|python|java|javascript|typescript|nodejs|angular|vue|nextjs|spring|aws|azure|gcp|kubernetes|k8s|terraform|ansible|jenkins|mongodb|postgres|postgresql|mysql|redis|kafka|rabbitmq|elasticsearch|graphql|grpc|microservice|microservices|serverless|s3|ec2|rds|dynamodb|sqs|sns|ecs|eks|iam|loadbalancer|fastapi|flask|django|pandas|numpy|pytorch|tensorflow|spark|hadoop|airflow|snowflake|databricks|bigquery|selenium|cypress|jest|pytest|junit|scalability|latency|throughput|observability|monitoring|logging|grafana|prometheus|datadog|splunk|architecture|fullstack|frontend|backend|agile|scrum|sprint|devops|bash|linux|shell|openai|langchain|llm)\b/i.test(normalized);
+      // Keep it if it has a verb + subject (looks like a real sentence) OR tech signal
+      if (!hasVerb && !hasSubjectPronoun && !hasTechSignal) return true;
+    }
+
+    return false;
+  }, []);
+
   const isStrongInterviewerQuestion = useCallback((raw: string): boolean => {
     const text = String(raw || "").trim();
     if (!text) return false;
     const advanced = detectQuestionAdvanced(text);
     const normalized = text.toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
+    // No first-person "I" pronoun + enough words + question/tech cue → interviewer speaking
+    const iCount = (text.match(/\bI\b/g) || []).length;
+    const wordCount = normalized.split(/\s+/).filter(Boolean).length;
+    const hasQuestionOrTechCue =
+      /\?/.test(text)
+      || /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|tell|walk|explain|describe|share|give)\b/.test(normalized)
+      || /\b(experience|react|python|fastapi|java|javascript|typescript|nodejs|angular|vue|aws|azure|gcp|kubernetes|docker|sql|nosql|mongodb|postgres|redis|kafka|graphql|microservice|backend|frontend|devops|agile|machine learning|llm|architecture|scalability|project|role|challenge|design|deploy|api|flask|django|spring|terraform|linux|bash)\b/.test(normalized);
+    if (iCount === 0 && wordCount >= 5 && hasQuestionOrTechCue && !isLikelyNoiseSegment(text)) return true;
     const hasQuestionCue =
       /\?/.test(text)
       || /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|tell|walk|explain)\b/.test(normalized)
       || /\b(experience|project|react|python|fastapi|fast api|fast apis|apis|django|architecture|design|challenge|role)\b/.test(normalized);
     return (detectQuestion(text) || (advanced.isQuestion && advanced.confidence >= 0.5)) && hasQuestionCue;
-  }, []);
+  }, [isLikelyNoiseSegment]);
 
   const looksLikeLikelyInterimQuestion = useCallback((raw: string): boolean => {
     const text = String(raw || "").trim();
@@ -2901,43 +2932,6 @@ export default function MeetingSession() {
     const startsWithAux = /^(do|does|did|can|could|would|have|has|is|are|tell|walk|explain)\b/i.test(normalized);
     const openEndedJoinerTail = /\b(and|or|also|as well as|along with|including|in addition|regarding|about|specifically)\s*\??$/i.test(normalized);
     return detectQuestion(text) || advanced.confidence >= 0.5 || (startsWithWh && words >= 4) || (startsWithAux && words >= 3) || openEndedJoinerTail;
-  }, []);
-
-  const isLikelyNoiseSegment = useCallback((raw: string): boolean => {
-    const text = String(raw || "").trim();
-    if (!text) return true;
-    const normalized = text.toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
-    const words = normalized.split(" ").filter(Boolean);
-    const hasQuestionCue =
-      /\?/.test(text) ||
-      /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|tell|walk|explain)\b/.test(normalized);
-    const hasInterviewCue =
-      /\b(interview|experience|react|python|fastapi|fast api|fast apis|apis|flask|django|api|backend|frontend|project|wipro|anthem|resume|start date|end date|month|year|worked)\b/.test(normalized);
-    if (words.length <= 1) {
-      return !(hasInterviewCue || hasQuestionCue);
-    }
-
-    if (/\b(hey cortana|open internet explorer|call mom|call dad|play music|download|road closed|downtown)\b/.test(normalized)) {
-      return true;
-    }
-
-    // Pure filler regardless of length
-    if (/^(okay|ok|right|yeah|yes|no|hmm|uh|um|uh huh|so|and also|also)\b/.test(normalized) && words.length <= 4) return true;
-
-    // Very short non-interview phrases ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â aggressive gate
-    if (!hasInterviewCue && !hasQuestionCue && words.length <= 3) return true;
-
-    // Medium length (4-10 words): only drop if it has no semantic substance ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â
-    // no verb, no subject pronoun, and no known tech/role signal
-    if (!hasInterviewCue && !hasQuestionCue && words.length <= 10) {
-      const hasVerb = /\b(is|are|was|were|be|been|have|has|had|do|does|did|get|got|make|made|use|used|work|worked|know|knew|think|thought|say|said|see|saw|come|came|go|went|take|took|build|built|write|wrote|run|ran|implement|deploy|design|develop|create|handle|manage|integrate|configure|test|debug)\b/i.test(normalized);
-      const hasSubjectPronoun = /\b(i|we|you|they|he|she|it|my|our|your|their|this|that|these|those)\b/i.test(normalized);
-      const hasTechSignal = /\b(api|sdk|cloud|server|client|database|db|code|app|service|system|platform|tool|stack|framework|library|module|function|class|object|method|query|request|response|endpoint|deploy|build|test|debug|pipeline|repo|git|docker|ci|cd|devops|ml|ai|model|data|stream|queue|event|token|auth|ssl|tls|http|rest|graph|node|pod|cluster|container|instance|bucket|blob|vpc|subnet|lambda|function|trigger|hook|cron|job|task|worker|cache|session|cookie|jwt|oauth|saml|ldap|role|policy|permission|schema|table|index|query|join|migration|orm|crud|api|endpoint)\b/i.test(normalized);
-      // Keep it if it has a verb + subject (looks like a real sentence) OR tech signal
-      if (!hasVerb && !hasSubjectPronoun && !hasTechSignal) return true;
-    }
-
-    return false;
   }, []);
 
   const sanitizeMergedSeed = useCallback((raw: string): string => {
@@ -2977,7 +2971,7 @@ export default function MeetingSession() {
       const words = normalized.split(" ").filter(Boolean);
       const hasQMark = text.includes("?");
       const startsLikeQuestion = /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|tell|walk|explain)\b/.test(normalized);
-      const hasInterviewCue = /\b(experience|react|python|fastapi|fast api|fast apis|apis|flask|wipro|anthem|start date|end date|month|year|worked)\b/.test(normalized);
+      const hasInterviewCue = /\b(experience|react|python|fastapi|fast api|fast apis|apis|flask|django|java|javascript|typescript|nodejs|angular|vue|nextjs|spring|aws|azure|gcp|kubernetes|docker|terraform|mongodb|postgres|mysql|redis|kafka|graphql|microservice|serverless|backend|frontend|fullstack|devops|agile|scrum|machine learning|deep learning|llm|openai|pandas|pytorch|tensorflow|spark|snowflake|databricks|bigquery|selenium|jest|pytest|architecture|wipro|anthem|start date|end date|month|year|worked|resume|project|role|challenge|design|deploy|build|scalability|performance|system|database|api|sql|nosql|linux|bash|ci cd|github|gitlab|jenkins|datadog|grafana|prometheus)\b/.test(normalized);
       const partialStub = /^(when did you|do you have|what was your|have you worked with|tell me about)\s*$/.test(normalized);
       const dateSpecific = /\b(start date|end date|from|to|month|year|wipro)\b/.test(normalized);
       const questionLike = hasQMark || startsLikeQuestion || (hasInterviewCue && words.length >= 4);
@@ -3007,7 +3001,7 @@ export default function MeetingSession() {
       const normalized = text.toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
       const words = normalized.split(" ").filter(Boolean);
       const hasInterviewCue =
-        /\b(interview|experience|react|python|fastapi|fast api|fast apis|apis|flask|django|api|backend|frontend|project|wipro|anthem|resume|start date|end date|month|year|worked)\b/.test(normalized);
+        /\b(interview|experience|react|python|fastapi|fast api|fast apis|apis|flask|django|java|javascript|typescript|nodejs|angular|vue|nextjs|spring|aws|azure|gcp|kubernetes|docker|terraform|mongodb|postgres|mysql|redis|kafka|graphql|microservice|serverless|backend|frontend|fullstack|devops|agile|scrum|machine learning|deep learning|llm|openai|pandas|pytorch|tensorflow|spark|snowflake|databricks|bigquery|selenium|jest|pytest|architecture|api|sql|nosql|linux|bash|ci cd|github|gitlab|jenkins|datadog|grafana|prometheus|wipro|anthem|resume|project|role|challenge|design|deploy|build|scalability|performance|system|database|start date|end date|month|year|worked)\b/.test(normalized);
       if (isLikelyNoiseSegment(text) && !hasInterviewCue) continue;
       if (words.length >= 1) return text;
     }
@@ -3067,7 +3061,7 @@ export default function MeetingSession() {
         const looksQuestion = clean.includes("?") || starters.test(normalized);
         const advanced = detectQuestionAdvanced(clean);
         const hasInterviewCue =
-          /\b(experience|react|python|fastapi|fast api|fast apis|apis|flask|django|api|backend|frontend|project|wipro|anthem|resume|start date|end date|month|year|worked)\b/i.test(normalized);
+          /\b(interview|experience|react|python|fastapi|fast api|fast apis|apis|flask|django|java|javascript|typescript|nodejs|angular|vue|nextjs|spring|aws|azure|gcp|kubernetes|docker|terraform|mongodb|postgres|mysql|redis|kafka|graphql|microservice|serverless|backend|frontend|fullstack|devops|agile|scrum|machine learning|deep learning|llm|openai|pandas|pytorch|tensorflow|spark|snowflake|databricks|bigquery|selenium|jest|pytest|architecture|api|sql|nosql|linux|bash|ci cd|github|gitlab|jenkins|datadog|grafana|prometheus|wipro|anthem|resume|project|role|challenge|design|deploy|build|scalability|performance|system|database|start date|end date|month|year|worked)\b/i.test(normalized);
         const partialStub = /^(when did you|do you have|what was your|have you worked with|tell me about|experience in)\s*$/i.test(normalized);
         const repeatedWordNoise = /\b([a-z]{3,})\s+\1\b/i.test(normalized) && !hasInterviewCue;
         const fillerOnly = /\b(just a minute|one minute|hold on|wait a second)\b/i.test(normalized) && words.length <= 6;
@@ -3157,70 +3151,18 @@ export default function MeetingSession() {
   }, [meeting?.incognito]);
 
   useEffect(() => {
-    let cancelled = false;
-
-    fetchSttConfig()
-      .then((config) => {
-        if (cancelled) return;
-        setAzureAvailable(config.azureAvailable);
-        setDeepgramAvailable(config.deepgramAvailable);
-
-        const resolvedProvider: SttProvider =
-          config.defaultProvider === "azure" && config.azureAvailable
-            ? "azure"
-            : config.defaultProvider === "deepgram" && config.deepgramAvailable
-              ? "deepgram"
-              : config.defaultProvider === "browser"
-                ? "browser"
-                : config.azureAvailable
-                  ? "azure"
-                  : config.deepgramAvailable
-                    ? "deepgram"
-                    : "browser";
-
-        setSttProvider(resolvedProvider);
-        localStorage.setItem("zoommate-stt-engine", resolvedProvider);
-      })
-      .catch(() => {
-        checkAzureAvailability().then((available) => {
-          if (cancelled) return;
-          setAzureAvailable(available);
-          setDeepgramAvailable(false);
-          if (available) {
-            setSttProvider("azure");
-            localStorage.setItem("zoommate-stt-engine", "azure");
-            return;
-          }
-          setSttProvider("browser");
-          localStorage.setItem("zoommate-stt-engine", "browser");
-        });
-      });
-
-    return () => {
-      cancelled = true;
-    };
+    checkAzureAvailability().then((available) => {
+      setAzureAvailable(available);
+      const saved = localStorage.getItem("zoommate-stt-engine");
+      if (available && !saved) {
+        setSttProvider("azure");
+        localStorage.setItem("zoommate-stt-engine", "azure");
+      } else if (saved === "azure" && !available) {
+        setSttProvider("browser");
+      }
+    });
   }, []);
 
-    // Force memory extraction on page load
-  useEffect(() => {
-    if (!id) return;
-    
-    async function extractMemory() {
-      try {
-        await fetch(`/api/meetings/${id}/extract-memory`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ force: true })
-        });
-        console.log('[MEMORY] Extraction triggered');
-        queryClient.invalidateQueries({ queryKey: ["/api/meetings", id, "memory"] });
-      } catch (error) {
-        console.error('[MEMORY] Extraction failed:', error);
-      }
-    }
-    
-    extractMemory();
-  }, [id]);
 
   const isAiFeedbackLoop = useCallback((text: string): boolean => {
     // Protect both mic and system audio from echo ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â recentAiOutputRef is populated at assistant_end
@@ -3322,41 +3264,8 @@ export default function MeetingSession() {
   }, [responsesLocal]);
 
   useEffect(() => {
-    if (!responsesLocal.length) {
-      if (selectedResponseId !== null) {
-        setSelectedResponseId(null);
-      }
-      return;
-    }
-    if (selectedResponseId && responsesLocal.some((response) => response.id === selectedResponseId)) {
-      return;
-    }
-    setSelectedResponseId(responsesLocal[0].id);
-  }, [responsesLocal, selectedResponseId]);
-
-  useEffect(() => {
-    if (
-      selectedResponseId !== null
-      && (isStreaming || isAwaitingFirstChunk || !!streamingQuestion || !!streamingAnswer || !!pendingResponse)
-    ) {
-      setSelectedResponseId(null);
-    }
-  }, [
-    isAwaitingFirstChunk,
-    isStreaming,
-    pendingResponse,
-    selectedResponseId,
-    streamingAnswer,
-    streamingQuestion,
-  ]);
-
-  useEffect(() => {
     streamingAnswerRef.current = streamingAnswer;
   }, [streamingAnswer]);
-
-  useEffect(() => {
-    isListeningRef.current = isListening;
-  }, [isListening]);
 
   useEffect(() => {
     interpretedQuestionRef.current = interpretedQuestion;
@@ -3424,11 +3333,12 @@ export default function MeetingSession() {
     if (!el) return;
     // Always keep newest transcript at the top.
     el.scrollTop = 0;
-  }, [displayTranscriptSegments, interimText, stagedTranscriptText, pendingTranscriptLine]);
+  }, [transcriptSegments, interimText]);
 
   useEffect(() => {
     isAwaitingFirstChunkRef.current = isAwaitingFirstChunk;
   }, [isAwaitingFirstChunk]);
+
 
   useEffect(() => {
     if (!id) return;
@@ -3484,12 +3394,7 @@ export default function MeetingSession() {
 
   const highlightAndScrollResponse = useCallback((responseId: string) => {
     if (!responseId) return;
-    setSelectedResponseId(responseId);
     setHighlightResponseId(responseId);
-    const selected = responsesLocalRef.current.find((response) => response.id === responseId);
-    if (selected?.question) {
-      setSelectedQuestionFilter(selected.question);
-    }
     const el = responseCardRefs.current[responseId];
     if (el) {
       el.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -3499,34 +3404,31 @@ export default function MeetingSession() {
     }, 1800);
   }, []);
 
+  const isApologyResponse = useCallback((text: string): boolean => {
+    const t = text.trim().toLowerCase();
+    return /^(i['']?m sorry|i am sorry|sorry,|i apologize|my apologies|there seems to be (some )?confusion|i don['']?t (quite )?understand|could you (please )?(clarify|restate|rephrase|elaborate|specify)|it seems (there (is|was) a misunderstanding|like there might be)|i('m| am) not sure (what|which|about)|please (clarify|rephrase|restate|specify)|can you (clarify|rephrase|specify)|i need more (context|clarification)|i('m| am) unable to (understand|determine)|it (looks|seems) like (your|the) question (got cut off|was cut off|is incomplete|wasn't complete|seems cut off)|it seems like (your|the) question|(your|the) question (got|was|seems to have) cut off|i('m| am) not quite sure what (you('re| are)|the question)|could you please specify)/.test(t);
+  }, []);
+
   const appendLocalResponse = useCallback((question: string, answer: string, responseType = "concise") => {
     const q = question.trim();
     const a = answer.trim();
     if (!a) return "";
+    if (isApologyResponse(a)) return "";
     // Ref-based dedup fires before state update ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â prevents duplicates when two calls
     // arrive before React commits the first setResponsesLocal update.
     const fp = `${normalizeForDedup(q)}|||${normalizeForDedup(a).slice(0, 120)}`;
     if (lastAppendedFpRef.current === fp) return "";
     lastAppendedFpRef.current = fp;
+    setPendingResponse(null);
     lastAnswerWasCodeRef.current = /```/.test(a);
     const tempId = `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     setResponsesLocal((prev) => {
-      // Enhanced dedupe check
-      const newQ = (q || '').toLowerCase().trim();
-      const isDuplicate = prev.some((r) => {
-        const existingQ = (r.question || '').toLowerCase().trim();
-        if (!existingQ) return false;
-        // Simple similarity: if 80% of words match, it's a duplicate
-        const newWords = newQ.split(/\s+/).filter(Boolean);
-        if (newWords.length === 0) return false;
-        const existingWords = new Set(existingQ.split(/\s+/));
-        const matchCount = newWords.filter(w => existingWords.has(w)).length;
-        const similarity = matchCount / Math.max(newWords.length, 1);
-        return similarity > 0.8;
-      });
-      
-      if (isDuplicate) {
-        console.log('[DEDUPE] Blocked similar question:', q);
+      const newest = prev[0];
+      if (
+        newest &&
+        normalizeForDedup(newest.question || "") === normalizeForDedup(q) &&
+        normalizeForDedup(newest.answer || "") === normalizeForDedup(a)
+      ) {
         return prev;
       }
       const localResponse: Response = {
@@ -3573,27 +3475,6 @@ export default function MeetingSession() {
     el.addEventListener("scroll", onScroll);
     return () => el.removeEventListener("scroll", onScroll);
   }, [isNearBottom]);
-
-  // Force memory extraction on page load
-  useEffect(() => {
-    if (!id) return;
-    
-    async function extractMemory() {
-      try {
-        await fetch(`/api/meetings/${id}/extract-memory`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ force: true })
-        });
-        console.log('[MEMORY] Extraction triggered');
-        queryClient.invalidateQueries({ queryKey: [`/api/meetings/${id}`] }); // Refresh meeting data
-      } catch (error) {
-        console.error('[MEMORY] Extraction failed:', error);
-      }
-    }
-    
-    extractMemory();
-  }, [id]);
 
   useEffect(() => {
     scheduleAutoScroll();
@@ -3662,7 +3543,7 @@ export default function MeetingSession() {
           if (line.startsWith("```")) return "";
           return `<p style="margin:0 0 4px">${line.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")}</p>`;
         }).join("")
-      : `<p style="color:rgba(255,255,255,0.25);font-size:12px">Waiting for interviewer question…</p>`;
+      : `<p style="color:rgba(255,255,255,0.25);font-size:12px">Waiting for speaker question…</p>`;
 
     pipWin.document.body.innerHTML = `
       <div style="background:rgba(10,10,15,0.97);min-height:100vh;color:rgba(255,255,255,0.88);font-family:ui-sans-serif,system-ui,sans-serif;font-size:13px;line-height:1.55">
@@ -3783,8 +3664,9 @@ export default function MeetingSession() {
 
   const updateDraftFromPartial = useCallback((rawPartial: string) => {
     const rawLive = String(rawPartial || "").replace(/\s+/g, " ").trim();
-    const cleaned = normalizeTranscriptUtterance(rawPartial || "", "partial");
-    const fastDraft = (rawLive || cleaned).trim();
+    // Skip heavy normalization for partials — rawLive is always non-empty when a partial
+    // arrives, so the cleaned result was always discarded. Use rawLive directly.
+    const fastDraft = rawLive;
     const now = Date.now();
     if (!fastDraft) {
       // Only clear the live display if its content is already committed to segments.
@@ -3834,7 +3716,10 @@ export default function MeetingSession() {
         // If new draft extends the old one, it's a continuation ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â don't commit yet.
         // If new draft is genuinely different speech, commit the old content first.
         const newFirstThree = newNorm.split(/\s+/).slice(0, 3).join(" ");
-        const isExtension = newFirstThree.length > 3 && oldNorm.includes(newFirstThree);
+        // New partial extends old when new starts with old (normal streaming growth),
+        // OR when old contains the new partial's start (overlap/redo case).
+        const isExtension = newNorm.startsWith(oldNorm)
+          || (newFirstThree.length > 3 && oldNorm.includes(newFirstThree));
         if (!isExtension) {
           upsertDisplayTranscriptSegment(oldInterim);
         }
@@ -3856,7 +3741,7 @@ export default function MeetingSession() {
     lastPartialTsRef.current = now;
 
     // Keep light memory updates; heavy detection/merge runs on final text path.
-    rememberContinuationTopics(cleaned || rawLive, now);
+    rememberContinuationTopics(rawLive, now);
     rememberInterimKeywords(fastDraft, now);
     const liveCandidate = buildLiveQuestionCandidateFromPartial(fastDraft);
     if (liveCandidate) {
@@ -4012,6 +3897,7 @@ export default function MeetingSession() {
           setPendingResponse(null);
           setStreamingAnswer("");
           streamBufferRef.current = "";
+          streamingAccumulatorRef.current = "";
           clearStreamingRenderTimer();
           startFirstChunkWatchdog("assistant_start");
           return;
@@ -4036,14 +3922,15 @@ export default function MeetingSession() {
             console.log(`[perf][client] ws_ttft=${now - tDetected}ms request_to_first_token=${ttfb}ms`);
             setDebugMeta((prev) => ({ ...prev, ttfb, sessionState: interviewStateRef.current }));
             streamBufferRef.current += chunk;
-            setStreamingAnswer((prev) => sanitizeDisplayedAnswerText(prev + streamBufferRef.current));
+            streamingAccumulatorRef.current += streamBufferRef.current;
+            setStreamingAnswer(sanitizeDisplayedAnswerText(streamingAccumulatorRef.current));
             streamBufferRef.current = "";
             setIsAwaitingFirstChunk(false);
             isAwaitingFirstChunkRef.current = false;
             return;
           }
-          streamBufferRef.current += chunk;
-          queueStreamFlush();
+          streamingAccumulatorRef.current += chunk;
+          setStreamingAnswer(sanitizeDisplayedAnswerText(streamingAccumulatorRef.current));
           return;
         }
 
@@ -4057,7 +3944,8 @@ export default function MeetingSession() {
           clearFirstChunkWatchdog();
           const buffered = streamBufferRef.current;
           streamBufferRef.current = "";
-          const finalAnswer = sanitizeDisplayedAnswerText(streamingAnswerRef.current + buffered);
+          streamingAccumulatorRef.current += buffered;
+          const finalAnswer = sanitizeDisplayedAnswerText(streamingAccumulatorRef.current);
           // Layer 2 echo protection: record this answer so isAiFeedbackLoop can filter it if mic picks it up
           if (finalAnswer.trim()) {
             recentAiOutputRef.current = [finalAnswer, ...recentAiOutputRef.current].slice(0, 5);
@@ -4076,6 +3964,7 @@ export default function MeetingSession() {
               setStreamingQuestion("");
               setPendingResponse(null);
               setStreamingAnswer("");
+              streamingAccumulatorRef.current = "";
               activeWsStreamIdRef.current = "";
             }
             if (cooldownTimerRef.current) clearTimeout(cooldownTimerRef.current);
@@ -4091,6 +3980,7 @@ export default function MeetingSession() {
           isAwaitingFirstChunkRef.current = false;
           setStreamingQuestion("");
           activeWsStreamIdRef.current = "";
+          interpretedQuestionRef.current = "";
           triggerMetricRef.current.t_stream_done_rendered = Date.now();
           // Go straight back to listening ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â no cooldown delay so next question
           // from the interviewer is captured immediately after the answer ends.
@@ -4114,7 +4004,6 @@ export default function MeetingSession() {
               const same = normalizedUsed && normalizeForDedup(q.text) === normalizedUsed;
               return same ? { ...q, answered: true } : q;
             });
-            setPendingResponse({ question: questionUsed, answer: finalAnswer });
             appendLocalResponse(questionUsed, finalAnswer, responseFormat === "custom" ? "custom" : responseFormat);
             lastCommittedResponseQuestionRef.current = questionUsed;
             lastAssistantAnswerRef.current = finalAnswer;
@@ -4154,9 +4043,12 @@ export default function MeetingSession() {
               || interpretedQuestionRef.current
               || streamingQuestionRef.current
               || "";
-            // Replace the fast answer card in-place — do NOT call setStreamingAnswer which
-            // would create a second streaming card on top of the existing history card.
+            // Replace the fast answer card in-place. Also clear streamingAnswer so the
+            // old fast-answer streaming card hides — if left set, newestResponseMatchesStreaming
+            // becomes false (refined ≠ fast) and the streaming card reappears as a second card.
             replaceLatestLocalResponse(questionUsed, refined, responseFormat === "custom" ? "custom" : responseFormat);
+            setStreamingAnswer("");
+            streamingAccumulatorRef.current = "";
             setPendingResponse((prev) => prev ? { ...prev, answer: refined } : prev);
             lastAssistantAnswerRef.current = refined;
             appendConversationContextLine("Candidate", refined.replace(/```[\s\S]*?```/g, "[code]").slice(0, 500));
@@ -4363,6 +4255,18 @@ export default function MeetingSession() {
       }
       return;
     }
+
+    // Mic-only: detect candidate self-talk — starts with "I" OR has more than 3 "I" words.
+    // Store in conversation memory for follow-up context but never trigger an answer.
+    const selfTalkICount = (trimmed.match(/\bI\b/g) || []).length;
+    const isCandidateSpeech = /^i\b/i.test(trimmed.trim()) || selfTalkICount > 3;
+    if (isCandidateSpeech) {
+      if (trimmed && isSubstantiveSegment(trimmed)) {
+        appendConversationContextLine("Candidate", trimmed);
+      }
+      return;
+    }
+
     const meaningfulTopics = extractMeaningfulInterviewTopics(trimmed);
     const keepAsMeaningfulFragment =
       meaningfulTopics.length > 0
@@ -4434,7 +4338,10 @@ export default function MeetingSession() {
       }
 
       // Merge bare short tech-topic fragments (e.g. "AWS", "Django", ".NET") within 10s.
-      if (!stitchedFromFragment && !currentIsNewQuestion && prevIsQuestionLike && currentWordCount <= 4 && keepAsMeaningfulFragment && msSinceLastSegment <= 10_000) {
+      // Also merge any very short fragment (≤3 words) arriving within 4s of a question —
+      // e.g. "roughly", "at peak", "in production", "for this project".
+      const isQuickShortFragment = currentWordCount <= 3 && msSinceLastSegment <= 4_000 && !currentIsNewQuestion;
+      if (!stitchedFromFragment && !currentIsNewQuestion && prevIsQuestionLike && currentWordCount <= 4 && (keepAsMeaningfulFragment || isQuickShortFragment) && msSinceLastSegment <= 10_000) {
         const prevNoQ = prevFinal.replace(/\?\s*$/, "").trim();
         const joiner = /\b(in|with|on|for|and)\s*$/i.test(prevNoQ) ? "" : " and";
         const stitchedTopic = `${prevNoQ}${joiner} ${trimmed}`.replace(/\s+/g, " ").trim();
@@ -4580,8 +4487,7 @@ export default function MeetingSession() {
       pendingTranscriptLineRef.current
       && !newSegIsQuestion
       && !(pendingIsCompleteQuestion && newSegIsQuestion)
-      && newSegStartsJoiner
-      && combinedWordCount <= 14
+      && combinedWordCount <= 20
       && (Date.now() - pendingTranscriptTsRef.current) <= joinerGroupingMs;
     if (shouldGroupWithPending) {
       const pendingNorm = normalizeForDedup(pendingTranscriptLineRef.current);
@@ -4642,8 +4548,14 @@ export default function MeetingSession() {
     lastFinalizedAtRef.current = Date.now();
 
     const isIncompleteFinal = isLikelyIncompleteFragment(trimmed) && !keepAsMeaningfulFragment;
-    const finalIsQuestion = (detectQuestion(trimmed) || (advanced.isQuestion && advanced.confidence >= 0.5)) && !isIncompleteFinal;
-    if (finalIsQuestion) {
+    // No "I" pronoun → very likely interviewer: lower confidence threshold so more gets detected as question
+    const noFirstPerson = selfTalkICount === 0;
+    const confidenceThreshold = noFirstPerson ? 0.25 : 0.5;
+    const minWords = noFirstPerson ? 2 : 3;
+    const finalIsQuestion = (detectQuestion(trimmed) || (advanced.isQuestion && advanced.confidence >= confidenceThreshold)) && !isIncompleteFinal;
+    const isSubstantiveStatement = !finalIsQuestion && !isIncompleteFinal && !isLikelyNoiseSegment(trimmed) &&
+      trimmed.split(/\s+/).filter(Boolean).length >= minWords;
+    if (finalIsQuestion || isSubstantiveStatement) {
       pendingContinuationTopicsRef.current = [];
       rememberBoundaryQuestionCandidate(trimmed, Date.now());
       interviewerQuestionMemoryRef.current = [
@@ -4664,7 +4576,9 @@ export default function MeetingSession() {
       }
       spokenReplyMemoryRef.current = [{ text: trimmed, ts: Date.now() }, ...spokenReplyMemoryRef.current].slice(0, 30);
     }
-    appendConversationContextLine(finalIsQuestion ? "Interviewer" : "Candidate", trimmed);
+    // No "I" and not noise → treat as interviewer in conversation context too
+    const speakerLabel: "Interviewer" | "Candidate" = (finalIsQuestion || noFirstPerson) ? "Interviewer" : "Candidate";
+    appendConversationContextLine(speakerLabel, trimmed);
 
     // Stage B: reconcile speculative trigger with final transcript.
     const speculative = speculativeQuestionRef.current;
@@ -4797,54 +4711,97 @@ export default function MeetingSession() {
     startFirstChunkWatchdog,
   ]);
 
-  const buildRealtimeRecognizerCallbacks = useCallback((providerLabel: string, speaker: "interviewer" | "candidate" | "unknown" = "unknown") => ({
-    onPartial: (text: string) => {
-      if (speaker !== "candidate" && text?.trim()) {
-        handleBargeIn();
-      }
-      if (speaker !== "candidate") {
-        updateDraftFromPartial(text);
-      }
-    },
-    onFinal: (text: string) => {
-      handleFinalTurn(text, undefined, undefined, speaker);
-    },
-    onError: (error: string) => {
-      console.error(`[${providerLabel}] Error:`, error);
-      setSttStatus("error");
-      setSttError(error);
-      toast({ title: "Transcription error", description: error, variant: "destructive" });
-    },
-    onStatusChange: (status: "connecting" | "connected" | "disconnected" | "error") => {
-      if (status === "connected") {
-        console.log(`[${providerLabel}] Connected`);
-        setSttStatus("connected");
-        setSttError("");
-      } else if (status === "error" || status === "disconnected") {
-        console.log(`[${providerLabel}] Status:`, status);
-        setSttStatus(status === "error" ? "error" : "idle");
-        if (
-          speaker !== "candidate"
-          && status === "disconnected"
-          && isListeningRef.current
-          && !isStoppingSttRef.current
-        ) {
-          toast({
-            title: "Transcription stopped",
-            description: `${providerLabel} disconnected. Switch the transcription engine or restart listening.`,
-            variant: "destructive",
-          });
-          stopListeningRef.current();
-        }
-      }
-    },
-  }), [handleBargeIn, updateDraftFromPartial, handleFinalTurn, toast]);
+  const setupAudioAnalyser = useCallback((stream: MediaStream) => {
+    try {
+      const ctx = new AudioContext();
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 256;
+      const source = ctx.createMediaStreamSource(stream);
+      source.connect(analyser);
+      audioContextRef.current = ctx;
+      analyserRef.current = analyser;
+
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      const updateLevel = () => {
+        if (!analyserRef.current) return;
+        analyserRef.current.getByteFrequencyData(dataArray);
+        const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+        setAudioLevel(Math.min(100, Math.round(avg * 1.5)));
+        animFrameRef.current = requestAnimationFrame(updateLevel);
+      };
+      updateLevel();
+    } catch (e) {
+      console.error("Audio analyser setup failed:", e);
+    }
+  }, []);
+
+  const cleanupAudioAnalyser = useCallback(() => {
+    if (animFrameRef.current) {
+      cancelAnimationFrame(animFrameRef.current);
+      animFrameRef.current = 0;
+    }
+    if (audioContextRef.current) {
+      try { audioContextRef.current.close(); } catch (e) {}
+      audioContextRef.current = null;
+    }
+    analyserRef.current = null;
+    setAudioLevel(0);
+  }, []);
 
   const startAzureRecognizer = useCallback(async (mode: "mic" | "system", stream?: MediaStream, speaker: "interviewer" | "candidate" | "unknown" = "unknown") => {
     setSttStatus("connecting");
     setSttError("");
+    azureLastCallRef.current = { mode, stream, speaker };
+    const scheduleAzureReconnect = () => {
+      const alive = mode === "system" ? systemAudioAlive.current : recognitionAlive.current;
+      if (!alive) return;
+      if (azureReconnectTimerRef.current) clearTimeout(azureReconnectTimerRef.current);
+      azureReconnectTimerRef.current = setTimeout(() => {
+        const last = azureLastCallRef.current;
+        if (!last || !azureStartFnRef.current) return;
+        const stillAlive = last.mode === "system" ? systemAudioAlive.current : recognitionAlive.current;
+        if (!stillAlive) return;
+        console.log("[Azure STT] Auto-reconnecting after disconnect...");
+        void azureStartFnRef.current(last.mode, last.stream, last.speaker);
+      }, 2500);
+    };
     const recognizer = new AzureRecognizer(
-      buildRealtimeRecognizerCallbacks("Azure STT", speaker),
+      {
+        onPartial: (text) => {
+          if (speaker !== "candidate" && text?.trim()) {
+            handleBargeIn();
+          }
+          if (speaker !== "candidate") {
+            updateDraftFromPartial(text);
+          }
+        },
+        onFinal: (text) => {
+          handleFinalTurn(text, undefined, undefined, speaker);
+        },
+        onError: (error) => {
+          const alive = mode === "system" ? systemAudioAlive.current : recognitionAlive.current;
+          if (!alive) return; // intentional stop — ignore error
+          console.error("[Azure STT] Error (will reconnect):", error);
+          setSttError(error);
+          setSttStatus("connecting");
+          scheduleAzureReconnect();
+        },
+        onStatusChange: (status) => {
+          const alive = mode === "system" ? systemAudioAlive.current : recognitionAlive.current;
+          if (status === "connected") {
+            console.log("[Azure STT] Connected");
+            setSttStatus("connected");
+            setSttError("");
+            if (azureReconnectTimerRef.current) { clearTimeout(azureReconnectTimerRef.current); azureReconnectTimerRef.current = null; }
+          } else if (status === "disconnected" && alive) {
+            console.log("[Azure STT] Disconnected — reconnecting...");
+            setSttStatus("connecting");
+            scheduleAzureReconnect();
+          } else if (!alive) {
+            setSttStatus("idle");
+          }
+        },
+      },
       {
         language: sttLanguage,
         // Moderate segmentation: reduce early splits while keeping live feel.
@@ -4862,31 +4819,11 @@ export default function MeetingSession() {
     } else if (stream) {
       await recognizer.startFromStream(stream);
     }
-  }, [sttLanguage, buildSpeechPhraseHints, buildRealtimeRecognizerCallbacks]);
+  }, [sttLanguage, toast, handleFinalTurn, handleBargeIn, updateDraftFromPartial, buildSpeechPhraseHints]);
 
-  const startDeepgramRecognizer = useCallback(async (mode: "mic" | "system", stream?: MediaStream, speaker: "interviewer" | "candidate" | "unknown" = "unknown") => {
-    setSttStatus("connecting");
-    setSttError("");
-    const recognizer = new DeepgramRecognizer(
-      buildRealtimeRecognizerCallbacks("Deepgram STT", speaker),
-      {
-        language: sttLanguage,
-        silenceTimeoutMs: mode === "system" ? 2100 : 600,
-        phraseHints: buildSpeechPhraseHints(),
-        vadEnabled: true,
-        vadNoiseFloor: mode === "system" ? 0.02 : 0.008,
-      },
-    );
-
-    deepgramRecognizerRef.current = recognizer;
-
-    if (stream) {
-      await recognizer.startFromStream(stream);
-      return;
-    }
-
-    throw new Error(`Deepgram ${mode} recognizer requires an audio stream`);
-  }, [sttLanguage, buildSpeechPhraseHints, buildRealtimeRecognizerCallbacks]);
+  // Keep azureStartFnRef always pointing at the latest startAzureRecognizer so the reconnect
+  // timer can call it without a stale closure.
+  useEffect(() => { azureStartFnRef.current = startAzureRecognizer; }, [startAzureRecognizer]);
 
   // ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ Free-tier tick: deduct 1 min every 60s while listening ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬
   const startFreeSessionTick = useCallback(() => {
@@ -4970,119 +4907,74 @@ export default function MeetingSession() {
   }, [refreshSessionAccess]);
 
   // ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ Microphone permission request ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬
-  const describeMicAccessError = useCallback((error: any): string => {
-    if (typeof window !== "undefined" && !window.isSecureContext) {
-      return "Microphone access requires HTTPS, localhost, or the desktop app secure WebView.";
-    }
-    if (!navigator?.mediaDevices?.getUserMedia) {
-      return "This browser or embedded webview does not expose microphone capture. Try Chrome or enable microphone access for the desktop app.";
-    }
-    if (error?.name === "NotAllowedError") {
-      return "Please allow microphone access in your browser or desktop app settings and try again.";
-    }
-    if (error?.name === "NotFoundError") {
-      return "No microphone was detected on this device.";
-    }
-    return error?.message || String(error || "Failed to access microphone.");
-  }, []);
-
-  const requestMicrophoneStream = useCallback(async (audio: MediaTrackConstraints | boolean) => {
-    if (typeof window !== "undefined" && !window.isSecureContext) {
-      throw new Error("Microphone access requires HTTPS, localhost, or the desktop app secure WebView.");
-    }
-    if (!navigator?.mediaDevices?.getUserMedia) {
-      throw new Error("This browser or embedded webview does not expose microphone capture.");
-    }
-    return navigator.mediaDevices.getUserMedia({ audio });
-  }, []);
-
-  const handleRequestMicPermission = useCallback(async (): Promise<boolean> => {
+  const handleRequestMicPermission = useCallback(async () => {
     try {
-      const s = await requestMicrophoneStream(true);
+      const s = await navigator.mediaDevices.getUserMedia({ audio: true });
       s.getTracks().forEach((t) => t.stop());
       setMicGranted(true);
-      setSttError("");
-      return true;
-    } catch (error: any) {
-      const description = describeMicAccessError(error);
-      setSttStatus("error");
-      setSttError(description);
-      toast({
-        title: error?.name === "NotFoundError" ? "No microphone found" : "Microphone unavailable",
-        description,
-        variant: "destructive",
-      });
-      return false;
+    } catch {
+      toast({ title: "Microphone denied", description: "Please allow microphone access in your browser settings.", variant: "destructive" });
     }
-  }, [describeMicAccessError, requestMicrophoneStream, toast]);
+  }, [toast]);
 
-  const startMicListening = useCallback(async (): Promise<boolean> => {
+  const startMicListening = useCallback(async () => {
     try {
-      const preferredRealtimeProvider =
-        sttProvider === "azure" && azureAvailable
-          ? "azure"
-          : sttProvider === "deepgram" && deepgramAvailable
-            ? "deepgram"
-            : null;
-
-      if (preferredRealtimeProvider) {
+      if (sttProvider === "azure" && azureAvailable) {
         try {
           // Step 1: get mic stream with echo cancellation OFF so speaker audio leaks through
-          const micStream = await requestMicrophoneStream({
-            echoCancellation: false, // intentionally allow speaker bleed for tab audio capture
-            noiseSuppression: true,
-            autoGainControl: true,
+          const micStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: false, // intentionally allow speaker bleed for tab audio capture
+              noiseSuppression: true,
+              autoGainControl: true,
+            },
           });
           micStreamRef.current = micStream;
-          setMicGranted(true);
 
           // Step 2: use existing tab audio stream if user already shared screen
           // (getDisplayMedia popup is NOT triggered on session start — only when user clicks "Share Screen / Tab Audio")
           const tabStream: MediaStream | null = tabAudioStreamRef.current || null;
-          // Step 3: for plain mic mode use the direct stream path.
-          // Only use mixed-stream mode when tab audio is actually present.
+          // Step 3: start Azure with mixed streams (mic + optional tab audio)
           const streamsToMix = [micStream, ...(tabStream ? [tabStream] : [])].filter(
             (s) => s.getAudioTracks().length > 0,
           );
 
           setSttStatus("connecting");
           setSttError("");
-          if (preferredRealtimeProvider === "azure") {
-            const recognizer = new AzureRecognizer(
-              buildRealtimeRecognizerCallbacks("Azure STT", "unknown"),
-              {
-                language: sttLanguage,
-                silenceTimeoutMs: 600,
-                phraseHints: buildSpeechPhraseHints(),
-                vadEnabled: true,
-                vadNoiseFloor: 0.008,
+          const recognizer = new AzureRecognizer(
+            {
+              onPartial: (text) => {
+                if (text?.trim()) handleBargeIn();
+                updateDraftFromPartial(text);
               },
-            );
-            azureRecognizerRef.current = recognizer;
-            if (tabStream) {
-              await recognizer.startFromMixedStreams(streamsToMix);
-            } else {
-              await recognizer.startFromStream(micStream);
-            }
-          } else {
-            const recognizer = new DeepgramRecognizer(
-              buildRealtimeRecognizerCallbacks("Deepgram STT", "unknown"),
-              {
-                language: sttLanguage,
-                silenceTimeoutMs: 600,
-                phraseHints: buildSpeechPhraseHints(),
-                vadEnabled: true,
-                vadNoiseFloor: 0.008,
+              onFinal: (text) => handleFinalTurn(text, undefined, undefined, "unknown"),
+              onError: (error) => {
+                console.error("[Azure mixed] Error:", error);
+                setSttStatus("error");
+                setSttError(error);
+                toast({ title: "Transcription error", description: error, variant: "destructive" });
               },
-            );
-            deepgramRecognizerRef.current = recognizer;
-            if (tabStream) {
-              await recognizer.startFromMixedStreams(streamsToMix);
-            } else {
-              await recognizer.startFromStream(micStream);
-            }
-          }
+              onStatusChange: (status) => {
+                if (status === "connected") {
+                  setSttStatus("connected");
+                  setSttError("");
+                } else if (status === "error" || status === "disconnected") {
+                  setSttStatus(status === "error" ? "error" : "idle");
+                }
+              },
+            },
+            {
+              language: sttLanguage,
+              silenceTimeoutMs: 600,
+              phraseHints: buildSpeechPhraseHints(),
+              vadEnabled: true,
+              vadNoiseFloor: 0.008,
+            },
+          );
+          azureRecognizerRef.current = recognizer;
+          await recognizer.startFromMixedStreams(streamsToMix);
 
+          setupAudioAnalyser(micStream);
           setIsListening(true);
           setAudioMode("mic");
           updateStatusMutation.mutate({ status: "active" });
@@ -5092,55 +4984,47 @@ export default function MeetingSession() {
               ? "Capturing both your mic and the selected tab's audio for transcription."
               : "Microphone is ready. Listening for audio.",
           });
-          return true;
-        } catch (providerErr: any) {
-          console.error(`[${preferredRealtimeProvider} mic] Failed, falling back:`, providerErr.message);
+          return;
+        } catch (azureErr: any) {
+          console.error("[Azure mic] Failed, falling back:", azureErr.message);
           // Clean up any streams opened before the failure
           micStreamRef.current?.getTracks().forEach((t) => t.stop());
           micStreamRef.current = null;
           tabAudioStreamRef.current?.getTracks().forEach((t) => t.stop());
           tabAudioStreamRef.current = null;
-          if (preferredRealtimeProvider === "azure") {
-            azureRecognizerRef.current?.stop();
-            azureRecognizerRef.current = null;
-          } else {
-            deepgramRecognizerRef.current?.stop();
-            deepgramRecognizerRef.current = null;
-          }
-          toast({
-            title: "Switching to browser speech recognition.",
-            description: describeMicAccessError(providerErr),
-            variant: "destructive",
-          });
+          toast({ title: "Switching to browser speech recognition.", variant: "destructive" });
         }
       }
 
-      const stream = await requestMicrophoneStream({
-        echoCancellation: false,  // allow speaker audio (interviewer voice) to leak into mic for transcription
-        noiseSuppression: true,   // remove background noise
-        autoGainControl: true,    // normalize mic volume
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,  // allow speaker audio (interviewer voice) to leak into mic for transcription
+          noiseSuppression: true,   // remove background noise
+          autoGainControl: true,    // normalize mic volume
+        },
       });
       setSttStatus("connected");
       setSttError("");
       micStreamRef.current = stream;
-      setMicGranted(true);
 
       const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
       if (!SpeechRecognition) {
         stream.getTracks().forEach((t: MediaStreamTrack) => t.stop());
         micStreamRef.current = null;
         setSttStatus("error");
-        setSttError("Live transcription requires Azure Speech, Deepgram, or Browser Speech API.");
+        setSttError("Live transcription requires Azure Speech or Browser Speech API.");
         toast({
           title: "Live STT unavailable",
-          description: "Enable Azure Speech, Deepgram, or use a browser with Web Speech API. Server-side Whisper is batch mode and disabled for live.",
+          description: "Enable Azure Speech or use a browser with Web Speech API. Server-side Whisper is batch mode and disabled for live.",
           variant: "destructive",
         });
-        return false;
+        return;
       }
 
       recognitionAlive.current = true;
       recognitionRestartCount.current = 0;
+      setupAudioAnalyser(stream);
+
       stream.getAudioTracks()[0].onended = () => {
         stopListening();
       };
@@ -5196,42 +5080,20 @@ export default function MeetingSession() {
         title: "Microphone active",
         description: "Real-time speech recognition active. Press Enter to answer the latest interviewer question.",
       });
-      return true;
     } catch (error: any) {
-      const description = describeMicAccessError(error);
       setSttStatus("error");
-      setSttError(description);
-      toast({
-        title: error?.name === "NotFoundError" ? "No microphone found" : "Failed to start microphone",
-        description,
-        variant: "destructive",
-      });
-      return false;
+      setSttError(error?.message || String(error));
+      if (error.name === "NotAllowedError") {
+        toast({ title: "Microphone access denied", description: "Please allow microphone access in your browser settings.", variant: "destructive" });
+      } else {
+        toast({ title: "Failed to start microphone", description: error.message, variant: "destructive" });
+      }
     }
-  }, [
-    toast,
-    sttLanguage,
-    sttProvider,
-    azureAvailable,
-    deepgramAvailable,
-    buildSpeechPhraseHints,
-    buildRealtimeRecognizerCallbacks,
-    describeMicAccessError,
-    requestMicrophoneStream,
-  ]);
-
-  const handleStartMicrophone = useCallback(async (): Promise<boolean> => {
-    const hasMicAccess = micGranted || await handleRequestMicPermission();
-    if (!hasMicAccess) return false;
-    const started = await startMicListening();
-    if (started) {
-      setSessionLaunched(true);
-    }
-    return started;
-  }, [micGranted, handleRequestMicPermission, startMicListening]);
+  }, [toast, setupAudioAnalyser, sttLanguage, sttProvider, azureAvailable, startAzureRecognizer, handleFinalTurn, handleBargeIn, updateDraftFromPartial, buildSpeechPhraseHints]);
 
   // ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ Start Session (paid ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â deducts minutes) ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬
   const handleStartSession = useCallback(async () => {
+    if (!micGranted) { await handleRequestMicPermission(); return; }
     if (!hasFullAccess) {
       toast({ title: "No paid minutes", description: "Purchase minutes or upgrade to use Start Session.", variant: "destructive" });
       return;
@@ -5239,14 +5101,13 @@ export default function MeetingSession() {
     sessionUsagePersistedRef.current = false;
     setLastSessionUsageMinutes(null);
     setElapsedSeconds(0);
-    const started = await handleStartMicrophone();
-    if (!started) {
-      setSessionLaunched(false);
-    }
-  }, [hasFullAccess, toast, handleStartMicrophone]);
+    setSessionLaunched(true);
+    await startMicListening();
+  }, [micGranted, hasFullAccess, handleRequestMicPermission, toast, startMicListening]);
 
   // ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ Free Session (6 min per 30 min window) ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬
   const handleFreeSession = useCallback(async () => {
+    if (!micGranted) { await handleRequestMicPermission(); return; }
     let remaining = freeSecondsRemaining;
     if (remaining === null) {
       const access = await refreshSessionAccess();
@@ -5259,11 +5120,9 @@ export default function MeetingSession() {
     sessionUsagePersistedRef.current = false;
     setLastSessionUsageMinutes(null);
     setElapsedSeconds(0);
-    const started = await handleStartMicrophone();
-    if (!started) {
-      setSessionLaunched(false);
-    }
-  }, [freeSecondsRemaining, refreshSessionAccess, handleStartMicrophone]);
+    setSessionLaunched(true);
+    await startMicListening();
+  }, [micGranted, freeSecondsRemaining, handleRequestMicPermission, refreshSessionAccess, startMicListening]);
 
   const startSystemAudioListening = useCallback(async () => {
     try {
@@ -5324,18 +5183,13 @@ export default function MeetingSession() {
       systemAudioAlive.current = true;
       setSttStatus("connected");
 
+      setupAudioAnalyser(audioStream);
+
       audioTracks[0].onended = () => {
         stopListening();
       };
 
-      const preferredRealtimeProvider =
-        sttProvider === "azure" && azureAvailable
-          ? "azure"
-          : sttProvider === "deepgram" && deepgramAvailable
-            ? "deepgram"
-            : null;
-
-      if (preferredRealtimeProvider === "azure") {
+      if (sttProvider === "azure" && azureAvailable) {
         try {
           // Tag system audio as interviewer ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â Q detection always active
           await startAzureRecognizer("system", audioStream, "interviewer");
@@ -5378,36 +5232,18 @@ export default function MeetingSession() {
         }
       }
 
-      if (preferredRealtimeProvider === "deepgram") {
-        try {
-          await startDeepgramRecognizer("system", audioStream, "interviewer");
-          setIsListening(true);
-          setAudioMode("system");
-          updateStatusMutation.mutate({ status: "active" });
-          toast({
-            title: "System audio active",
-            description: "Deepgram live transcription is analyzing the shared audio stream.",
-          });
-          return;
-        } catch (deepgramErr: any) {
-          console.error("[Deepgram system] Failed, falling back:", deepgramErr.message);
-          deepgramRecognizerRef.current?.stop();
-          deepgramRecognizerRef.current = null;
-          toast({ title: "System audio unavailable", description: "Please try sharing your screen/tab audio again.", variant: "destructive" });
-        }
-      }
-
       audioTracks.forEach((t) => t.stop());
       if (displayCaptureStreamRef.current) {
         displayCaptureStreamRef.current.getTracks().forEach((t) => t.stop());
         displayCaptureStreamRef.current = null;
       }
       systemAudioStreamRef.current = null;
+      cleanupAudioAnalyser();
       setSttStatus("error");
-      setSttError("Live system-audio transcription requires Azure Speech or Deepgram.");
+      setSttError("Live system-audio transcription requires Azure Speech.");
       toast({
         title: "Live system STT unavailable",
-        description: "Enable Azure Speech or Deepgram for real-time shared-audio transcription. Batch upload transcription is disabled in live mode.",
+        description: "Enable Azure Speech for real-time system audio transcription. Batch upload transcription is disabled in live mode.",
         variant: "destructive",
       });
       return;
@@ -5420,12 +5256,12 @@ export default function MeetingSession() {
         toast({ title: "Failed to capture system audio", description: error.message, variant: "destructive" });
       }
     }
-  }, [azureAvailable, deepgramAvailable, startAzureRecognizer, startDeepgramRecognizer, sttProvider, toast, handleFinalTurn]);
+  }, [azureAvailable, cleanupAudioAnalyser, setupAudioAnalyser, startAzureRecognizer, sttLanguage, sttProvider, toast, handleFinalTurn]);
 
   const stopListening = useCallback(() => {
-    isStoppingSttRef.current = true;
     recognitionAlive.current = false;
     systemAudioAlive.current = false;
+    if (azureReconnectTimerRef.current) { clearTimeout(azureReconnectTimerRef.current); azureReconnectTimerRef.current = null; }
 
     if (systemTimerRef.current) {
       clearTimeout(systemTimerRef.current);
@@ -5435,11 +5271,6 @@ export default function MeetingSession() {
     if (azureRecognizerRef.current) {
       azureRecognizerRef.current.stop();
       azureRecognizerRef.current = null;
-    }
-
-    if (deepgramRecognizerRef.current) {
-      deepgramRecognizerRef.current.stop();
-      deepgramRecognizerRef.current = null;
     }
 
     if (azureMicShadowRef.current) {
@@ -5480,6 +5311,7 @@ export default function MeetingSession() {
       tabAudioStreamRef.current = null;
     }
 
+    cleanupAudioAnalyser();
     setIsListening(false);
     setSttStatus("idle");
     setSttError("");
@@ -5494,12 +5326,7 @@ export default function MeetingSession() {
     void flushTranscriptPersistQueue();
     stopFreeSessionTick();
     stopFreeCountdown();
-    isStoppingSttRef.current = false;
-  }, [flushTranscriptPersistQueue, stopFreeSessionTick, stopFreeCountdown]);
-
-  useEffect(() => {
-    stopListeningRef.current = stopListening;
-  }, [stopListening]);
+  }, [cleanupAudioAnalyser, flushTranscriptPersistQueue, stopFreeSessionTick, stopFreeCountdown]);
 
   const persistPaidSessionUsage = useCallback(() => {
     if (!id || !hasFullAccess || elapsedSeconds <= 0 || sessionUsagePersistedRef.current) return;
@@ -5850,6 +5677,17 @@ export default function MeetingSession() {
     if (!sourceText) return null;
     const latestFinal = segmentsRef.current[0]?.trim();
     const now = Date.now();
+
+    // If Enter was pressed while Azure is still mid-utterance (interim ends with a dangling
+    // preposition/conjunction like "in", "with", "about"), prefer the latest final segment
+    // which is the complete previous sentence, rather than sending a truncated interim.
+    if (mode === "enter" && latestFinal) {
+      const endsIncomplete = /\b(in|with|on|for|to|of|at|by|from|about|and|or|that|a|an|the|is|are|was|have|has)\s*$/i.test(sourceText);
+      if (endsIncomplete && latestFinal.split(/\s+/).filter(Boolean).length > sourceText.split(/\s+/).filter(Boolean).length) {
+        sourceText = latestFinal;
+      }
+    }
+
     const sourceWordCount = sourceText.split(/\s+/).filter(Boolean).length;
 
     if (/\b(and|or|also)\s*$/i.test(sourceText)) {
@@ -5930,13 +5768,9 @@ export default function MeetingSession() {
       return { seedText: seed, displayQuestion: questions.join("\n"), source: "transcript", multiQuestionMode: true };
     };
 
-    // Raise thresholds to stop partial/noisy ASR fragments from triggering answers.
-    // pause mode needs 3+ words and higher confidence since it fires on every detected silence.
-    const modeThreshold = mode === "pause" ? 0.60 : mode === "final" ? 0.52 : 0.4;
+    const modeThreshold = mode === "pause" ? 0.45 : mode === "final" ? 0.5 : 0.4;
     if (mode === "pause") {
-      // Hard-block single/dual-word fragments in pause mode — they're almost always ASR noise
-      if (sourceWordCount < 3 && !sourceText.includes("?") && !hasImperative) return null;
-      const pauseEligible = sourceWordCount >= 3 && !isLikelyNoiseSegment(sourceText);
+      const pauseEligible = sourceWordCount >= 1 && !isLikelyNoiseSegment(sourceText);
       const passesQuestionGate = advanced.isQuestion && advanced.confidence >= modeThreshold;
       if (!pauseEligible && !passesQuestionGate && !hasImperative) return null;
     } else if (mode === "final") {
@@ -6143,6 +5977,38 @@ export default function MeetingSession() {
     const now = Date.now();
 
     // ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ PRIORITY 1: Follow-up detection ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬
+    // PRIORITY 0: Candidate correction/clarification detection.
+    // Only fires when the VERY LATEST segment is candidate speech — meaning the candidate
+    // spoke AFTER the interviewer's last question. If the interviewer has spoken since,
+    // their question is at index 0 and we fall through to answer it normally.
+    const CANDIDATE_PREFIX_RE = /^Candidate:\s+/i;
+    const latestCandidateSeg = CANDIDATE_PREFIX_RE.test(segmentsRef.current[0] || "")
+      ? segmentsRef.current[0]
+      : null;
+    if (latestCandidateSeg && lastAssistantAnswerRef.current.trim()) {
+      const candidateSpeech = latestCandidateSeg.replace(CANDIDATE_PREFIX_RE, "").trim();
+      const isCorrectionOrClarification =
+        /^(no\b|no,|no i |no I |actually |not exactly|not directly|i don't|i dont|i didn't|i didnt|i haven't|i havent|well no|not really|i do not|i have not|i haven't|i never|actually i|well i|to be honest|honestly|truthfully|i mean |um no|uh no)/i.test(candidateSpeech)
+        || /\b(but i (do|don't|have|haven't|can|can't)|however i|although i|though i)\b/i.test(candidateSpeech);
+      if (isCorrectionOrClarification && candidateSpeech.split(/\s+/).filter(Boolean).length >= 3) {
+        const prevAnswer = lastAssistantAnswerRef.current.trim().slice(0, 400);
+        const seed = [
+          `The candidate just said: "${candidateSpeech}"`,
+          `This corrects or clarifies the previous suggested answer.`,
+          `Previous answer: "${prevAnswer}"`,
+          `Rewrite the answer from the candidate's ACTUAL perspective based on what they said.`,
+          `Keep it interview-ready, honest, and positive (e.g. pivot to related experience they do have).`,
+        ].join("\n");
+        return {
+          seedText: seed,
+          displayQuestion: candidateSpeech,
+          source: "memory-followup" as SubmitSeedSource,
+          recentSpokenReply: candidateSpeech,
+          lastInterviewerQuestion: (interviewerQuestionMemoryRef.current[0]?.text || "").slice(0, 300),
+        };
+      }
+    }
+
     // If the current live text is a short follow-up query ("why?", "how so?",
     // "what about that?"), answer it using previous Q&A context immediately.
     const currentLiveText =
@@ -6190,6 +6056,26 @@ export default function MeetingSession() {
           source: "transcript",
         };
       }
+    }
+
+    // PRIORITY 2.5: Trust the LLM — send latest interviewer utterance directly.
+    // The LLM knows from context whether something is a question or implicit prompt.
+    // We don't need regex to detect "is this a question?" — just send it.
+    // Only skip if: it's candidate's own speech, it's noise, or it's the same as last Enter.
+    const latestSeg = (segmentsRef.current[0] || "").trim();
+    const latestSegNormSimple = latestSeg.toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
+    const latestSegWords = latestSegNormSimple.split(/\s+/).filter(Boolean).length;
+    const latestSegIsNew = normalizeForDedup(latestSeg) !== normalizeForDedup(lastEnterSeedRef.current.text || "");
+    const latestSegIsInterviewer =
+      !CANDIDATE_PREFIX_RE.test(latestSeg)
+      && latestSegWords >= 3
+      && !isLikelyNoiseSegment(latestSeg)
+      && !(/^(i |we |my |our )/i.test(latestSegNormSimple));
+    if (latestSegIsInterviewer && latestSegIsNew) {
+      const cleaned = rewriteMixedTopicQuestion(
+        cleanDetectedInterviewQuestion(dedupeExperienceTopics(sanitizeQuestionCandidate(latestSeg)))
+      );
+      return { seedText: cleaned || latestSeg, displayQuestion: cleaned || latestSeg, source: "transcript" };
     }
 
     const freshPartialCandidate =
@@ -6446,7 +6332,7 @@ export default function MeetingSession() {
     const latestLooseWords = latestLooseNorm.split(/\s+/).filter(Boolean).length;
     const latestLooksQuestionLikeLoose =
       latestUtterance.includes("?")
-      || /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are|tell|walk|explain)\b/i.test(latestLooseNorm);
+      || /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are|tell|walk|explain|describe|share|give|talk|elaborate|discuss)\b/i.test(latestLooseNorm);
     const lastEnterNorm = normalizeForDedup(lastEnterSeedRef.current.text || "");
     const latestIsNewSinceLastEnter =
       !!latestLooseNorm
@@ -6455,6 +6341,20 @@ export default function MeetingSession() {
     if (latestLooksQuestionLikeLoose && latestLooseWords >= 2 && latestIsNewSinceLastEnter) {
       const withQ = latestUtterance.trim().endsWith("?") ? latestUtterance.trim() : `${latestUtterance.trim()}?`;
       return { seedText: withQ, displayQuestion: withQ, source: "transcript" };
+    }
+    // Substantive interviewer statement fallback:
+    // Catches cases like "Describe your experience with X", "Your background in Y",
+    // "So about your Python work" — no question words but clearly an interview prompt.
+    // Requires ≥5 words, not first-person (not candidate's own speech), not noise.
+    const latestIsSubstantiveStatement =
+      latestLooseWords >= 5
+      && !isLikelyNoiseSegment(latestUtterance)
+      && !(/^(i |we |my |our |candidate:)/i.test(latestLooseNorm));
+    if (latestIsSubstantiveStatement && latestIsNewSinceLastEnter) {
+      const cleaned = rewriteMixedTopicQuestion(
+        cleanDetectedInterviewQuestion(dedupeExperienceTopics(sanitizeQuestionCandidate(latestUtterance.trim())))
+      );
+      return { seedText: cleaned || latestUtterance.trim(), displayQuestion: cleaned || latestUtterance.trim(), source: "transcript" };
     }
     const topExplicitCandidates: Array<{ q: string; score: number }> = [];
     for (let idx = 0; idx < topQuestionWindow.length; idx += 1) {
@@ -6536,6 +6436,27 @@ export default function MeetingSession() {
       const hybrid = maybeWrapHybridFollowups(best);
       if (hybrid) return { seedText: hybrid.seedText, displayQuestion: hybrid.displayQuestion, source: hybrid.source, multiQuestionMode: hybrid.multiQuestionMode };
       return { seedText: best, displayQuestion: best, source: "transcript" };
+    }
+
+    // Interim text fallback: if the question is still being transcribed (not yet committed to
+    // segmentsRef), use currentLiveText directly as the seed so Enter fires immediately.
+    // Only use if it's substantive (≥4 words, not noise, not pure first-person candidate speech).
+    if (currentLiveText) {
+      const liveWords = currentLiveText.trim().split(/\s+/).filter(Boolean);
+      const liveNorm = currentLiveText.toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
+      const liveIsSubstantive =
+        liveWords.length >= 4
+        && !isLikelyNoiseSegment(currentLiveText)
+        && !(/^(i |we |my |our )/i.test(liveNorm));
+      const liveIsNewVsLastEnter =
+        normalizeForDedup(currentLiveText) !== normalizeForDedup(lastEnterSeedRef.current.text || "");
+      if (liveIsSubstantive && liveIsNewVsLastEnter) {
+        const liveCleaned = rewriteMixedTopicQuestion(
+          cleanDetectedInterviewQuestion(dedupeExperienceTopics(sanitizeQuestionCandidate(currentLiveText)))
+        );
+        const liveWithQ = (liveCleaned || currentLiveText).trim();
+        return { seedText: liveWithQ, displayQuestion: liveWithQ, source: "transcript" };
+      }
     }
 
     // No explicit question found in latest turn window -> follow up on latest context.
@@ -7455,7 +7376,7 @@ export default function MeetingSession() {
     if (ws && ws.readyState === WebSocket.OPEN && id) {
       triggerMetricRef.current = { t_trigger_decision: now };
       triggerMetricRef.current.t_request_sent = now;
-      if (isStreaming) {
+      if (isStreaming || isAwaitingFirstChunk) {
         try {
           ws.send(JSON.stringify({ type: "cancel", sessionId: id }));
         } catch {}
@@ -7519,6 +7440,7 @@ export default function MeetingSession() {
     toast,
     INTERPRETED_PLACEHOLDER,
     isStreaming,
+    isAwaitingFirstChunk,
     isRecentDuplicateIntent,
     rememberAskedFingerprint,
     appendConversationContextLine,
@@ -7605,10 +7527,22 @@ export default function MeetingSession() {
     if (!id || !isListening) return;
     const timer = setInterval(() => {
       const now = Date.now();
-      const draft = (questionDraftRef.current.trim() || interimText.trim()).trim();
+      let draft = (questionDraftRef.current.trim() || interimText.trim()).trim();
       if (!draft) return;
       const stable = now - stableSinceTsRef.current >= STABLE_MS;
       if (!stable) return;
+
+      // If the draft ends mid-sentence (dangling preposition/article/conjunction) OR looks
+      // like a sentence tail ("one over the other", "into your application"), prefer the
+      // last finalized segment so speculative starts with a complete question.
+      const draftEndsIncomplete =
+        /\b(in|with|on|for|to|of|at|by|from|about|and|or|that|a|an|the|is|are|was|have|has)\s*$/i.test(draft)
+        || /\b(one over the other|into your application|in your application|in your project|over the other|each other|one another|than the other)\s*$/i.test(draft);
+      const latestFinalForSpec = segmentsRef.current[0]?.trim();
+      if (draftEndsIncomplete && latestFinalForSpec && latestFinalForSpec.split(/\s+/).filter(Boolean).length > draft.split(/\s+/).filter(Boolean).length) {
+        draft = latestFinalForSpec;
+      }
+
       const wordCount = draft.split(/\s+/).filter(Boolean).length;
       if (wordCount < 3) return;
       if (isLikelyNoiseSegment(draft)) return;
@@ -7644,10 +7578,6 @@ export default function MeetingSession() {
         azureRecognizerRef.current.stop();
         azureRecognizerRef.current = null;
       }
-      if (deepgramRecognizerRef.current) {
-        deepgramRecognizerRef.current.stop();
-        deepgramRecognizerRef.current = null;
-      }
       if (recognitionRef.current) {
         try { recognitionRef.current.stop(); } catch (e) {}
         recognitionRef.current = null;
@@ -7669,6 +7599,10 @@ export default function MeetingSession() {
         visionCaptureStreamRef.current = null;
       }
       (window as ScreenShareWindow).__zoommateVisionStream = null;
+      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+      if (audioContextRef.current) {
+        try { audioContextRef.current.close(); } catch (e) {}
+      }
       if (transcriptPersistTimerRef.current) {
         clearTimeout(transcriptPersistTimerRef.current);
         transcriptPersistTimerRef.current = null;
@@ -7684,10 +7618,10 @@ export default function MeetingSession() {
     askStreamingQuestion(question);
   }, [askStreamingQuestion]);
 
-  const handleCopilotAsk = useCallback(() => {
+  const handleCopilotAsk = () => {
     console.log("[submit] send icon clicked");
     submitCurrentQuestion("send_icon");
-  }, [submitCurrentQuestion]);
+  };
 
   // Retry: re-sends the last interpreted question
   const handleRetry = useCallback(() => {
@@ -8316,74 +8250,17 @@ export default function MeetingSession() {
     syncScreenPreviewTargets();
   }, [screenShareLabel, syncScreenPreviewTargets, toast]);
 
-  const copyToClipboard = useCallback((text: string, responseId: string) => {
+  const copyToClipboard = (text: string, responseId: string) => {
     navigator.clipboard.writeText(text);
     setCopiedId(responseId);
     setTimeout(() => setCopiedId(null), 2000);
-  }, []);
-
-  const cancelActiveStream = useCallback(() => {
-    abortCurrentStream();
-    fetch(`/api/meetings/${id}/cancel-stream`, { method: "POST", credentials: "include" }).catch(() => {});
-  }, [abortCurrentStream, id]);
+  };
 
   const formatTime = (seconds: number) => {
     const m = Math.floor(seconds / 60);
     const s = seconds % 60;
     return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
   };
-  const freeResetText = freeResetSeconds !== null ? formatMmSs(freeResetSeconds) : "";
-  const transcriptTimerLabel = !hasFullAccess && freeSecondsRemaining !== null
-    ? `${formatMmSs(freeSecondsRemaining)} left`
-    : formatMmSs(elapsedSeconds);
-  const transcriptTimerWarning = !hasFullAccess && freeSecondsRemaining !== null && freeSecondsRemaining <= 60;
-
-  const handleSubmitManualQuestion = useCallback(() => {
-    if (!manualTypeText.trim()) return;
-    submitExplicitQuestion(manualTypeText.trim());
-    setManualTypeText("");
-  }, [manualTypeText, submitExplicitQuestion]);
-
-  const handleUpgradePricing = useCallback(() => {
-    window.location.href = "/pricing";
-  }, []);
-
-  const handleDismissUpgradeBanner = useCallback(() => {
-    setShowUpgradeBanner(false);
-  }, []);
-
-  const handleClearMultiCapture = useCallback(() => {
-    setMultiCaptureQueue([]);
-  }, []);
-
-  const handleToggleSidebarScreenShare = useCallback(() => {
-    if (isScreenShareReady) {
-      stopVisionScreenShare();
-      return;
-    }
-    handleStartScreenShare();
-  }, [isScreenShareReady, stopVisionScreenShare, handleStartScreenShare]);
-
-  const handleSelectRecentQuestion = useCallback((question: string) => {
-    setSelectedQuestionFilter(question);
-    const matchingResponse = responsesLocalRef.current.find(
-      (response) => normalizeForDedup(response.question || "") === normalizeForDedup(question),
-    );
-    if (matchingResponse) {
-      setSelectedResponseId(matchingResponse.id);
-    }
-  }, []);
-
-  const handleReanswerQuestion = useCallback((question: string) => {
-    submitExplicitQuestion(question);
-  }, [submitExplicitQuestion]);
-
-  const formatSidebarHistoryAnswer = useCallback((question: string | null | undefined, answer: string) => {
-    const normalizedQuestion = question || undefined;
-    return shouldDisplayAnswerAsCode(normalizedQuestion, answer)
-      ? enforceCodeOnlyDisplay(answer, normalizedQuestion)
-      : answer;
-  }, [shouldDisplayAnswerAsCode, enforceCodeOnlyDisplay]);
 
   if (meetingLoading) {
     return (
@@ -8403,99 +8280,6 @@ export default function MeetingSession() {
             <Button>Back to Dashboard</Button>
           </Link>
         </Card>
-      </div>
-    );
-  }
-
-  if (compactMode) {
-    return (
-      <div
-        className="fixed bottom-4 right-4 z-[99999] flex flex-col rounded-md border shadow-lg bg-background/90 backdrop-blur-xl"
-        style={{
-          width: "380px",
-          maxHeight: "420px",
-        }}
-        data-testid="compact-overlay"
-      >
-        <div className="flex items-center justify-between gap-2 px-3 h-9 border-b bg-muted/50 flex-wrap">
-          <div className="flex items-center gap-2">
-            <Zap className="w-3 h-3 text-primary" />
-            <span className="text-xs font-semibold truncate max-w-[120px]">{meeting.title}</span>
-            {isListening && (
-              <div className="w-1.5 h-1.5 rounded-full bg-destructive animate-pulse" />
-            )}
-          </div>
-          <div className="flex items-center gap-1">
-            <span className="text-xs font-mono text-muted-foreground">{formatTime(elapsedSeconds)}</span>
-            <Button variant="ghost" size="icon" onClick={() => setCompactMode(false)} data-testid="button-expand">
-              <Maximize2 className="w-3 h-3" />
-            </Button>
-          </div>
-        </div>
-
-        <div className="flex-1 overflow-y-auto p-2 space-y-1.5" ref={scrollRef} style={{ maxHeight: "300px" }}>
-          {(streamingAnswer || pendingResponse?.answer) && (
-            <div className="p-2 rounded-md border border-primary/20 text-xs bg-primary/5">
-              {streamingDisplayAsCode ? (
-                <MarkdownRenderer content={streamingRenderedAnswer} className="text-xs leading-relaxed" />
-              ) : (
-                <pre className="whitespace-pre-wrap text-xs leading-relaxed font-sans">
-                  {streamingDisplayAnswer}
-                </pre>
-              )}
-              <span className="inline-block w-1 h-3 bg-primary animate-pulse ml-0.5" />
-            </div>
-          )}
-          {(showResponseHistory ? responsesLocal.slice(0, 5) : responsesLocal.slice(0, 1)).map((resp) => (
-            <div key={resp.id} className="p-2 rounded-md border text-xs bg-card/50" data-testid={`compact-response-${resp.id}`}>
-              <div className="flex items-center justify-between gap-2 mb-1">
-                <span className="text-xs text-muted-foreground">{resp.createdAt ? new Date(resp.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : ""}</span>
-                <Button variant="ghost" size="icon" onClick={() => copyToClipboard(resp.answer, resp.id)}>
-                  {copiedId === resp.id ? <Check className="w-3 h-3 text-chart-3" /> : <Copy className="w-3 h-3" />}
-                </Button>
-              </div>
-              {shouldDisplayAnswerAsCode(resp.question, resp.answer) ? (
-                <MarkdownRenderer content={enforceCodeOnlyDisplay(resp.answer, resp.question)} className="leading-relaxed text-xs" />
-              ) : (
-                <MarkdownRenderer content={resp.answer} className="leading-relaxed text-xs" />
-              )}
-            </div>
-          ))}
-        </div>
-
-        <div className="border-t p-2">
-          {responsesLocal.length > 1 && (
-            <div className="mb-2">
-              <Button
-                size="sm"
-                variant="ghost"
-                className="h-7 text-xs w-full"
-                onClick={() => setShowResponseHistory((v) => !v)}
-                data-testid="button-toggle-history-compact"
-              >
-                {showResponseHistory ? "Hide History" : `View History (${responsesLocal.length})`}
-              </Button>
-            </div>
-          )}
-          <div className="flex items-center gap-1.5">
-            <Button
-              size="icon"
-              variant={isListening ? "destructive" : "default"}
-              onClick={isListening ? stopListening : startMicListening}
-              data-testid="button-listen-compact"
-            >
-              {isListening ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
-            </Button>
-            <Button
-              size="icon"
-              onClick={handleCopilotAsk}
-              disabled={isStreaming}
-              data-testid="button-send-compact"
-            >
-              {isStreaming ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
-            </Button>
-          </div>
-        </div>
       </div>
     );
   }
@@ -8588,7 +8372,7 @@ export default function MeetingSession() {
   }
 
   return (
-    <div className="min-h-screen bg-background flex flex-col">
+    <div className="h-screen overflow-hidden bg-background flex flex-col">
       {showDebugPanel && (
         <DebugPanel data={debugPanelData} onClose={() => setShowDebugPanel(false)} />
       )}
@@ -8676,7 +8460,7 @@ export default function MeetingSession() {
               <select
                 value={sttProvider}
                 onChange={(e) => {
-                  const val = e.target.value as SttProvider;
+                  const val = e.target.value as "azure" | "browser";
                   setSttProvider(val);
                   localStorage.setItem("zoommate-stt-engine", val);
                 }}
@@ -8684,17 +8468,11 @@ export default function MeetingSession() {
                 data-testid="select-stt-provider"
               >
                 {azureAvailable && <option value="azure">Azure Speech (recommended)</option>}
-                {deepgramAvailable && <option value="deepgram">Deepgram Live</option>}
                 <option value="browser">Browser Speech API</option>
               </select>
               {sttProvider === "azure" && (
                 <p className="text-xs text-emerald-500 mt-1 flex items-center gap-1">
                   <Cloud className="w-3 h-3" /> Azure Speech active - smooth real-time partials + finals
-                </p>
-              )}
-              {sttProvider === "deepgram" && (
-                <p className="text-xs text-emerald-500 mt-1 flex items-center gap-1">
-                  <Cloud className="w-3 h-3" /> Deepgram active - live partials + finals via short-lived tokens
                 </p>
               )}
               {sttProvider === "browser" && (
@@ -8704,10 +8482,8 @@ export default function MeetingSession() {
             <p className="text-xs text-muted-foreground mt-3">
               {sttProvider === "azure"
                 ? "Azure Speech provides smooth real-time transcription with partial updates for both microphone and system audio."
-                : sttProvider === "deepgram"
-                  ? "Deepgram provides real-time transcription for microphone and shared audio using short-lived server-minted browser tokens."
                 : <>
-                    <strong>Microphone</strong> uses browser speech recognition for real-time results (Chrome best). <strong>System Audio</strong> live mode requires Azure Speech or Deepgram.
+                    <strong>Microphone</strong> uses browser speech recognition for real-time results (Chrome best). <strong>System Audio</strong> live mode requires Azure Speech.
                   </>
               }
             </p>
@@ -8732,33 +8508,8 @@ export default function MeetingSession() {
               End Session
             </Button>
           </div>
-          <div className="flex-1 flex overflow-hidden">
-            <div className="w-full flex flex-col lg:flex-row overflow-hidden">
-              <SessionTranscriptPanel
-                timerLabel={transcriptTimerLabel}
-                timerWarning={transcriptTimerWarning}
-                isListening={isListening}
-                micGranted={micGranted}
-                sttStatus={sttStatus}
-                sttError={sttError}
-                displayTranscriptSegments={displayTranscriptSegments}
-                displayTranscriptSegmentKeys={displayTranscriptSegmentKeys}
-                interimText={interimText}
-                stagedTranscriptText={stagedTranscriptText}
-                pendingTranscriptLine={pendingTranscriptLine}
-                showUpgradeBanner={showUpgradeBanner}
-                freeResetText={freeResetText}
-                lastSessionUsageMinutes={lastSessionUsageMinutes}
-                onUpgrade={handleUpgradePricing}
-                onDismissUpgradeBanner={handleDismissUpgradeBanner}
-                audioMode={audioMode}
-                onRequestMicPermission={() => { void handleRequestMicPermission(); }}
-                onSendTranscript={handleSendTranscript}
-                onCopilotAsk={handleCopilotAsk}
-                isStreaming={isStreaming}
-                scrollRef={transcriptScrollRef}
-              />
-              {false && (
+          <div className="flex-1 flex overflow-hidden min-h-0">
+            <div className="w-full h-full flex flex-col lg:flex-row overflow-hidden">
               <div
                 className="lg:w-[360px] xl:w-[400px] lg:min-w-[280px] lg:max-w-[640px] shrink-0 border-b lg:border-b-0 lg:border-r flex flex-col lg:resize-x lg:overflow-auto"
                 style={{ minHeight: 0 }}
@@ -8768,9 +8519,9 @@ export default function MeetingSession() {
                     <Eye className="w-3 h-3" />
                     Live Transcript
                     {isListening && (
-                      <span className={`font-mono text-[10px] px-1.5 py-0.5 rounded ${!hasFullAccess && (freeSecondsRemaining ?? 61) <= 60 ? "bg-destructive/10 text-destructive" : "bg-muted text-muted-foreground"}`}>
+                      <span className={`font-mono text-[10px] px-1.5 py-0.5 rounded ${!hasFullAccess && freeSecondsRemaining !== null && freeSecondsRemaining <= 60 ? "bg-destructive/10 text-destructive" : "bg-muted text-muted-foreground"}`}>
                         {!hasFullAccess && freeSecondsRemaining !== null
-                          ? `${formatMmSs(freeSecondsRemaining ?? 0)} left`
+                          ? `${formatMmSs(freeSecondsRemaining)} left`
                           : formatMmSs(elapsedSeconds)}
                       </span>
                     )}
@@ -8792,7 +8543,7 @@ export default function MeetingSession() {
                       <p className="text-xs text-muted-foreground">
                         Your 6-minute free session is over.
                         {freeResetSeconds !== null && (
-                          <> Free trial resets in {formatMmSs(freeResetSeconds ?? 0)}.</>
+                          <> Free trial resets in {formatMmSs(freeResetSeconds)}.</>
                         )}
                       </p>
                       {lastSessionUsageMinutes !== null && (
@@ -8880,7 +8631,7 @@ export default function MeetingSession() {
                           <Button
                             className="w-full text-xs h-9 bg-blue-600 hover:bg-blue-700 text-white"
                             onClick={handleStartSession}
-                            disabled={!hasFullAccess}
+                            disabled={!micGranted || !hasFullAccess}
                             data-testid="button-start-session"
                           >
                             <Zap className="w-3.5 h-3.5 mr-1.5" />
@@ -8889,7 +8640,7 @@ export default function MeetingSession() {
                           <Button
                             className="w-full text-xs h-9 bg-amber-500 hover:bg-amber-600 text-white"
                             onClick={handleFreeSession}
-                            disabled={(freeSecondsRemaining ?? 1) <= 0}
+                            disabled={!micGranted || (freeSecondsRemaining !== null && freeSecondsRemaining <= 0)}
                             data-testid="button-free-session"
                           >
                             <Mic className="w-3.5 h-3.5 mr-1.5" />
@@ -8901,7 +8652,7 @@ export default function MeetingSession() {
                             {(freeSecondsRemaining ?? 0) > 0
                               ? `${formatMmSs(360 - (freeSecondsRemaining ?? 0))} used - ${formatMmSs(freeSecondsRemaining ?? 0)} left`
                               : (freeResetSeconds !== null
-                                ? `Free trial resets in ${formatMmSs(freeResetSeconds ?? 0)}`
+                                ? `Free trial resets in ${formatMmSs(freeResetSeconds)}`
                                 : "Free trial used - upgrade for full access")}
                           </p>
                         )}
@@ -8926,12 +8677,12 @@ export default function MeetingSession() {
                         Start listening to capture interviewer audio.
                         {!hasFullAccess && freeSecondsRemaining !== null && (
                           <span className="block mt-1 font-medium text-primary">
-                            Free session: {formatMmSs(360 - (freeSecondsRemaining ?? 0))} / 6:00 used
+                            Free session: {formatMmSs(360 - freeSecondsRemaining)} / 6:00 used
                           </span>
                         )}
                       </p>
                       <div className="flex flex-col gap-2">
-                        <Button onClick={handleStartMicrophone} className="w-full" data-testid="button-listen-mic">
+                        <Button onClick={startMicListening} className="w-full" data-testid="button-listen-mic">
                           <Mic className="w-4 h-4 mr-2" />
                           Start Microphone
                         </Button>
@@ -8987,9 +8738,9 @@ export default function MeetingSession() {
                         const isStaleEcho = !!activeLiveText && !!latestSeg
                           && normalizeForDedup(latestSeg) === normalizeForDedup(activeLiveText);
                         const liveText = isStaleEcho ? "" : activeLiveText;
-                        const rows = liveText
+                        const rows = (liveText
                           ? [liveText, ...displayTranscriptSegments.filter((seg) => normalizeForDedup(seg) !== normalizeForDedup(liveText))]
-                          : displayTranscriptSegments;
+                          : displayTranscriptSegments).slice(0, 15);
                         return rows.map((seg, i) => {
                           const adv = detectQuestionAdvanced(seg);
                           const isQ = detectQuestion(seg) || (adv.isQuestion && adv.confidence >= 0.5);
@@ -9053,7 +8804,6 @@ export default function MeetingSession() {
                   </p>
                 </div>
               </div>
-              )}
 
               {(meeting as any)?.sessionMode === "coding" && (
                 <div
@@ -9070,38 +8820,6 @@ export default function MeetingSession() {
                 </div>
               )}
 
-              <SessionInsightsPanel
-                isScreenShareReady={isScreenShareReady}
-                onToggleScreenShare={isScreenShareReady ? stopVisionScreenShare : handleStartScreenShare}
-                isScreenAnalyzing={isScreenAnalyzing}
-                onScreenCapture={handleScreenCapture}
-                isMultiAnalyzing={isMultiAnalyzing}
-                onAddToMultiCapture={handleAddToMultiCapture}
-                multiCaptureQueueLength={multiCaptureQueue.length}
-                onSubmitMultiScreenAnalysis={submitMultiScreenAnalysis}
-                onClearMultiCapture={handleClearMultiCapture}
-                onGenerate={handleSendTranscript}
-                generateDisabled={isStreaming || !isListening}
-                shouldShowStreamingCard={shouldShowStreamingCard}
-                isStreaming={isStreaming}
-                isAwaitingFirstChunk={isAwaitingFirstChunk}
-                streamingQuestion={streamingDisplayQuestion}
-                streamingAnswer={streamingRenderedAnswer}
-                streamingRenderAsCode={streamingDisplayAsCode}
-                isRefining={isRefining}
-                onCancelStream={cancelActiveStream}
-                selectedResponse={selectedResponse}
-                selectedResponseRenderedAnswer={selectedResponseRenderedAnswer}
-                copiedId={copiedId}
-                onDeepRerun={handleDeepRerun}
-                onCopyResponse={copyToClipboard}
-                scrollRef={scrollRef}
-                manualQuestion={manualTypeText}
-                onManualQuestionChange={setManualTypeText}
-                onSubmitManualQuestion={handleSubmitManualQuestion}
-                manualQuestionDisabled={isStreaming || !manualTypeText.trim()}
-              />
-              {false && (
               <div className="flex-1 flex flex-col overflow-hidden">
                 <div className="shrink-0 border-b px-4 py-1.5 flex items-center justify-between">
                   <div className="flex items-center gap-2">
@@ -9190,7 +8908,7 @@ export default function MeetingSession() {
                   </Button>
                 </div>
                 <div
-                  className="flex-1 overflow-y-auto p-3"
+                  className="flex-1 overflow-y-auto min-h-0 p-3"
                   ref={scrollRef}
                   onScroll={() => {
                     if (!scrollRef.current) return;
@@ -9201,33 +8919,12 @@ export default function MeetingSession() {
                     <div className="space-y-3">
                       {shouldShowStreamingCard && (
                         <div className="py-2" data-testid="card-streaming-response">
-                          {isStreaming && (
-                            <div className="flex justify-end mb-1">
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                className="shrink-0 h-6 text-xs text-destructive hover:text-destructive"
-                                onClick={() => {
-                                  abortCurrentStream();
-                                  fetch(`/api/meetings/${id}/cancel-stream`, { method: "POST", credentials: "include" }).catch(() => {});
-                                }}
-                                data-testid="button-cancel-stream"
-                              >
-                                <Square className="w-3 h-3 mr-1" /> Stop
-                              </Button>
-                            </div>
-                          )}
                           {(streamingAnswer || pendingResponse?.answer) ? (
                             <div className="text-sm leading-relaxed">
-                              {streamingDisplayQuestion && (
-                                <div className="font-bold mb-2 text-foreground/90 pb-2 border-b border-primary/10">Q: {streamingDisplayQuestion}</div>
-                              )}
                               {streamingDisplayAsCode ? (
-                                <MarkdownRenderer content={streamingRenderedAnswer} />
+                                <MarkdownRenderer content={enforceCodeOnlyDisplay(streamingDisplayAnswer, streamingDisplayQuestion)} streaming={isStreaming} />
                               ) : (
-                                <pre className="whitespace-pre-wrap text-sm font-sans">
-                                  {streamingDisplayAnswer}
-                                </pre>
+                                <MarkdownRenderer content={streamingDisplayAnswer} streaming={isStreaming} />
                               )}
                               {isRefining
                                 ? <span className="text-[10px] text-muted-foreground ml-1 animate-pulse">Refining...</span>
@@ -9245,7 +8942,7 @@ export default function MeetingSession() {
                         </div>
                       )}
 
-                      {(showResponseHistory ? responsesLocal : responsesLocal.slice(0, 1))
+                      {(showResponseHistory ? responsesLocal.slice(0, 6) : responsesLocal.slice(0, 1))
                         .map((resp) => (
                           <div
                             key={resp.id}
@@ -9253,18 +8950,7 @@ export default function MeetingSession() {
                             className={`py-2 ${highlightResponseId === resp.id ? "bg-primary/5 rounded px-2" : ""}`}
                             data-testid={`card-response-${resp.id}`}
                           >
-                            <div className="flex justify-end gap-0.5 mb-1">
-                              <Button variant="ghost" size="icon" className="h-5 w-5" onClick={() => handleDeepRerun(resp.question)} disabled={isStreaming} title="Re-run with GPT-5" data-testid={`button-deep-${resp.id}`}>
-                                <Brain className="w-2.5 h-2.5" />
-                              </Button>
-                              <Button variant="ghost" size="icon" className="h-5 w-5" onClick={() => copyToClipboard(resp.answer, resp.id)} data-testid={`button-copy-${resp.id}`}>
-                                {copiedId === resp.id ? <Check className="w-2.5 h-2.5 text-chart-3" /> : <Copy className="w-2.5 h-2.5" />}
-                              </Button>
-                            </div>
                             <div className="text-sm leading-relaxed">
-                              {resp.question && (
-                                <div className="font-bold mb-2 text-foreground/90 pb-2 border-b border-primary/10">Q: {resp.question}</div>
-                              )}
                               {shouldDisplayAnswerAsCode(resp.question, resp.answer) ? (
                                 <MarkdownRenderer content={enforceCodeOnlyDisplay(resp.answer, resp.question)} />
                               ) : (
@@ -9319,27 +9005,7 @@ export default function MeetingSession() {
                   </Button>
                 </div>
               </div>
-              )}
 
-              <SessionSidebarPanel
-                isScreenShareReady={isScreenShareReady}
-                isScreenPreviewPopupOpen={isScreenPreviewPopupOpen}
-                onTogglePreviewPopup={handleToggleScreenPreviewPopup}
-                screenShareLabel={screenShareLabel}
-                screenShareThumbnail={screenShareThumbnail}
-                previewVideoRef={sharedScreenPreviewVideoRef}
-                onToggleScreenShare={handleToggleSidebarScreenShare}
-                isScreenAnalyzing={isScreenAnalyzing}
-                onScreenCapture={handleScreenCapture}
-                recentQuestions={recentQuestions}
-                selectedQuestionFilter={selectedQuestionFilter}
-                onSelectQuestion={handleSelectRecentQuestion}
-                onReanswerQuestion={handleReanswerQuestion}
-                reanswerDisabled={isStreaming}
-                responses={responsesLocal}
-                formatHistoryAnswer={formatSidebarHistoryAnswer}
-              />
-              {false && (
               <div
                 className="lg:w-[300px] xl:w-[340px] lg:min-w-[260px] lg:max-w-[560px] shrink-0 border-l flex flex-col lg:resize-x lg:overflow-auto"
                 style={{ minHeight: 0 }}
@@ -9431,12 +9097,6 @@ export default function MeetingSession() {
                           type="button"
                           onClick={() => {
                             setSelectedQuestionFilter(text);
-                            const matchingResponse = responsesLocal.find(
-                              (response) => normalizeForDedup(response.question || "") === normalizeForDedup(text),
-                            );
-                            if (matchingResponse) {
-                              setSelectedResponseId(matchingResponse.id);
-                            }
                           }}
                           className={`flex-1 text-left text-xs leading-relaxed transition-colors ${
                             normalizeForDedup(text) === normalizeForDedup(selectedQuestionFilter)
@@ -9480,7 +9140,6 @@ export default function MeetingSession() {
                   )}
                 </div>
               </div>
-              )}
 
               <AnimatePresence>
                 {showMemory && (

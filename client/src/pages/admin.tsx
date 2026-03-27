@@ -19,8 +19,7 @@ import {
   Shield, Search, Loader2, Settings, Activity, Key, Eye, EyeOff, Save,
   CreditCard, Gift, Ban, History, ChevronDown, ChevronUp, DollarSign, Plus,
   Download, Megaphone, AlertTriangle, Trash2, UserX, CheckCircle, XCircle,
-  TrendingUp, UserPlus, Globe, Wrench, FileText, Database, Router, BarChart2,
-  Mail
+  TrendingUp, UserPlus, Globe, Wrench, FileText, Database, Router, BarChart2
 } from "lucide-react";
 import { motion } from "framer-motion";
 
@@ -543,7 +542,7 @@ interface RouterConfig {
 const USE_CASE_LABELS: Record<string, string> = {
   QUESTION_CLASSIFIER: "Question Classifier",
   QUESTION_NORMALIZER: "Question Normalizer",
-  LIVE_INTERVIEW_ANSWER: "Live Interview Answer",
+  LIVE_INTERVIEW_ANSWER: "Live Meeting Answer",
   SUMMARY_UPDATER: "Summary Updater",
   FACT_EXTRACTOR: "Fact Extractor",
   CODING_ASSIST: "Coding Assist",
@@ -726,35 +725,17 @@ function SettingsTab() {
   const [googleSttKey, setGoogleSttKey] = useState("");
   const [azureSpeechKey, setAzureSpeechKey] = useState("");
   const [azureSpeechRegion, setAzureSpeechRegion] = useState("");
-  const [deepgramApiKey, setDeepgramApiKey] = useState("");
   const [showOpenai, setShowOpenai] = useState(false);
   const [showGemini, setShowGemini] = useState(false);
   const [showAzure, setShowAzure] = useState(false);
-  const [showDeepgram, setShowDeepgram] = useState(false);
-  const [smtpHost, setSmtpHost] = useState("");
-  const [smtpPort, setSmtpPort] = useState("");
-  const [smtpUser, setSmtpUser] = useState("");
-  const [smtpPass, setSmtpPass] = useState("");
-  const [smtpFromEmail, setSmtpFromEmail] = useState("");
-  const [smtpFromName, setSmtpFromName] = useState("");
-  const [showSmtpPass, setShowSmtpPass] = useState(false);
-  const [smtpSynced, setSmtpSynced] = useState(false);
-  const [testSmtpEmail, setTestSmtpEmail] = useState("");
   const { data: settings, isLoading: settingsLoading } = useQuery<any>({ queryKey: ["/api/admin/settings"] });
   const [defaultModel, setDefaultModel] = useState("gpt-4o");
   const [modelSynced, setModelSynced] = useState(false);
-  const [defaultSttProvider, setDefaultSttProvider] = useState("browser");
-  const [sttProviderSynced, setSttProviderSynced] = useState(false);
   const { data: models } = useQuery<{ openai: string[]; gemini: string[] }>({ queryKey: ["/api/models"] });
 
   if (settings?.default_model && !modelSynced) {
     setDefaultModel(settings.default_model);
     setModelSynced(true);
-  }
-
-  if (settings?.default_stt_provider && !sttProviderSynced) {
-    setDefaultSttProvider(settings.default_stt_provider);
-    setSttProviderSynced(true);
   }
 
   const saveMutation = useMutation({
@@ -771,45 +752,8 @@ function SettingsTab() {
     },
   });
 
-  const smtpSaveMutation = useMutation({
-    mutationFn: async (data: any) => {
-      const res = await apiRequest("POST", "/api/admin/settings/save-smtp", data);
-      return res.json();
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["/api/admin/settings"] });
-      toast({ title: "SMTP settings saved successfully" });
-    },
-    onError: (error: Error) => {
-      toast({ title: "Failed to save SMTP settings", description: error.message, variant: "destructive" });
-    },
-  });
-
-  const testSmtpMutation = useMutation({
-    mutationFn: async (data: { email?: string }) => {
-      const res = await apiRequest("POST", "/api/admin/settings/test-smtp", data);
-      return res.json();
-    },
-    onSuccess: (data: any) => {
-      toast({ title: "SMTP Test", description: data.message });
-    },
-    onError: (error: Error) => {
-      toast({ title: "SMTP Test Failed", description: error.message, variant: "destructive" });
-    },
-  });
-
   if (settingsLoading) {
     return <Card className="p-6"><div className="flex items-center justify-center py-8"><Loader2 className="w-6 h-6 animate-spin text-primary" /></div></Card>;
-  }
-
-  // Sync SMTP fields from settings
-  if (settings && !smtpSynced) {
-    setSmtpHost(settings.smtp_host || "");
-    setSmtpPort(settings.smtp_port || "587");
-    setSmtpUser(settings.smtp_user || "");
-    setSmtpFromEmail(settings.smtp_from_email || "");
-    setSmtpFromName(settings.smtp_from_name || "");
-    setSmtpSynced(true);
   }
 
   const allModels = [
@@ -953,129 +897,6 @@ function SettingsTab() {
               </div>
               <p className="text-xs text-muted-foreground">Azure Speech provides the smoothest real-time transcription with partial updates. Key is never sent to the browser - only short-lived tokens are minted. You can enter multiple regions (comma-separated) for automatic nearest-region selection and failover.</p>
             </div>
-          </div>
-
-          <div className="p-4 border rounded-md space-y-3">
-            <div className="flex items-center justify-between gap-4 flex-wrap">
-              <div>
-                <p className="font-medium text-sm">Deepgram Live STT</p>
-                <p className="text-xs text-muted-foreground">
-                  {settings?.deepgram_api_key_set
-                    ? `Key: ••••••••••••${settings.deepgram_api_key_last4 || ""}`
-                    : "Not configured (optional - real-time Deepgram transcription)"}
-                </p>
-              </div>
-              <div className="flex items-center gap-2">
-                <div className={`w-2 h-2 rounded-full ${settings?.deepgram_api_key_set ? "bg-emerald-500" : "bg-muted-foreground"}`} />
-                <span className="text-xs text-muted-foreground">{settings?.deepgram_api_key_set ? "Active" : "Inactive"}</span>
-              </div>
-            </div>
-            <div className="space-y-2">
-              <div className="flex items-center gap-2">
-                <div className="relative flex-1">
-                  <Input type={showDeepgram ? "text" : "password"} value={deepgramApiKey} onChange={(e) => setDeepgramApiKey(e.target.value)} placeholder="Deepgram API key..." data-testid="input-deepgram-api-key" />
-                  <Button variant="ghost" size="icon" className="absolute right-0 top-0" onClick={() => setShowDeepgram(!showDeepgram)} data-testid="button-toggle-deepgram-visibility">
-                    {showDeepgram ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                  </Button>
-                </div>
-                <Button size="sm" onClick={() => { saveMutation.mutate({ deepgram_api_key: deepgramApiKey }); setDeepgramApiKey(""); }} disabled={!deepgramApiKey || saveMutation.isPending} data-testid="button-save-deepgram">
-                  <Save className="w-4 h-4 mr-1" /> Save
-                </Button>
-              </div>
-              <p className="text-xs text-muted-foreground">Deepgram is stored server-side and used only to mint short-lived browser tokens for live transcription.</p>
-            </div>
-          </div>
-
-          <div className="p-4 border rounded-md space-y-3">
-            <div className="flex items-center justify-between gap-4 flex-wrap">
-              <div>
-                <p className="font-medium text-sm">Default STT Provider</p>
-                <p className="text-xs text-muted-foreground">Choose the live transcription engine that Zoommate should prefer by default.</p>
-              </div>
-              <div className="flex items-center gap-2">
-                <Badge variant="secondary" className="uppercase">{defaultSttProvider}</Badge>
-              </div>
-            </div>
-            <div className="flex items-center gap-2">
-              <Select value={defaultSttProvider} onValueChange={setDefaultSttProvider}>
-                <SelectTrigger className="flex-1" data-testid="select-default-stt-provider">
-                  <SelectValue placeholder="Choose a provider" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="azure">Azure Speech</SelectItem>
-                  <SelectItem value="deepgram">Deepgram</SelectItem>
-                  <SelectItem value="browser">Browser Speech API</SelectItem>
-                </SelectContent>
-              </Select>
-              <Button onClick={() => saveMutation.mutate({ default_stt_provider: defaultSttProvider })} disabled={saveMutation.isPending} data-testid="button-save-default-stt-provider">
-                <Save className="w-4 h-4 mr-1" /> Save
-              </Button>
-            </div>
-          </div>
-        </div>
-      </Card>
-
-      <Card className="p-6">
-        <h3 className="font-semibold mb-1 flex items-center gap-2"><Mail className="w-4 h-4 text-primary" /> Email / SMTP Settings</h3>
-        <p className="text-xs text-muted-foreground mb-4">Configure SMTP for sending email verification codes to new users.</p>
-        <div className="space-y-4">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <div>
-              <label className="text-xs font-medium text-muted-foreground">SMTP Host</label>
-              <Input value={smtpHost} onChange={(e) => setSmtpHost(e.target.value)} placeholder="e.g. smtp.gmail.com" data-testid="input-smtp-host" />
-            </div>
-            <div>
-              <label className="text-xs font-medium text-muted-foreground">SMTP Port</label>
-              <Input value={smtpPort} onChange={(e) => setSmtpPort(e.target.value)} placeholder="587" data-testid="input-smtp-port" />
-            </div>
-            <div>
-              <label className="text-xs font-medium text-muted-foreground">SMTP Username</label>
-              <Input value={smtpUser} onChange={(e) => setSmtpUser(e.target.value)} placeholder="your-email@example.com" data-testid="input-smtp-user" />
-            </div>
-            <div>
-              <label className="text-xs font-medium text-muted-foreground">SMTP Password</label>
-              <div className="relative">
-                <Input type={showSmtpPass ? "text" : "password"} value={smtpPass} onChange={(e) => setSmtpPass(e.target.value)} placeholder={settings?.smtp_pass_set ? "••••••••(already set)" : "App password or SMTP password"} data-testid="input-smtp-pass" />
-                <Button variant="ghost" size="icon" className="absolute right-0 top-0" onClick={() => setShowSmtpPass(!showSmtpPass)} data-testid="button-toggle-smtp-pass">
-                  {showSmtpPass ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                </Button>
-              </div>
-            </div>
-            <div>
-              <label className="text-xs font-medium text-muted-foreground">From Email</label>
-              <Input value={smtpFromEmail} onChange={(e) => setSmtpFromEmail(e.target.value)} placeholder="noreply@yourdomain.com" data-testid="input-smtp-from-email" />
-            </div>
-            <div>
-              <label className="text-xs font-medium text-muted-foreground">From Name</label>
-              <Input value={smtpFromName} onChange={(e) => setSmtpFromName(e.target.value)} placeholder="Zoom Mate" data-testid="input-smtp-from-name" />
-            </div>
-          </div>
-          <div className="flex items-center gap-2 flex-wrap">
-            <Button onClick={() => {
-              smtpSaveMutation.mutate({
-                smtp_host: smtpHost,
-                smtp_port: smtpPort,
-                smtp_user: smtpUser,
-                smtp_pass: smtpPass,
-                smtp_from_email: smtpFromEmail,
-                smtp_from_name: smtpFromName,
-              });
-              setSmtpPass("");
-            }} disabled={!smtpHost || !smtpUser || smtpSaveMutation.isPending} data-testid="button-save-smtp">
-              {smtpSaveMutation.isPending ? <Loader2 className="w-4 h-4 animate-spin mr-1" /> : <Save className="w-4 h-4 mr-1" />}
-              Save SMTP Settings
-            </Button>
-            <div className="flex items-center gap-2">
-              <Input value={testSmtpEmail} onChange={(e) => setTestSmtpEmail(e.target.value)} placeholder="Test email address" className="w-[200px]" data-testid="input-test-smtp-email" />
-              <Button variant="outline" onClick={() => testSmtpMutation.mutate({ email: testSmtpEmail || undefined })} disabled={testSmtpMutation.isPending} data-testid="button-test-smtp">
-                {testSmtpMutation.isPending ? <Loader2 className="w-4 h-4 animate-spin mr-1" /> : <Mail className="w-4 h-4 mr-1" />}
-                Send Test Email
-              </Button>
-            </div>
-          </div>
-          <div className="flex items-center gap-2">
-            <div className={`w-2 h-2 rounded-full ${settings?.smtp_host && settings?.smtp_user && settings?.smtp_pass_set ? "bg-emerald-500" : "bg-muted-foreground"}`} />
-            <span className="text-xs text-muted-foreground">{settings?.smtp_host && settings?.smtp_user && settings?.smtp_pass_set ? "SMTP Configured" : "SMTP Not Configured — email verification will not work"}</span>
           </div>
         </div>
       </Card>

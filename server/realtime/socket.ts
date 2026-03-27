@@ -80,6 +80,11 @@ export function initSocket(httpServer: HttpServer) {
       if (!clean) return;
       const now = typeof ts === "number" ? ts : Date.now();
       addFinal(meetingId, clean, now);
+      // Broadcast candidate mic speech to web UI clients so they can detect
+      // corrections in real time and auto-trigger answer rewrites.
+      if (/^Candidate:\s/i.test(clean)) {
+        io.to(meetingId).emit("candidate_speech", { meetingId, text: clean, ts: now });
+      }
     });
 
     socket.on("barge_in", ({ meetingId }: any) => {

@@ -21,15 +21,12 @@ import OpenAI from "openai";
 import fs from "fs";
 import path from "path";
 import { mintAzureToken, getAzureStatus } from "./speech/azureToken";
-import { mintDeepgramToken, getDeepgramStatus } from "./speech/deepgramToken";
 import { encryptSettingValue, decryptSettingValue } from "./settingsCrypto";
-import { sendVerificationEmail, testSmtpConnection } from "./emailService";
 import { runDetectionPipeline, extractQuestionsWithLLM, composeQuestionWithLLM, normalizeQuestion, isDuplicateQuestion } from "./assist/questionDetect";
 import { streamAssistantAnswer } from "./assist/answerStream";
 import { orchestrate } from "./assist/orchestrator";
 import { getState as getMeetingState, getRecentFinals, setAnswerStyle, getAnswerStyle, setCodeContext } from "./realtime/meetingStore";
 import { recordInterviewerQuestion, recordSpokenReply, getCodingProblemState } from "./assist/sessionState";
-import { addMessage } from "./assist/onEnterMemory";
 import { getStructuredInterviewAnswer } from "./assist/structuredAnswer";
 import { indexDocumentForRag, retrieveDocumentContext } from "./rag";
 import { getOrLoadConversationSummary, getOrLoadDocRetrieval, getOrLoadSettings } from "./cache/hotPathCache";
@@ -96,22 +93,7 @@ export async function registerRoutes(
       ALTER TABLE users
       ADD COLUMN IF NOT EXISTS first_name text,
       ADD COLUMN IF NOT EXISTS last_name text,
-      ADD COLUMN IF NOT EXISTS google_id text UNIQUE,
-      ADD COLUMN IF NOT EXISTS email_verified boolean NOT NULL DEFAULT false
-    `);
-    // Grandfather existing users as verified
-    await pool.query(`UPDATE users SET email_verified = true WHERE email_verified = false AND created_at < NOW() - INTERVAL '1 minute'`);
-    // Create email verification codes table
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS email_verification_codes (
-        id varchar PRIMARY KEY DEFAULT gen_random_uuid(),
-        user_id varchar NOT NULL,
-        email text NOT NULL,
-        code text NOT NULL,
-        expires_at timestamp NOT NULL,
-        attempts integer NOT NULL DEFAULT 0,
-        created_at timestamp DEFAULT NOW()
-      )
+      ADD COLUMN IF NOT EXISTS google_id text UNIQUE
     `);
   } catch (error: any) {
     console.error("[startup] Failed to ensure user profile columns:", error?.message || error);
@@ -155,135 +137,29 @@ export async function registerRoutes(
   app.post("/api/auth/signup", async (req, res) => {
     try {
       const { username, password, email } = req.body;
-      if (!username || !password || !email) {
-        return res.status(400).json({ message: "Username, password, and email are required" });
+      if (!username || !password) {
+        return res.status(400).json({ message: "Username and password are required" });
       }
       if (password.length < 6) {
         return res.status(400).json({ message: "Password must be at least 6 characters" });
-      }
-      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-      if (!emailRegex.test(email)) {
-        return res.status(400).json({ message: "Please enter a valid email address" });
       }
       const existing = await storage.getUserByUsername(username);
       if (existing) {
         return res.status(400).json({ message: "Username already taken" });
       }
-      const existingEmail = await storage.getUserByEmail(email);
-      if (existingEmail) {
-        return res.status(400).json({ message: "An account with this email already exists" });
-      }
       const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS);
       const user = await storage.createUser({ username, password: hashedPassword, email });
-
-      // Generate 6-digit verification code
-      const code = Math.floor(100000 + Math.random() * 900000).toString();
-      const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
-      await storage.createVerificationCode(user.id, email, code, expiresAt);
-
-      try {
-        await sendVerificationEmail(email, code);
-      } catch (emailErr: any) {
-        // Clean up user if email fails
-        console.error("[signup] Failed to send verification email:", emailErr?.message);
-        return res.status(500).json({ message: emailErr?.message || "Failed to send verification email. Please try again later." });
-      }
-
-      res.json({ requiresVerification: true, userId: user.id });
-    } catch (error: any) {
-      console.error("Signup error:", error);
-      res.status(500).json({ message: error?.message || "An error occurred during signup. Please try again." });
-    }
-  });
-
-  app.post("/api/auth/verify-email", async (req, res) => {
-    try {
-      const { userId, code } = req.body;
-      if (!userId || !code) {
-        return res.status(400).json({ message: "User ID and verification code are required" });
-      }
-      const user = await storage.getUser(userId);
-      if (!user) {
-        return res.status(404).json({ message: "User not found" });
-      }
-      if (user.emailVerified) {
-        return res.status(400).json({ message: "Email is already verified" });
-      }
-      const verification = await storage.getVerificationCode(userId);
-      if (!verification) {
-        return res.status(400).json({ message: "No verification code found. Please request a new one." });
-      }
-      if (verification.attempts >= 5) {
-        return res.status(429).json({ message: "Too many attempts. Please request a new verification code." });
-      }
-      if (new Date() > verification.expiresAt) {
-        return res.status(400).json({ message: "Verification code has expired. Please request a new one." });
-      }
-      if (verification.code !== code.trim()) {
-        await storage.incrementVerificationAttempts(verification.id);
-        return res.status(400).json({ message: "Invalid verification code. Please check and try again." });
-      }
-
-      // Verify the user
-      await storage.updateUser(userId, { emailVerified: true } as any);
-      await storage.deleteVerificationCodes(userId);
-
-      // Auto-login after verification
       (req.session as any).userId = user.id;
       req.session.save((err) => {
         if (err) {
-          console.error("Session save error after verification:", err);
-          return res.status(500).json({ message: "Email verified but session failed. Please log in." });
+          console.error("Session save error:", err);
+          return res.status(500).json({ message: "Account created but session failed. Please log in." });
         }
         res.json({ id: user.id, username: user.username, role: user.role });
-      });
+        });
     } catch (error: any) {
-      console.error("Verify email error:", error);
-      res.status(500).json({ message: error?.message || "Verification failed. Please try again." });
-    }
-  });
-
-  app.post("/api/auth/resend-verification", async (req, res) => {
-    try {
-      const { userId } = req.body;
-      if (!userId) {
-        return res.status(400).json({ message: "User ID is required" });
-      }
-      const user = await storage.getUser(userId);
-      if (!user) {
-        return res.status(404).json({ message: "User not found" });
-      }
-      if (user.emailVerified) {
-        return res.status(400).json({ message: "Email is already verified" });
-      }
-      if (!user.email) {
-        return res.status(400).json({ message: "No email address on file" });
-      }
-
-      // Rate limit: check if last code was sent less than 60 seconds ago
-      const existingCode = await storage.getVerificationCode(userId);
-      if (existingCode && existingCode.createdAt) {
-        const secondsSince = (Date.now() - new Date(existingCode.createdAt).getTime()) / 1000;
-        if (secondsSince < 60) {
-          return res.status(429).json({ message: `Please wait ${Math.ceil(60 - secondsSince)} seconds before requesting a new code.` });
-        }
-      }
-
-      const code = Math.floor(100000 + Math.random() * 900000).toString();
-      const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
-      await storage.createVerificationCode(userId, user.email, code, expiresAt);
-
-      try {
-        await sendVerificationEmail(user.email, code);
-      } catch (emailErr: any) {
-        console.error("[resend] Failed to send verification email:", emailErr?.message);
-        return res.status(500).json({ message: emailErr?.message || "Failed to send verification email." });
-      }
-
-      res.json({ message: "Verification code sent" });
-    } catch (error: any) {
-      console.error("Resend verification error:", error);
-      res.status(500).json({ message: error?.message || "Failed to resend verification code." });
+      console.error("Signup error:", error);
+      res.status(500).json({ message: error?.message || "An error occurred during signup. Please try again." });
     }
   });
 
@@ -306,10 +182,6 @@ export async function registerRoutes(
       const isValid = await bcrypt.compare(password, user.password);
       if (!isValid) {
         return res.status(401).json({ message: "Invalid username or password" });
-      }
-      // Check email verification for email-registered users (non-Google)
-      if (!user.emailVerified && !user.googleId) {
-        return res.json({ requiresVerification: true, userId: user.id });
       }
       await storage.updateUser(user.id, { lastLoginAt: new Date() });
       (req.session as any).userId = user.id;
@@ -1000,6 +872,7 @@ export async function registerRoutes(
 
       // Track practice minutes for free-trial window
       if (updateData.status === "completed" && meeting.isPractice) {
+        const FREE_MINUTES = 6;
         const WINDOW_MS = 30 * 60 * 1000;
         const usedMinutes = typeof totalMinutes === "number" ? totalMinutes : (updated.totalMinutes || 0);
         try {
@@ -1009,9 +882,12 @@ export async function registerRoutes(
             const windowStart = user.practiceWindowStart ? new Date(user.practiceWindowStart) : null;
             const windowExpired = !windowStart || (now.getTime() - windowStart.getTime()) > WINDOW_MS;
             if (windowExpired) {
-              await storage.updateUser(req.userId, { practiceWindowStart: now, practiceMinutesUsed: usedMinutes });
+              // Cap at FREE_MINUTES to prevent over-recording
+              await storage.updateUser(req.userId, { practiceWindowStart: now, practiceMinutesUsed: Math.min(usedMinutes, FREE_MINUTES) });
             } else {
-              await storage.updateUser(req.userId, { practiceMinutesUsed: (user.practiceMinutesUsed || 0) + usedMinutes });
+              // Cap total so session-tick + completion don't double-count beyond limit
+              const newUsed = Math.min((user.practiceMinutesUsed || 0) + usedMinutes, FREE_MINUTES);
+              await storage.updateUser(req.userId, { practiceMinutesUsed: newUsed });
             }
           }
         } catch (err: any) {
@@ -1164,14 +1040,12 @@ export async function registerRoutes(
       const user = await storage.getUser(req.userId);
       if (!user) return res.status(404).json({ message: "User not found" });
 
-      // Full access uses one shared paid pool across purchased and referral minutes.
+      // Full access: paid plan, purchased minutes, referral credits, or admin
       const hasPaidPlan = user.plan && user.plan !== "free";
-      const remainingPaidMinutes = Math.max(
-        0,
-        (user.minutesPurchased ?? 0) + (user.referralCredits ?? 0) - (user.minutesUsed ?? 0),
-      );
+      const hasPurchasedMinutes = (user.minutesPurchased ?? 0) > (user.minutesUsed ?? 0);
+      const hasReferralCredits = (user.referralCredits ?? 0) > 0;
       const isAdmin = user.role === "admin";
-      const hasFullAccess = !!(hasPaidPlan || remainingPaidMinutes > 0 || isAdmin);
+      const hasFullAccess = !!(hasPaidPlan || hasPurchasedMinutes || hasReferralCredits || isAdmin);
 
       if (hasFullAccess) {
         return res.json({ hasFullAccess: true, freeSecondsRemaining: null, windowResetAt: null });
@@ -1213,17 +1087,19 @@ export async function registerRoutes(
       const minutes = Math.max(1, Math.round(Number(req.body?.minutes ?? 1)));
 
       const hasPaidPlan = user.plan && user.plan !== "free";
-      const totalPaidMinutes = (user.minutesPurchased ?? 0) + (user.referralCredits ?? 0);
-      const remainingPaidMinutes = Math.max(0, totalPaidMinutes - (user.minutesUsed ?? 0));
+      const hasPurchasedMinutes = (user.minutesPurchased ?? 0) > (user.minutesUsed ?? 0);
+      const hasReferralCredits = (user.referralCredits ?? 0) > 0;
       const isAdmin = user.role === "admin";
 
-      if (hasPaidPlan || isAdmin || remainingPaidMinutes > 0) {
-        // Atomically add all minutes in a single write — no race condition
-        const newUsed = (user.minutesUsed ?? 0) + minutes;
-        const nextUsed = hasPaidPlan || isAdmin ? newUsed : Math.min(newUsed, totalPaidMinutes);
-        await storage.updateUser(req.userId, { minutesUsed: nextUsed });
-        const remaining = Math.max(0, totalPaidMinutes - nextUsed);
-        return res.json({ ok: true, minutesUsed: nextUsed, minutesRemaining: remaining });
+      if (hasPaidPlan || hasReferralCredits || isAdmin || hasPurchasedMinutes) {
+        // Atomic SQL increment — no read-modify-write race condition
+        const updated = await storage.incrementMinutesUsed(req.userId, minutes);
+        const newUsed = updated.minutesUsed ?? 0;
+        const purchasedBalance = (updated.minutesPurchased ?? 0) - newUsed;
+        const remaining = hasPaidPlan || isAdmin
+          ? null
+          : Math.max(0, purchasedBalance > 0 ? purchasedBalance : (user.referralCredits ?? 0));
+        return res.json({ ok: true, minutesUsed: newUsed, minutesRemaining: remaining });
       }
 
       // Free tier: deduct from practice window
@@ -1515,6 +1391,64 @@ export async function registerRoutes(
     }
   });
 
+  // ── Screen context for typing injection (desktop app) ──────────────────────
+  // Returns: { platform, language, already_typed, is_coding }
+  // Used by the Typing Playback feature to read what's on screen before injecting.
+  app.post("/api/screen-context", requireAuth, async (req: any, res) => {
+    try {
+      const { image } = req.body;
+      if (!image) return res.status(400).json({ message: "image required" });
+      const { getOpenAIKey } = await import("./llmRouter");
+      const apiKey = await getOpenAIKey();
+      if (!apiKey) return res.status(500).json({ message: "No OpenAI key configured" });
+
+      const imageMatch = String(image).match(/^data:(image\/[\w.+-]+);base64,(.+)$/);
+      const imageDataUrl = imageMatch?.[0] || `data:image/png;base64,${image}`;
+
+      const response = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          messages: [{
+            role: "user",
+            content: [
+              { type: "text", text: `Analyze this screenshot and return ONLY a JSON object with these exact fields:
+- platform: the coding platform or editor visible (e.g. "LeetCode", "HackerRank", "VSCode", "Replit", "unknown")
+- language: programming language selected or visible in editor (e.g. "python", "javascript", "java", "cpp", "unknown")
+- already_typed: the exact code currently in the main editor/code area as a string (empty string "" if nothing typed yet)
+- is_coding: true if this is a coding environment, false otherwise
+- has_error: true if there is a visible error, exception, test failure, or wrong answer result on screen, false otherwise
+- error_message: the exact error text or "Wrong Answer" / "Runtime Error" / "TLE" shown on screen (empty string "" if no error)
+- problem_text: the full problem/question statement visible on screen — include the title, description, constraints, and examples exactly as shown (empty string "" if no problem visible)
+- question_type: one of "coding" | "behavioral" | "system_design" | "conceptual" | "unknown"
+
+Return ONLY valid JSON. No explanation, no markdown, no code fences. Just the JSON object.` },
+              { type: "image_url", image_url: { url: imageDataUrl, detail: "low" } },
+            ],
+          }],
+          max_tokens: 600,
+          temperature: 0,
+        }),
+      });
+
+      if (!response.ok) {
+        const err = await response.text();
+        return res.status(500).json({ message: `OpenAI error: ${err}` });
+      }
+
+      const result = await response.json() as any;
+      const text = (result.choices?.[0]?.message?.content || "{}").replace(/^```json\n?|\n?```$/g, "").trim();
+      try {
+        res.json(JSON.parse(text));
+      } catch {
+        res.json({ platform: "unknown", language: "unknown", already_typed: "", is_coding: false, has_error: false, error_message: "", problem_text: "", question_type: "unknown" });
+      }
+    } catch (e: any) {
+      res.status(500).json({ message: e.message });
+    }
+  });
+
   app.post("/api/meetings/:id/analyze-screen", requireAuth, async (req: any, res) => {
     try {
       const { image, question, displayQuestion } = req.body;
@@ -1578,12 +1512,69 @@ export async function registerRoutes(
         capturedAt: response.createdAt ? new Date(response.createdAt).getTime() : Date.now(),
       });
 
-      addMessage(req.params.id, "interviewer", `[Screen Capture]: ${effectiveDisplayQuestion}`);
-      addMessage(req.params.id, "candidate", answer);
-
       res.json(response);
     } catch (error: any) {
       res.status(500).json({ message: error.message });
+    }
+  });
+
+  // ── Capture & Solve (desktop app — no meeting required) ────────────────────
+  // Screenshots the screen, reads the problem, streams back the full solution.
+  app.post("/api/screen-solve", requireAuth, async (req: any, res) => {
+    try {
+      const { image } = req.body;
+      if (!image) return res.status(400).json({ message: "image required" });
+
+      const allDocs = await storage.getDocuments(req.userId);
+      let documentContext = "";
+      if (allDocs.length > 0) {
+        documentContext = await retrieveDocumentContext(req.userId, "coding problem on screen", allDocs.map((d) => d.id));
+      }
+
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache, no-transform",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+        "Content-Encoding": "none",
+      });
+      res.flushHeaders();
+      res.write(":ok\n\n");
+
+      const question = [
+        "This is a live coding interview screen.",
+        "Read the visible problem statement, examples, constraints, and any code already written.",
+        "Solve or fix the problem shown. Treat the visible screen as the source of truth.",
+        "OUTPUT FORMAT (strictly follow this order):",
+        "1. Explanation first (2-3 sentences): approach in first person. NEVER start with a code block.",
+        "2. Code block: complete solution in a fenced code block (e.g. ```python).",
+        "3. Complexity: one short line on time/space complexity.",
+      ].join("\n");
+
+      const generator = analyzeScreenStream(
+        image,
+        question,
+        "technical",
+        documentContext || undefined,
+        undefined,
+        "coding",
+      );
+
+      for await (const chunk of generator) {
+        res.write("event: chunk\n");
+        res.write(`data: ${JSON.stringify({ chunk })}\n\n`);
+      }
+
+      res.write("event: done\n");
+      res.write(`data: ${JSON.stringify({})}\n\n`);
+      res.end();
+    } catch (error: any) {
+      if (!res.headersSent) {
+        res.status(500).json({ message: error.message });
+      } else {
+        res.write(`event: error\ndata: ${JSON.stringify({ message: error.message })}\n\n`);
+        res.end();
+      }
     }
   });
 
@@ -1591,7 +1582,6 @@ export async function registerRoutes(
     try {
       const { image, question, displayQuestion, liveTranscript } = req.body;
       if (!image) return res.status(400).json({ message: "Screen capture is required" });
-
 
       const meeting = await storage.getMeeting(req.params.id);
       if (!meeting) return res.status(404).json({ message: "Meeting not found" });
@@ -1666,9 +1656,6 @@ export async function registerRoutes(
         answer: fullAnswer,
         capturedAt: response.createdAt ? new Date(response.createdAt).getTime() : Date.now(),
       });
-
-      addMessage(req.params.id, "interviewer", `[Screen Capture]: ${effectiveDisplayQuestion}`);
-      addMessage(req.params.id, "candidate", fullAnswer);
 
       res.write("event: done\n");
       res.write(`data: ${JSON.stringify({ response })}\n\n`);
@@ -1751,9 +1738,6 @@ export async function registerRoutes(
         answer: fullAnswer,
         capturedAt: response.createdAt ? new Date(response.createdAt).getTime() : Date.now(),
       });
-
-      addMessage(req.params.id, "interviewer", `[Screen Capture]: ${effectiveDisplayQuestion}`);
-      addMessage(req.params.id, "candidate", fullAnswer);
 
       res.write("event: done\n");
       res.write(`data: ${JSON.stringify({ response })}\n\n`);
@@ -2133,54 +2117,6 @@ export async function registerRoutes(
   app.get("/api/speech/azure/status", requireAuth, azureStatusHandler);
   app.get("/api/stt/azure-status", requireAuth, azureStatusHandler);
 
-  const deepgramTokenHandler = async (req: any, res: any) => {
-    try {
-      const canUseSpeech = await hasSpeechCredits(req.userId);
-      if (!canUseSpeech) {
-        return res.status(402).json({ message: "No credits remaining for speech transcription." });
-      }
-
-      const result = await mintDeepgramToken();
-      if (!result) {
-        return res.status(404).json({ message: "Deepgram STT is not configured. Ask admin to set the Deepgram API key." });
-      }
-
-      res.json({
-        token: result.token,
-        expires_in_seconds: result.expiresInSeconds,
-      });
-    } catch (error: any) {
-      console.error("[deepgram-token] Error:", error.message);
-      res.status(500).json({ message: "Failed to get Deepgram token" });
-    }
-  };
-
-  const sttConfigHandler = async (_req: any, res: any) => {
-    try {
-      const [azureStatus, deepgramStatus, rawDefaultProvider] = await Promise.all([
-        getAzureStatus(),
-        getDeepgramStatus(),
-        storage.getSetting("default_stt_provider"),
-      ]);
-
-      const defaultProvider = rawDefaultProvider === "azure" || rawDefaultProvider === "deepgram" || rawDefaultProvider === "browser"
-        ? rawDefaultProvider
-        : "browser";
-
-      res.json({
-        azureAvailable: azureStatus.configured === true,
-        deepgramAvailable: deepgramStatus.configured === true,
-        defaultProvider,
-      });
-    } catch (error: any) {
-      res.status(500).json({ message: error.message });
-    }
-  };
-
-  app.get("/api/speech/deepgram/token", requireAuth, deepgramTokenHandler);
-  app.get("/api/stt/deepgram-token", requireAuth, deepgramTokenHandler);
-  app.get("/api/speech/stt/config", requireAuth, sttConfigHandler);
-
   app.get("/api/admin/settings", requireAdmin, async (req: any, res) => {
     try {
       const settings = await storage.getAllSettings();
@@ -2198,7 +2134,7 @@ export async function registerRoutes(
           } else {
             safeSettings[key] = "";
           }
-        } else if (key === "azure_speech_key" || key === "deepgram_api_key") {
+        } else if (key === "azure_speech_key") {
           const decrypted = decryptSettingValue(value);
           safeSettings[`${key}_set`] = !!decrypted;
           safeSettings[`${key}_last4`] = decrypted ? decrypted.slice(-4) : "";
@@ -2207,18 +2143,12 @@ export async function registerRoutes(
         } else if (key.includes("api_key")) {
           safeSettings[key] = value ? `${value.slice(0, 8)}...${value.slice(-4)}` : "";
           safeSettings[`${key}_set`] = !!value;
-        } else if (key === "smtp_pass") {
-          const decrypted = decryptSettingValue(value);
-          safeSettings[`${key}_set`] = !!decrypted;
-        } else if (key === "smtp_host" || key === "smtp_port" || key === "smtp_user" || key === "smtp_from_email" || key === "smtp_from_name") {
-          safeSettings[key] = value || "";
         } else {
           safeSettings[key] = value;
         }
       }
       safeSettings.openai_env_set = !!process.env.OPENAI_API_KEY;
       safeSettings.default_model = settings.default_model || "gpt-4o";
-      safeSettings.default_stt_provider = settings.default_stt_provider || "browser";
       res.json(safeSettings);
     } catch (error: any) {
       res.status(500).json({ message: error.message });
@@ -2261,16 +2191,6 @@ export async function registerRoutes(
       if (typeof req.body.azure_speech_region === "string") {
         await storage.setSetting("azure_speech_region", req.body.azure_speech_region.trim() || "eastus");
       }
-      if (typeof req.body.deepgram_api_key === "string") {
-        const key = req.body.deepgram_api_key.trim();
-        await storage.setSetting("deepgram_api_key", key ? encryptSettingValue(key) : "");
-      }
-      if (typeof req.body.default_stt_provider === "string") {
-        const provider = req.body.default_stt_provider.trim();
-        if (provider === "azure" || provider === "deepgram" || provider === "browser") {
-          await storage.setSetting("default_stt_provider", provider);
-        }
-      }
 
       if (typeof default_model === "string" && default_model) {
         await storage.setSetting("default_model", default_model);
@@ -2287,41 +2207,6 @@ export async function registerRoutes(
       res.json({ message: "Settings updated successfully" });
     } catch (error: any) {
       res.status(500).json({ message: error.message });
-    }
-  });
-
-  app.post("/api/admin/settings/save-smtp", requireAdmin, async (req: any, res) => {
-    try {
-      const { smtp_host, smtp_port, smtp_user, smtp_pass, smtp_from_email, smtp_from_name } = req.body;
-      if (typeof smtp_host === "string") await storage.setSetting("smtp_host", smtp_host.trim());
-      if (typeof smtp_port === "string") await storage.setSetting("smtp_port", smtp_port.trim() || "587");
-      if (typeof smtp_user === "string") await storage.setSetting("smtp_user", smtp_user.trim());
-      if (typeof smtp_pass === "string" && smtp_pass.trim()) {
-        await storage.setSetting("smtp_pass", encryptSettingValue(smtp_pass.trim()));
-      }
-      if (typeof smtp_from_email === "string") await storage.setSetting("smtp_from_email", smtp_from_email.trim());
-      if (typeof smtp_from_name === "string") await storage.setSetting("smtp_from_name", smtp_from_name.trim());
-      res.json({ message: "SMTP settings saved successfully" });
-    } catch (error: any) {
-      res.status(500).json({ message: error.message || "Failed to save SMTP settings" });
-    }
-  });
-
-  app.post("/api/admin/settings/test-smtp", requireAdmin, async (req: any, res) => {
-    try {
-      const user = await storage.getUser(req.userId);
-      const testEmail = user?.email || req.body?.email;
-      if (!testEmail) {
-        return res.status(400).json({ message: "No email address available to send test email. Please provide one." });
-      }
-      const result = await testSmtpConnection(testEmail);
-      if (result.success) {
-        res.json({ message: `Test email sent successfully to ${testEmail}` });
-      } else {
-        res.status(400).json({ message: result.error || "SMTP test failed" });
-      }
-    } catch (error: any) {
-      res.status(500).json({ message: error.message || "SMTP test failed" });
     }
   });
 

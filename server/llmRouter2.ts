@@ -14,7 +14,7 @@ const DEFAULT_CONFIGS: Record<string, Partial<LLMRouterConfig>> = {
   QUESTION_NORMALIZER: { primaryProvider: "openai", primaryModel: "gpt-4o-mini", temperature: 0, maxTokens: 200, streamingEnabled: false, timeoutMs: 5000 },
   QUESTION_EXTRACTOR: { primaryProvider: "openai", primaryModel: "gpt-4o-mini", temperature: 0, maxTokens: 250, streamingEnabled: false, timeoutMs: 5000 },
   QUESTION_COMPOSER: { primaryProvider: "openai", primaryModel: "gpt-4o-mini", temperature: 0, maxTokens: 120, streamingEnabled: false, timeoutMs: 5000 },
-  LIVE_INTERVIEW_ANSWER: { primaryProvider: "openai", primaryModel: "gpt-4o-mini", temperature: 0.5, maxTokens: 600, streamingEnabled: true, timeoutMs: 30000 },
+  LIVE_INTERVIEW_ANSWER: { primaryProvider: "openai", primaryModel: "gpt-4o-mini", temperature: 0.3, maxTokens: 600, streamingEnabled: true, timeoutMs: 30000 },
   SUMMARY_UPDATER: { primaryProvider: "openai", primaryModel: "gpt-4o-mini", temperature: 0, maxTokens: 400, streamingEnabled: false, timeoutMs: 10000 },
   FACT_EXTRACTOR: { primaryProvider: "openai", primaryModel: "gpt-4o-mini", temperature: 0, maxTokens: 500, streamingEnabled: false, timeoutMs: 10000 },
   CODING_ASSIST: { primaryProvider: "openai", primaryModel: "gpt-4o-mini", temperature: 0.3, maxTokens: 900, streamingEnabled: true, timeoutMs: 20000 },
@@ -62,10 +62,11 @@ export function resolveAutomaticInterviewModel(
   const tier = chooseAnswerRoutingTier(question, options);
   // All tiers prefer gpt-4o-mini; fall back to Gemini only if OpenAI key is absent.
   if (tier === "large") {
-    return pickAvailableModel(["gpt-4o-mini", "gemini-2.0-flash"]);
+    // Coding, system design, deep reasoning — use the most capable available model
+    return pickAvailableModel(["gpt-4o", "gpt-4.1", "gemini-2.5-pro", "gpt-4o-mini", "gemini-2.0-flash"]);
   }
   if (tier === "medium") {
-    return pickAvailableModel(["gpt-4o-mini", "gemini-2.0-flash"]);
+    return pickAvailableModel(["gpt-4o-mini", "gemini-2.5-flash", "gemini-2.0-flash"]);
   }
   return pickAvailableModel(["gpt-4o-mini", "gemini-2.0-flash"]);
 }

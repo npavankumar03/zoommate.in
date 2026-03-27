@@ -21,7 +21,7 @@ export async function* streamOpenAIFast(
     messages,
     stream: true,
     max_tokens: maxTokens,
-    temperature: 0.5,
+    temperature: 0.3,
   });
 
   const response = await new Promise<any>((resolve, reject) => {
@@ -82,7 +82,7 @@ export async function* streamOpenAI(
     messages,
     stream: true,
     ...(isNewer ? { max_completion_tokens: maxTokens } : { max_tokens: maxTokens }),
-    ...(supportsTemperature(model) ? { temperature: 0.5 } : {}),
+    ...(supportsTemperature(model) ? { temperature: 0.3 } : {}),
   };
 
   const response = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -165,7 +165,7 @@ export async function generateOpenAI(
     model,
     messages,
     ...(isNewer ? { max_completion_tokens: 2048 } : { max_tokens: 2048 }),
-    ...(supportsTemperature(model) ? { temperature: 0.7 } : {}),
+    ...(supportsTemperature(model) ? { temperature: 0.4 } : {}),
   };
 
   const response = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -206,7 +206,7 @@ export async function* streamGemini(
       systemInstruction: systemPrompt,
       generationConfig: {
         maxOutputTokens: maxTokens,
-        temperature: 0.5,
+        temperature: 0.3,
       },
     });
     const result = await genModel.generateContentStream(userMessage);

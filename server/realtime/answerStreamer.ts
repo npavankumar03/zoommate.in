@@ -203,7 +203,7 @@ export async function streamAnswer({
   const MAX_DOC_CHARS = 6000;
   const MAX_MEMORY_CHARS = 2000;
   const MAX_CONVO_CHARS = 2000;
-  const MAX_TURNS_CHARS = 1200;
+  const MAX_TURNS_CHARS = 2000;
   abortRealtimeStream(meetingId);
   let activeController = new AbortController();
   activeSocketStreams.set(meetingId, activeController);
@@ -283,10 +283,12 @@ export async function streamAnswer({
     ].filter(Boolean).join("\n\n");
   });
   cacheMetrics.promptTemplate = promptTemplateProbe.hit ? "hit" : "miss";
+  const tier0IntelligenceBlock = buildInterviewerIntelligenceBlock(meetingId, displayQuestion || llmPrompt, 5);
   const tier0SystemPrompt = [
     promptTemplateProbe.value,
     effectiveInstructions ? `Custom instructions (highest priority, follow strictly unless they conflict with no-invention/safety rules): ${effectiveInstructions.slice(0, TIER0_CUSTOM_INSTRUCTIONS_CHARS)}` : "",
     tier0TurnContext ? `Last turn:\n${tier0TurnContext}` : "",
+    tier0IntelligenceBlock || "",
   ].filter(Boolean).join("\n\n");
 
   const buildTier1Prompt = async (): Promise<string> => {
@@ -300,7 +302,7 @@ export async function streamAnswer({
         });
     const [rawMemoryContext, recentTurns] = await Promise.all([
       memoryPromise,
-      storage.getRecentTranscriptTurns(meetingId, 4),
+      storage.getRecentTranscriptTurns(meetingId, 8),
       ]);
     const memoryContext = (rawMemoryContext || "").slice(0, MAX_MEMORY_CHARS);
     let documentContext = "";
@@ -456,7 +458,7 @@ export async function streamAnswer({
             fullAnswer,
           ].join("\n"),
           meetingId,
-          { maxTokens: 260, temperature: 0.2, cacheUserId: userId, model: resolvedModel },
+          { maxTokens: 700, temperature: 0.2, cacheUserId: userId, model: resolvedModel },
         );
         const cleanRefined = strictCustomPromptMode
           ? enforceStrictQaFormat(displayQuestion || llmPrompt, (refined || "").trim())

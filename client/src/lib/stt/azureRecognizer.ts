@@ -1,10 +1,21 @@
 import * as SpeechSDK from "microsoft-cognitiveservices-speech-sdk";
 
 export interface AzureRecognizerCallbacks {
-  onPartial: (text: string) => void;
-  onFinal: (text: string) => void;
+  onPartial: (text: string, meta?: AzureTranscriptMeta) => void;
+  onFinal: (text: string, meta?: AzureTranscriptMeta) => void;
   onError: (error: string) => void;
   onStatusChange: (status: "connecting" | "connected" | "disconnected" | "error") => void;
+}
+
+export interface AzureTranscriptMeta {
+  confidence?: number;
+  durationMs?: number;
+  offsetMs?: number;
+  language?: string;
+  isSpeech?: boolean;
+  rms?: number;
+  noiseLikely?: boolean;
+  source?: "partial" | "final";
 }
 
 export interface AzureRecognizerOptions {
@@ -17,6 +28,9 @@ export interface AzureRecognizerOptions {
   maxGain?: number;
   clippingThreshold?: number;
   silenceHoldFrames?: number;
+  preRollMs?: number;
+  postSpeechHoldMs?: number;
+  minSpeechRms?: number;
 }
 
 interface TokenResponse {
@@ -41,12 +55,27 @@ async function fetchAzureToken(): Promise<TokenResponse> {
 
 export class AzureRecognizer {
   private recognizer: SpeechSDK.SpeechRecognizer | null = null;
+  private speechConfig: SpeechSDK.SpeechConfig | null = null;
   private callbacks: AzureRecognizerCallbacks;
   private options: AzureRecognizerOptions;
   private running = false;
+  private intentionalStop = false;
   private audioStream: SpeechSDK.PushAudioInputStream | null = null;
   private processorNode: ScriptProcessorNode | AudioWorkletNode | null = null;
   private audioContext: AudioContext | null = null;
+  private lastChunkMeta: AzureTranscriptMeta = { isSpeech: false, rms: 0, noiseLikely: false };
+  private preRollBuffers: Int16Array[] = [];
+  private maxPreRollSamples = 0;
+  private speechActive = false;
+  private silenceTailMs = 0;
+  private audioSampleRate = 16000;
+  private tokenRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  private restartTimer: ReturnType<typeof setTimeout> | null = null;
+  private restartAttempts = 0;
+  private startMode: "mic" | "stream" | "mixed" | null = null;
+  private sourceStream: MediaStream | null = null;
+  private sourceStreams: MediaStream[] = [];
+  private lastTokenRegion = "";
 
   constructor(callbacks: AzureRecognizerCallbacks, options: AzureRecognizerOptions = {}) {
     this.callbacks = callbacks;
@@ -61,15 +90,151 @@ export class AzureRecognizer {
       maxGain: options.maxGain ?? 4,
       clippingThreshold: options.clippingThreshold ?? 0.92,
       silenceHoldFrames: options.silenceHoldFrames ?? 2,
+      preRollMs: options.preRollMs ?? 800,
+      postSpeechHoldMs: options.postSpeechHoldMs ?? 600,
+      minSpeechRms: options.minSpeechRms ?? 0.01,
     };
   }
 
-  private preprocessFloatChunk(inputData: Float32Array): Int16Array {
+  private clearLifecycleTimers() {
+    if (this.tokenRefreshTimer) {
+      clearTimeout(this.tokenRefreshTimer);
+      this.tokenRefreshTimer = null;
+    }
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = null;
+    }
+  }
+
+  private scheduleTokenRefresh(expiresInSeconds?: number) {
+    if (!expiresInSeconds || !Number.isFinite(expiresInSeconds) || expiresInSeconds <= 0) return;
+    if (this.tokenRefreshTimer) {
+      clearTimeout(this.tokenRefreshTimer);
+    }
+    const refreshInMs = Math.max(30_000, (expiresInSeconds * 1000) - 90_000);
+    this.tokenRefreshTimer = setTimeout(() => {
+      void this.refreshToken().catch((err) => {
+        const message = String(err?.message || err || "Azure token refresh failed");
+        console.error("[AzureRecognizer] token refresh failed:", message);
+        this.callbacks.onError(`Azure token refresh failed: ${message}`);
+      });
+    }, refreshInMs);
+  }
+
+  private async refreshToken(): Promise<void> {
+    if (!this.running || this.intentionalStop || !this.recognizer) return;
+    const tokenData = await fetchAzureToken();
+    this.lastTokenRegion = tokenData.region;
+    if (this.speechConfig) {
+      this.speechConfig.authorizationToken = tokenData.token;
+    }
+    (this.recognizer as any).authorizationToken = tokenData.token;
+    this.scheduleTokenRefresh(tokenData.expires_in_seconds);
+    console.log("[AzureRecognizer] token refreshed for active session");
+  }
+
+  private createSpeechConfig(tokenData: TokenResponse): SpeechSDK.SpeechConfig {
+    const speechConfig = SpeechSDK.SpeechConfig.fromAuthorizationToken(
+      tokenData.token,
+      tokenData.region,
+    );
+    speechConfig.speechRecognitionLanguage = this.options.language!;
+    speechConfig.outputFormat = SpeechSDK.OutputFormat.Detailed;
+    speechConfig.setProperty(SpeechSDK.PropertyId.Speech_SegmentationSilenceTimeoutMs, String(this.options.silenceTimeoutMs));
+    speechConfig.setProperty(SpeechSDK.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs, String(this.options.silenceTimeoutMs));
+    this.speechConfig = speechConfig;
+    this.lastTokenRegion = tokenData.region;
+    this.scheduleTokenRefresh(tokenData.expires_in_seconds);
+    return speechConfig;
+  }
+
+  private async createSpeechConfigFromFreshToken(): Promise<SpeechSDK.SpeechConfig> {
+    const tokenData = await fetchAzureToken();
+    return this.createSpeechConfig(tokenData);
+  }
+
+  private cleanupRecognitionResources() {
+    if (this.recognizer) {
+      try { this.recognizer.close(); } catch {}
+      this.recognizer = null;
+    }
+    if (this.audioStream) {
+      try { this.audioStream.close(); } catch {}
+      this.audioStream = null;
+    }
+    if (this.audioContext) {
+      try { this.audioContext.close(); } catch {}
+      this.audioContext = null;
+    }
+    this.processorNode = null;
+    this.resetAudioState();
+  }
+
+  private async restartFromLastSource(): Promise<void> {
+    if (this.intentionalStop) return;
+    this.cleanupRecognitionResources();
+    const speechConfig = await this.createSpeechConfigFromFreshToken();
+    if (this.startMode === "mic") {
+      let audioConfig: SpeechSDK.AudioConfig;
+      try {
+        audioConfig = SpeechSDK.AudioConfig.fromDefaultMicrophoneInput();
+      } catch (err: any) {
+        const msg = String(err?.message || err || "Failed to access microphone");
+        console.error("[AzureRecognizer] microphone restart failed:", msg);
+        throw new Error(`Microphone access failed: ${msg}`);
+      }
+      this.setupRecognizer(speechConfig, audioConfig);
+      return;
+    }
+    if (this.startMode === "mixed") {
+      const streams = this.sourceStreams.filter((stream) => stream?.getAudioTracks().some((track) => track.readyState === "live"));
+      if (!streams.length) {
+        throw new Error("Audio source lost");
+      }
+      this.setupMixedAudioPipeline(streams, speechConfig);
+      return;
+    }
+    if (this.startMode === "stream" && this.sourceStream) {
+      const liveTrack = this.sourceStream.getAudioTracks().find((track) => track.readyState === "live");
+      if (!liveTrack) {
+        throw new Error("Audio source lost");
+      }
+      this.setupSingleStreamAudioPipeline(this.sourceStream, speechConfig);
+      return;
+    }
+    throw new Error("No audio source available for restart");
+  }
+
+  private scheduleRecognizerRestart(reason: string) {
+    if (!this.running || this.intentionalStop || this.restartTimer) return;
+    const backoffMs = Math.min(8_000, 800 * (this.restartAttempts + 1));
+    this.callbacks.onStatusChange("connecting");
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = null;
+      if (!this.running || this.intentionalStop) return;
+      this.restartAttempts += 1;
+      console.warn(`[AzureRecognizer] restarting after ${reason} (attempt ${this.restartAttempts})`);
+      void this.restartFromLastSource().then(() => {
+        this.restartAttempts = 0;
+      }).catch((err) => {
+        const message = String(err?.message || err || "Azure restart failed");
+        console.error("[AzureRecognizer] restart failed:", message);
+        this.callbacks.onError(`Azure restart failed: ${message}`);
+        this.callbacks.onStatusChange("error");
+      });
+    }, backoffMs);
+  }
+
+  private preprocessFloatChunk(inputData: Float32Array): { pcm16: Int16Array; meta: AzureTranscriptMeta } {
     const vadEnabled = this.options.vadEnabled !== false;
     const noiseFloor = Math.max(0.002, Math.min(0.08, this.options.vadNoiseFloor ?? 0.015));
     const targetRms = Math.max(0.04, Math.min(0.3, this.options.targetRms ?? 0.12));
     const maxGain = Math.max(1, Math.min(8, this.options.maxGain ?? 4));
     const clippingThreshold = Math.max(0.6, Math.min(0.98, this.options.clippingThreshold ?? 0.92));
+    const minSpeechRms = Math.max(0.003, Math.min(0.1, this.options.minSpeechRms ?? Math.max(noiseFloor * 1.2, 0.01)));
+    const postSpeechHoldMs = Math.max(80, Math.min(1200, this.options.postSpeechHoldMs ?? 260));
+    const chunkMs = Math.max(1, Math.round((inputData.length / this.audioSampleRate) * 1000));
 
     let sumSq = 0;
     let peak = 0;
@@ -81,10 +246,25 @@ export class AzureRecognizer {
     }
     const rms = Math.sqrt(sumSq / Math.max(1, inputData.length));
     const pcm16 = new Int16Array(inputData.length);
+    const isSpeech = rms >= minSpeechRms;
+    const noiseLikely = rms < noiseFloor;
 
-    if (vadEnabled && rms < noiseFloor) {
+    if (isSpeech) {
+      this.speechActive = true;
+      this.silenceTailMs = 0;
+    } else if (this.speechActive) {
+      this.silenceTailMs += chunkMs;
+      if (this.silenceTailMs > postSpeechHoldMs) {
+        this.speechActive = false;
+      }
+    }
+
+    if (vadEnabled && noiseLikely && !this.speechActive) {
       pcm16.fill(0);
-      return pcm16;
+      return {
+        pcm16,
+        meta: { rms, isSpeech: false, noiseLikely: true, source: "partial" },
+      };
     }
 
     const desiredGain = rms > 0.0001 ? targetRms / rms : maxGain;
@@ -102,21 +282,84 @@ export class AzureRecognizer {
       pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
     }
 
-    return pcm16;
+    return {
+      pcm16,
+      meta: { rms, isSpeech: this.speechActive || isSpeech, noiseLikely, source: "partial" },
+    };
+  }
+
+  private resetAudioState() {
+    this.lastChunkMeta = { isSpeech: false, rms: 0, noiseLikely: false };
+    this.preRollBuffers = [];
+    this.speechActive = false;
+    this.silenceTailMs = 0;
+  }
+
+  private primePreRoll(buffer: Int16Array) {
+    this.preRollBuffers.push(buffer);
+    let sampleCount = this.preRollBuffers.reduce((sum, chunk) => sum + chunk.length, 0);
+    while (sampleCount > this.maxPreRollSamples && this.preRollBuffers.length > 0) {
+      const removed = this.preRollBuffers.shift();
+      sampleCount -= removed?.length || 0;
+    }
+  }
+
+  private writeChunkToAzure(buffer: Int16Array, meta: AzureTranscriptMeta) {
+    if (!this.audioStream || !this.running) return;
+    const shouldWriteSpeech = meta.isSpeech || meta.rms === undefined || (meta.rms >= Math.max(this.options.minSpeechRms ?? 0.01, 0.003));
+    if (!shouldWriteSpeech) {
+      this.primePreRoll(buffer);
+      this.lastChunkMeta = meta;
+      return;
+    }
+
+    const previousWasSpeech = !!this.lastChunkMeta.isSpeech;
+    if (!previousWasSpeech && this.preRollBuffers.length > 0) {
+      for (const chunk of this.preRollBuffers) {
+        this.audioStream.write(chunk.buffer.slice(0));
+      }
+      this.preRollBuffers = [];
+    }
+
+    this.audioStream.write(buffer.buffer.slice(0));
+    this.lastChunkMeta = meta;
+  }
+
+  private buildAzureMeta(result: SpeechSDK.SpeechRecognitionResult, source: "partial" | "final"): AzureTranscriptMeta {
+    const meta: AzureTranscriptMeta = {
+      ...this.lastChunkMeta,
+      source,
+    };
+    const durationRaw = Number((result as any)?.duration || 0);
+    const offsetRaw = Number((result as any)?.offset || 0);
+    if (Number.isFinite(durationRaw) && durationRaw > 0) meta.durationMs = Math.round(durationRaw / 10_000);
+    if (Number.isFinite(offsetRaw) && offsetRaw > 0) meta.offsetMs = Math.round(offsetRaw / 10_000);
+
+    const jsonRaw = typeof (result as any)?.json === "string" ? String((result as any).json) : "";
+    if (jsonRaw) {
+      try {
+        const parsed = JSON.parse(jsonRaw);
+        const nBest = Array.isArray(parsed?.NBest) ? parsed.NBest : [];
+        const top = nBest[0] || {};
+        const confidence = Number(top?.Confidence);
+        if (Number.isFinite(confidence)) meta.confidence = confidence;
+        const locale = parsed?.PrimaryLanguage?.Language || parsed?.Language || parsed?.Locale;
+        if (typeof locale === "string" && locale.trim()) meta.language = locale.trim();
+      } catch {
+        // ignore malformed Azure JSON payloads
+      }
+    }
+
+    return meta;
   }
 
   async startFromMic(): Promise<void> {
+    this.intentionalStop = false;
     this.callbacks.onStatusChange("connecting");
-    const tokenData = await fetchAzureToken();
-
-    const speechConfig = SpeechSDK.SpeechConfig.fromAuthorizationToken(
-      tokenData.token,
-      tokenData.region,
-    );
-    speechConfig.speechRecognitionLanguage = this.options.language!;
-    speechConfig.outputFormat = SpeechSDK.OutputFormat.Detailed;
-    speechConfig.setProperty(SpeechSDK.PropertyId.Speech_SegmentationSilenceTimeoutMs, String(this.options.silenceTimeoutMs));
-    speechConfig.setProperty(SpeechSDK.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs, String(this.options.silenceTimeoutMs));
+    this.startMode = "mic";
+    this.sourceStream = null;
+    this.sourceStreams = [];
+    const speechConfig = await this.createSpeechConfigFromFreshToken();
 
     let audioConfig: SpeechSDK.AudioConfig;
     try {
@@ -137,120 +380,113 @@ export class AzureRecognizer {
    * Uses mic-tuned VAD/silence values since the primary use-case is mic + tab mixing.
    */
   async startFromMixedStreams(streams: MediaStream[]): Promise<void> {
+    this.intentionalStop = false;
     this.callbacks.onStatusChange("connecting");
-    const tokenData = await fetchAzureToken();
+    this.startMode = "mixed";
+    this.sourceStream = null;
+    this.sourceStreams = streams.slice();
+    const speechConfig = await this.createSpeechConfigFromFreshToken();
+    this.setupMixedAudioPipeline(streams, speechConfig);
+  }
 
-    const speechConfig = SpeechSDK.SpeechConfig.fromAuthorizationToken(
-      tokenData.token,
-      tokenData.region,
-    );
-    speechConfig.speechRecognitionLanguage = this.options.language!;
-    speechConfig.outputFormat = SpeechSDK.OutputFormat.Detailed;
-    speechConfig.setProperty(SpeechSDK.PropertyId.Speech_SegmentationSilenceTimeoutMs, String(this.options.silenceTimeoutMs));
-    speechConfig.setProperty(SpeechSDK.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs, String(this.options.silenceTimeoutMs));
+  async startFromStream(mediaStream: MediaStream): Promise<void> {
+    this.intentionalStop = false;
+    this.callbacks.onStatusChange("connecting");
+    this.startMode = "stream";
+    this.sourceStream = mediaStream;
+    this.sourceStreams = [];
+    const speechConfig = await this.createSpeechConfigFromFreshToken();
+    this.setupSingleStreamAudioPipeline(mediaStream, speechConfig);
+  }
 
+  private setupMixedAudioPipeline(streams: MediaStream[], speechConfig: SpeechSDK.SpeechConfig) {
     const format = SpeechSDK.AudioStreamFormat.getWaveFormatPCM(16000, 16, 1);
     this.audioStream = SpeechSDK.AudioInputStream.createPushStream(format);
+    this.audioSampleRate = 16000;
+    this.maxPreRollSamples = Math.round(this.audioSampleRate * Math.max(0.1, Math.min(1.0, (this.options.preRollMs ?? 420) / 1000)));
+    this.resetAudioState();
 
     this.audioContext = new AudioContext({ sampleRate: 16000, latencyHint: "interactive" });
-    if (this.audioContext.state === "suspended") {
-      await this.audioContext.resume();
-    }
     const destination = this.audioContext.createMediaStreamDestination();
+    destination.channelCount = 1;
+    destination.channelCountMode = "explicit";
+
+    const compressor = this.audioContext.createDynamicsCompressor();
+    compressor.threshold.value = -18;
+    compressor.knee.value = 24;
+    compressor.ratio.value = 8;
+    compressor.attack.value = 0.003;
+    compressor.release.value = 0.25;
 
     for (const stream of streams) {
       if (stream.getAudioTracks().length === 0) continue;
       const source = this.audioContext.createMediaStreamSource(stream);
-      // Boost each source slightly so quieter tab audio is still audible to Azure
       const gain = this.audioContext.createGain();
-      gain.gain.value = 1.2;
+      gain.gain.value = 0.5;
       source.connect(gain);
-      gain.connect(destination);
+      gain.connect(compressor);
     }
 
+    compressor.connect(destination);
     const mergedSource = this.audioContext.createMediaStreamSource(destination.stream);
-
-    if (this.audioContext.audioWorklet) {
-      try {
-        await this.audioContext.audioWorklet.addModule("/pcm-processor.js");
-        const workletNode = new AudioWorkletNode(this.audioContext, "pcm-processor");
-        workletNode.port.postMessage({
-          noiseFloor: this.options.vadNoiseFloor ?? 0.014,
-          targetRms: this.options.targetRms ?? 0.12,
-          maxGain: this.options.maxGain ?? 4,
-          limiter: this.options.clippingThreshold ?? 0.92,
-          silenceHoldFrames: this.options.silenceHoldFrames ?? 2,
-        });
-        workletNode.port.onmessage = (ev: MessageEvent) => {
-          if (this.audioStream && this.running) {
-            this.audioStream.write(ev.data as ArrayBuffer);
-          }
-        };
-        mergedSource.connect(workletNode);
-        workletNode.connect(this.audioContext.destination);
-        this.processorNode = workletNode;
-      } catch {
-        this.setupScriptProcessor(mergedSource);
-      }
-    } else {
-      this.setupScriptProcessor(mergedSource);
-    }
+    this.setupWorkletOrProcessor(mergedSource, this.options.vadNoiseFloor ?? 0.014);
 
     const audioConfig = SpeechSDK.AudioConfig.fromStreamInput(this.audioStream);
     this.setupRecognizer(speechConfig, audioConfig);
   }
 
-  async startFromStream(mediaStream: MediaStream): Promise<void> {
-    this.callbacks.onStatusChange("connecting");
-    const tokenData = await fetchAzureToken();
-
-    const speechConfig = SpeechSDK.SpeechConfig.fromAuthorizationToken(
-      tokenData.token,
-      tokenData.region,
-    );
-    speechConfig.speechRecognitionLanguage = this.options.language!;
-    speechConfig.outputFormat = SpeechSDK.OutputFormat.Detailed;
-    speechConfig.setProperty(SpeechSDK.PropertyId.Speech_SegmentationSilenceTimeoutMs, String(this.options.silenceTimeoutMs));
-    speechConfig.setProperty(SpeechSDK.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs, String(this.options.silenceTimeoutMs));
-
+  private setupSingleStreamAudioPipeline(mediaStream: MediaStream, speechConfig: SpeechSDK.SpeechConfig) {
     const format = SpeechSDK.AudioStreamFormat.getWaveFormatPCM(16000, 16, 1);
     this.audioStream = SpeechSDK.AudioInputStream.createPushStream(format);
+    this.audioSampleRate = 16000;
+    this.maxPreRollSamples = Math.round(this.audioSampleRate * Math.max(0.1, Math.min(1.0, (this.options.preRollMs ?? 420) / 1000)));
+    this.resetAudioState();
 
     this.audioContext = new AudioContext({ sampleRate: 16000, latencyHint: "interactive" });
-    if (this.audioContext.state === "suspended") {
-      await this.audioContext.resume();
-    }
     const source = this.audioContext.createMediaStreamSource(mediaStream);
+    this.setupWorkletOrProcessor(source, this.options.vadNoiseFloor ?? 0.015);
 
-    if (this.audioContext.audioWorklet) {
-      try {
-        await this.audioContext.audioWorklet.addModule("/pcm-processor.js");
+    const audioConfig = SpeechSDK.AudioConfig.fromStreamInput(this.audioStream);
+    this.setupRecognizer(speechConfig, audioConfig);
+  }
+
+  private setupWorkletOrProcessor(source: MediaStreamAudioSourceNode, noiseFloor: number) {
+    if (this.audioContext?.audioWorklet) {
+      void this.audioContext.audioWorklet.addModule("/pcm-processor.js").then(() => {
+        if (!this.audioContext || !this.running || !this.audioStream) return;
         const workletNode = new AudioWorkletNode(this.audioContext, "pcm-processor");
         workletNode.port.postMessage({
-          noiseFloor: this.options.vadNoiseFloor ?? 0.015,
+          noiseFloor,
           targetRms: this.options.targetRms ?? 0.12,
           maxGain: this.options.maxGain ?? 4,
           limiter: this.options.clippingThreshold ?? 0.92,
-          silenceHoldFrames: this.options.silenceHoldFrames ?? 2,
+          silenceHoldFrames: this.options.silenceHoldFrames ?? 8,
+          preRollFrames: this.options.preRollFrames ?? 5,
         });
         workletNode.port.onmessage = (ev: MessageEvent) => {
-          if (this.audioStream && this.running) {
-            const pcmData = ev.data as ArrayBuffer;
-            this.audioStream.write(pcmData);
-          }
+          if (!this.audioStream || !this.running) return;
+          // pcm-processor.js sends raw ArrayBuffer; older format sends { pcm, rms, isSpeech }
+          const pcmData: ArrayBuffer | undefined =
+            ev.data instanceof ArrayBuffer ? ev.data : (ev.data?.pcm as ArrayBuffer | undefined);
+          if (!pcmData) return;
+          const buffer = new Int16Array(pcmData);
+          const payload = ev.data instanceof ArrayBuffer ? {} : (ev.data || {});
+          this.writeChunkToAzure(buffer, {
+            rms: typeof payload.rms === "number" ? payload.rms : undefined,
+            isSpeech: payload.isSpeech !== false,
+            noiseLikely: !!payload.noiseLikely,
+            source: "partial",
+          });
         };
         source.connect(workletNode);
         workletNode.connect(this.audioContext.destination);
         this.processorNode = workletNode;
-      } catch {
+      }).catch(() => {
         this.setupScriptProcessor(source);
-      }
-    } else {
-      this.setupScriptProcessor(source);
+      });
+      return;
     }
-
-    const audioConfig = SpeechSDK.AudioConfig.fromStreamInput(this.audioStream);
-    this.setupRecognizer(speechConfig, audioConfig);
+    this.setupScriptProcessor(source);
   }
 
   private setupScriptProcessor(source: MediaStreamAudioSourceNode) {
@@ -258,8 +494,8 @@ export class AzureRecognizer {
     processor.onaudioprocess = (ev) => {
       if (!this.audioStream || !this.running) return;
       const inputData = ev.inputBuffer.getChannelData(0);
-      const pcm16 = this.preprocessFloatChunk(inputData);
-      this.audioStream.write(pcm16.buffer);
+      const { pcm16, meta } = this.preprocessFloatChunk(inputData);
+      this.writeChunkToAzure(pcm16, meta);
     };
     source.connect(processor);
     processor.connect(this.audioContext!.destination);
@@ -269,6 +505,7 @@ export class AzureRecognizer {
   private setupRecognizer(speechConfig: SpeechSDK.SpeechConfig, audioConfig: SpeechSDK.AudioConfig) {
     this.recognizer = new SpeechSDK.SpeechRecognizer(speechConfig, audioConfig);
     this.running = true;
+    this.intentionalStop = false;
     if (this.options.phraseHints && this.options.phraseHints.length > 0) {
       try {
         const phraseList = SpeechSDK.PhraseListGrammar.fromRecognizer(this.recognizer);
@@ -291,7 +528,7 @@ export class AzureRecognizer {
       const text = event.result.text;
       if (text) {
         // Partial UI updates only. Do not convert partials into finals on client side.
-        this.callbacks.onPartial(text);
+        this.callbacks.onPartial(text, this.buildAzureMeta(event.result, "partial"));
       }
     };
 
@@ -301,7 +538,7 @@ export class AzureRecognizer {
         const text = event.result.text?.trim();
         if (text) {
           // Final transcript commits come only from Azure recognized events.
-          this.callbacks.onFinal(text);
+          this.callbacks.onFinal(text, this.buildAzureMeta(event.result, "final"));
         }
       }
     };
@@ -326,16 +563,20 @@ export class AzureRecognizer {
           this.callbacks.onError(details);
         }
         this.callbacks.onStatusChange("error");
+        this.scheduleRecognizerRestart("canceled");
       }
     };
 
     this.recognizer.sessionStarted = () => {
+      this.restartAttempts = 0;
       this.callbacks.onStatusChange("connected");
     };
 
     this.recognizer.sessionStopped = () => {
       if (this.running) {
-        this.callbacks.onStatusChange("disconnected");
+        // scheduleRecognizerRestart fires "connecting" — skip "disconnected" so the
+        // outer reconnect logic (meeting-session.tsx) does not also kick off a restart.
+        this.scheduleRecognizerRestart("session stopped");
       }
     };
 
@@ -353,38 +594,34 @@ export class AzureRecognizer {
   }
 
   stop(): void {
+    this.intentionalStop = true;
     this.running = false;
+    this.clearLifecycleTimers();
 
     if (this.recognizer) {
       this.recognizer.stopContinuousRecognitionAsync(
         () => {
-          this.recognizer?.close();
-          this.recognizer = null;
+          this.cleanupRecognitionResources();
         },
         (err) => {
           console.error("[AzureRecognizer] Stop error:", err);
-          this.recognizer?.close();
-          this.recognizer = null;
+          this.cleanupRecognitionResources();
         },
       );
+    } else {
+      this.cleanupRecognitionResources();
     }
-
-    if (this.audioStream) {
-      this.audioStream.close();
-      this.audioStream = null;
-    }
-
-    if (this.audioContext) {
-      try { this.audioContext.close(); } catch {}
-      this.audioContext = null;
-    }
-
-    this.processorNode = null;
     this.callbacks.onStatusChange("disconnected");
   }
 
   isRunning(): boolean {
     return this.running;
+  }
+
+  async restart(): Promise<void> {
+    if (!this.running || this.intentionalStop) return;
+    this.clearLifecycleTimers();
+    await this.restartFromLastSource();
   }
 }
 

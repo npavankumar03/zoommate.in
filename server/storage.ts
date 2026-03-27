@@ -1,6 +1,6 @@
 import {
   users, documents, documentChunks, meetings, assistants, responses, appSettings, creditLogs, announcements, memorySlots,
-  llmRouterConfig, llmCallMetrics, transcriptTurns, emailVerificationCodes,
+  llmRouterConfig, llmCallMetrics, transcriptTurns,
   type User, type InsertUser,
   type Document, type InsertDocument,
   type DocumentChunk,
@@ -14,7 +14,6 @@ import {
   type LLMRouterConfig, type InsertLLMRouterConfig,
   type LLMCallMetric, type InsertLLMCallMetric,
   type TranscriptTurn, type InsertTranscriptTurn,
-  type EmailVerificationCode,
   type LLMUseCase,
 } from "@shared/schema";
 import { db, pool } from "./db";
@@ -133,13 +132,6 @@ export interface IStorage {
   getTranscriptTurns(meetingId: string): Promise<TranscriptTurn[]>;
   getRecentTranscriptTurns(meetingId: string, limit: number): Promise<TranscriptTurn[]>;
   deleteTranscriptTurns(meetingId: string): Promise<void>;
-
-  // Email verification
-  getUserByEmail(email: string): Promise<User | undefined>;
-  createVerificationCode(userId: string, email: string, code: string, expiresAt: Date): Promise<EmailVerificationCode>;
-  getVerificationCode(userId: string): Promise<EmailVerificationCode | undefined>;
-  deleteVerificationCodes(userId: string): Promise<void>;
-  incrementVerificationAttempts(codeId: string): Promise<void>;
 }
 
 export class DatabaseStorage implements IStorage {
@@ -165,6 +157,16 @@ export class DatabaseStorage implements IStorage {
 
   async updateUser(id: string, data: Partial<User>): Promise<User> {
     const [updated] = await db.update(users).set(data).where(eq(users.id, id)).returning();
+    return updated;
+  }
+
+  // Atomically increment minutesUsed using a SQL expression to avoid read-modify-write race conditions
+  async incrementMinutesUsed(id: string, minutes: number): Promise<{ minutesUsed: number; minutesPurchased: number }> {
+    const [updated] = await db
+      .update(users)
+      .set({ minutesUsed: sql`COALESCE(${users.minutesUsed}, 0) + ${minutes}` })
+      .where(eq(users.id, id))
+      .returning({ minutesUsed: users.minutesUsed, minutesPurchased: users.minutesPurchased });
     return updated;
   }
 
@@ -592,38 +594,6 @@ export class DatabaseStorage implements IStorage {
 
   async deleteTranscriptTurns(meetingId: string): Promise<void> {
     await db.delete(transcriptTurns).where(eq(transcriptTurns.meetingId, meetingId));
-  }
-
-  // ── Email Verification ──────────────────────────────────────────────────────
-
-  async getUserByEmail(email: string): Promise<User | undefined> {
-    const [user] = await db.select().from(users).where(eq(users.email, email));
-    return user || undefined;
-  }
-
-  async createVerificationCode(userId: string, email: string, code: string, expiresAt: Date): Promise<EmailVerificationCode> {
-    // Delete any existing codes first
-    await db.delete(emailVerificationCodes).where(eq(emailVerificationCodes.userId, userId));
-    const [created] = await db.insert(emailVerificationCodes).values({ userId, email, code, expiresAt }).returning();
-    return created;
-  }
-
-  async getVerificationCode(userId: string): Promise<EmailVerificationCode | undefined> {
-    const [row] = await db.select().from(emailVerificationCodes)
-      .where(eq(emailVerificationCodes.userId, userId))
-      .orderBy(desc(emailVerificationCodes.createdAt))
-      .limit(1);
-    return row || undefined;
-  }
-
-  async deleteVerificationCodes(userId: string): Promise<void> {
-    await db.delete(emailVerificationCodes).where(eq(emailVerificationCodes.userId, userId));
-  }
-
-  async incrementVerificationAttempts(codeId: string): Promise<void> {
-    await db.update(emailVerificationCodes)
-      .set({ attempts: sql`${emailVerificationCodes.attempts} + 1` })
-      .where(eq(emailVerificationCodes.id, codeId));
   }
 }
 

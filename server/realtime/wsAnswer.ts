@@ -3,10 +3,89 @@ import type { Server, IncomingMessage } from "http";
 import { URL } from "url";
 import { storage } from "../storage";
 import { streamAssistantAnswer, abortSessionStream, hasActiveStream } from "../assist/streamAssistantAnswer";
-import { getLastUnansweredInterviewerQuestion, getLatestSpokenReply, recordUserQuestion, getCodingProblemState } from "../assist/sessionState";
+import { getLastUnansweredInterviewerQuestion, getLatestSpokenReply, recordUserQuestion, getCodingProblemState, buildInterviewerIntelligenceBlock } from "../assist/sessionState";
 import { levenshteinSimilarity, normalizeQuestionForSimilarity } from "@shared/questionDetection";
 import { getRefineConfig, buildRefineContext } from "../assist/refinePass";
 import { parseResponse } from "../assist/responseParser";
+import { streamLLM, resolveAutomaticInterviewModel } from "../llmRouter2";
+import { buildTier0Prompt } from "../prompt";
+import type { Meeting } from "@shared/schema";
+
+// ── Speculative answer buffer ─────────────────────────────────────────────────
+interface SpeculativeEntry {
+  question: string;
+  norm: string;
+  chunks: string[];
+  done: boolean;
+  ts: number;
+  abortCtrl: AbortController;
+  // Set when a question handler adopts an in-progress stream
+  onChunk?: (chunk: string) => void;
+  onDone?: () => void;
+}
+const speculativeStreams = new Map<string, SpeculativeEntry>();
+
+function buildSpeculativePrompt(question: string, meeting: Meeting | null, sessionId: string): string {
+  const format = (meeting?.responseFormat === "custom" ? "concise" : meeting?.responseFormat) || "concise";
+  const meetingType = meeting?.type || "interview";
+  const tier0 = buildTier0Prompt(format, meetingType);
+  const intel = buildInterviewerIntelligenceBlock(sessionId, question, 3);
+  const instructions = meeting?.customInstructions
+    ? `Custom instructions: ${String(meeting.customInstructions).slice(0, 800)}`
+    : "";
+  return [tier0, instructions, intel].filter(Boolean).join("\n\n");
+}
+
+async function runSpeculativeStream(sessionId: string, question: string, meeting: Meeting | null): Promise<void> {
+  const existing = speculativeStreams.get(sessionId);
+  if (existing) {
+    const norm = normalizeQuestionForSimilarity(question);
+    const existingSimilarity = norm ? levenshteinSimilarity(existing.norm, norm) : 0;
+    if (existingSimilarity >= 0.80 && !existing.done) {
+      // Close enough — keep the existing stream running so chunks keep accumulating.
+      // Do NOT update existing.norm: the Enter similarity check must compare against
+      // what speculative was actually generated for (the original fragment), not the
+      // final question. If the norm were updated to the final question, Enter would
+      // always get similarity≈1.0 and replay a wrong fragment-based answer.
+      console.log(`[speculative] reuse_existing sessionId=${sessionId} similarity=${existingSimilarity.toFixed(2)} chunks=${existing.chunks.length}`);
+      return;
+    }
+    existing.abortCtrl.abort();
+    speculativeStreams.delete(sessionId);
+  }
+  const norm = normalizeQuestionForSimilarity(question);
+  if (!norm) return;
+  const abortCtrl = new AbortController();
+  const entry: SpeculativeEntry = { question, norm, chunks: [], done: false, ts: Date.now(), abortCtrl };
+  speculativeStreams.set(sessionId, entry);
+
+  try {
+    const systemPrompt = buildSpeculativePrompt(question, meeting, sessionId);
+    const model = (meeting?.model && meeting.model !== "automatic")
+      ? meeting.model
+      : resolveAutomaticInterviewModel(question, { sessionMode: (meeting as any)?.sessionMode });
+    const isCodeQuestion = /\b(write|implement|build|create|code|function|class|algorithm|program|script|def |solution)\b/i.test(question);
+    const speculativeMaxTokens = isCodeQuestion ? 1200 : 320;
+    const generator = streamLLM(
+      "LIVE_INTERVIEW_ANSWER",
+      systemPrompt,
+      question,
+      sessionId,
+      { maxTokens: speculativeMaxTokens, model, cacheUserId: meeting?.userId },
+      abortCtrl.signal,
+    );
+    for await (const chunk of generator) {
+      if (!chunk) continue;
+      if (speculativeStreams.get(sessionId) !== entry) break; // evicted
+      entry.chunks.push(chunk);
+      entry.onChunk?.(chunk); // deliver live to adopted consumer if any
+    }
+    entry.done = true;
+    entry.onDone?.(); // signal completion to adopted consumer
+  } catch {
+    // best-effort only
+  }
+}
 
 interface AnswerSession {
   ws: WebSocket;
@@ -275,9 +354,18 @@ export function setupWsAnswer(httpServer: Server): void {
   const extractTechTokens = (s: string): Set<string> =>
     new Set((s.match(TECH_TOKEN_RE) || []).map((t) => t.toLowerCase()));
 
-  const isRecentDuplicate = (sessionId: string, fingerprint: string, now = Date.now()): boolean => {
+  // Tracks the last raw transcript submitted per session, so new interviewer speech always wins
+  const lastRawTranscriptBySession = new Map<string, string>();
+
+  const isRecentDuplicate = (sessionId: string, fingerprint: string, rawTranscript: string, now = Date.now()): boolean => {
     const list = recentQuestionFingerprints.get(sessionId) || [];
     const newTech = extractTechTokens(fingerprint);
+
+    // If the raw transcript has changed since last submission, new interviewer content is present — always allow
+    const lastRaw = lastRawTranscriptBySession.get(sessionId) || "";
+    if (rawTranscript && rawTranscript !== lastRaw) return false;
+
+    // Short-window exact dedup (12s) — only applies when transcript hasn't changed
     for (const item of list) {
       if ((now - item.ts) > 12000) continue;
       if (levenshteinSimilarity(fingerprint, item.fp) < 0.85) continue;
@@ -289,14 +377,16 @@ export function setupWsAnswer(httpServer: Server): void {
       }
       return true;
     }
+
     return false;
   };
 
-  const rememberFingerprint = (sessionId: string, fingerprint: string, now = Date.now()) => {
+  const rememberFingerprint = (sessionId: string, fingerprint: string, rawTranscript: string, now = Date.now()) => {
     const current = recentQuestionFingerprints.get(sessionId) || [];
     const next = [{ fp: fingerprint, ts: now }, ...current.filter((x) => x.fp !== fingerprint)]
       .filter((x, idx) => idx < 20 && (now - x.ts) <= 12000);
     recentQuestionFingerprints.set(sessionId, next);
+    lastRawTranscriptBySession.set(sessionId, rawTranscript);
   };
 
   httpServer.on("upgrade", (req: IncomingMessage, socket, head) => {
@@ -314,7 +404,27 @@ export function setupWsAnswer(httpServer: Server): void {
       return;
     }
 
-    const socketState = { userId, sessionId: "", requestId: "" };
+    const socketState: {
+      userId: string;
+      sessionId: string;
+      requestId: string;
+      cachedMeeting: Meeting | null;
+      cachedMeetingAt: number;
+    } = { userId, sessionId: "", requestId: "", cachedMeeting: null, cachedMeetingAt: 0 };
+    const MEETING_CACHE_TTL_MS = 30_000;
+
+    const getCachedMeeting = async (sessionId: string): Promise<Meeting | null> => {
+      const now = Date.now();
+      if (socketState.cachedMeeting && (now - socketState.cachedMeetingAt) < MEETING_CACHE_TTL_MS) {
+        return socketState.cachedMeeting;
+      }
+      const meeting = await storage.getMeeting(sessionId);
+      if (meeting && meeting.userId === socketState.userId) {
+        socketState.cachedMeeting = meeting;
+        socketState.cachedMeetingAt = now;
+      }
+      return meeting ?? null;
+    };
 
     ws.on("message", async (raw: Buffer | string) => {
       try {
@@ -338,6 +448,8 @@ export function setupWsAnswer(httpServer: Server): void {
             return;
           }
           socketState.sessionId = sessionId;
+          socketState.cachedMeeting = meeting;
+          socketState.cachedMeetingAt = Date.now();
           safeSend(ws, { type: "session_started", sessionId });
           return;
         }
@@ -346,6 +458,18 @@ export function setupWsAnswer(httpServer: Server): void {
           const sessionId = String(msg?.sessionId || socketState.sessionId || "").trim();
           if (!sessionId) return;
           abortSessionStream(sessionId);
+          // Do NOT clear the speculative stream here — a new question message may immediately
+          // follow this cancel and needs the pre-generated chunks for instant replay.
+          return;
+        }
+
+        if (type === "speculative_question") {
+          const sessionId = String(msg?.sessionId || socketState.sessionId || "").trim();
+          const question = String(msg?.text || "").trim();
+          if (!sessionId || !question) return;
+          const meeting = await getCachedMeeting(sessionId);
+          if (!meeting || meeting.userId !== userId) return;
+          void runSpeculativeStream(sessionId, question, meeting);
           return;
         }
 
@@ -359,7 +483,7 @@ export function setupWsAnswer(httpServer: Server): void {
             return;
           }
 
-          const meeting = await storage.getMeeting(sessionId);
+          const meeting = await getCachedMeeting(sessionId);
           if (!meeting || meeting.userId !== userId) {
             safeSend(ws, { type: "error", sessionId, requestId: "", message: "Unauthorized session" });
             return;
@@ -383,6 +507,24 @@ export function setupWsAnswer(httpServer: Server): void {
             ? primarySeed
             : chooseBestQuestionSeed([lastUnanswered?.text, latestSpokenReply?.text, "[Continue]"]);
 
+          const QUESTION_WORD_RE = /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are|tell|walk|explain)\b/i;
+
+          // #1b: Any short utterance / follow-up word → anchor to last active topic
+          const BARE_FOLLOWUP_RE = /^(why|how so|how come|how|elaborate|explain|tell me more|go on|continue|expand|clarify|what next|what else|more detail|give an example|interesting|okay|ok|and|so|right|sure|really|huh|wait|yeah)\??$/i;
+          const wordCount = questionForStream.trim().split(/\s+/).filter(Boolean).length;
+          // Single word always anchors (even question words like "what", "why" alone = follow-up)
+          const isSingleWord = wordCount === 1;
+          // Also treat WH-starting fragments with ≤3 words as vague (e.g. "when building", "how about")
+          const isShortVague = wordCount <= 5 && !questionForStream.includes("?") &&
+            (!QUESTION_WORD_RE.test(questionForStream.trim()) || wordCount <= 3);
+          if (BARE_FOLLOWUP_RE.test(questionForStream.trim()) || isSingleWord || isShortVague) {
+            const prevQ = lastQuestionBySession.get(sessionId);
+            if (prevQ && prevQ !== "[Continue]") {
+              questionForStream = `${questionForStream.trim()} (follow-up to: "${prevQ}")`;
+              console.log(`[ws/answer] anchored_short_utterance sessionId=${sessionId}`, { expanded: questionForStream });
+            }
+          }
+
           // #2: Continuation stitching — "and also X" / "plus X" → stitch onto previous question
           const CONNECTOR_PREFIX = /^(and\s+also|and|also|plus|as\s+well\s+as|what\s+about|or)\s+/i;
           const connectorMatch = CONNECTOR_PREFIX.exec(questionForStream);
@@ -394,9 +536,8 @@ export function setupWsAnswer(httpServer: Server): void {
               console.log(`[ws/answer] stitched continuation sessionId=${sessionId}`, { prevQ, tail, result: questionForStream });
             }
           }
+
           // #2b: Bare tech-topic stitching — "Flask", "Django", "AWS" (no joiner) → stitch onto previous question
-          // Fires when the entire question is a short tech term without any question words.
-          const QUESTION_WORD_RE = /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are|tell|walk|explain)\b/i;
           const bareTopicOnly =
             !connectorMatch
             && !QUESTION_WORD_RE.test(questionForStream.trim())
@@ -410,44 +551,47 @@ export function setupWsAnswer(httpServer: Server): void {
               console.log(`[ws/answer] stitched bare topic sessionId=${sessionId}`, { prevQ, topic: questionForStream });
             }
           }
-          // #4: Recency amplification — boost detection of topic that appeared in last answer
-          // (stored below after answer completes; used here via lastQuestionBySession as proxy)
-          lastQuestionBySession.set(sessionId, questionForStream);
 
-          // Backend noise guard: reject partial/noisy ASR fragments that have no real question signal.
-          // This is a safety net for cases where the frontend's gating passes too-short fragments.
-          if (!force) {
-            const lowerQuestion = questionForStream.trim().toLowerCase();
-            // Block rhetorical check-ins where the interviewer is just confirming understanding
-            if (/^(does\s+that\s+)?make\s+sense\??$/.test(lowerQuestion) || /^(are\s+you\s+)?following\??$/.test(lowerQuestion) || /^right\??$/.test(lowerQuestion) || /^you\s+know\??$/.test(lowerQuestion)) {
-              console.log(`[ws/answer] rhetorical_checkin suppressed sessionId=${sessionId} text="${questionForStream.slice(0, 60)}"`);
-              return;
-            }
-
-            const qWords = questionForStream.trim().split(/\s+/).filter(Boolean);
-            const hasQuestionMark = questionForStream.includes("?");
-            const hasQuestionWord = /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are|tell|walk|explain|describe|share|give|talk)[\s,]/i.test(questionForStream.trim());
-            const isKnownFollowUp = KNOWN_FOLLOWUP_RE.test(lowerQuestion);
-            const hasInterviewSignal = /\b(experience|worked|familiar|background|explain|tell me about|walk me through|have you used|have you ever|your thoughts on|describe a time|trade-?offs?|pros and cons|optimize|scale|complexity)\b/i.test(questionForStream);
-            // Reject if fewer than 3 words and no clear question signal
-            if (qWords.length < 3 && !hasQuestionMark && !hasQuestionWord && !isKnownFollowUp && !hasInterviewSignal) {
-              console.log(`[ws/answer] noise_guard suppressed sessionId=${sessionId} words=${qWords.length} text="${questionForStream.slice(0, 60)}"`);
-              return;
-            }
-            // Also reject very short fragments (1 word) that would have no context
-            if (qWords.length <= 1 && !hasQuestionMark && !isKnownFollowUp) {
-              console.log(`[ws/answer] noise_guard suppressed single-word sessionId=${sessionId} text="${questionForStream.slice(0, 60)}"`);
-              return;
+          // #3: Incomplete/empty transcript — anchor to last known question so answer is always contextual
+          if (questionForStream === "[Continue]" || questionForStream.trim().length === 0) {
+            const prevQ = lastQuestionBySession.get(sessionId);
+            if (prevQ && prevQ !== "[Continue]") {
+              questionForStream = `Continue answering: "${prevQ}"`;
+              console.log(`[ws/answer] anchored_incomplete sessionId=${sessionId}`, { anchor: questionForStream });
             }
           }
 
-          const fp = normalizeQuestionForSimilarity(questionForStream);
-          if (!fp) return;
-          if (!force && isRecentDuplicate(sessionId, fp)) {
+          // #4: If the text isn't a clear question, wrap it so LLM infers and answers the implied question.
+          // This handles statements like "microservices and distributed systems" or "React experience" where
+          // the interviewer is implying a topic without an explicit question mark.
+          const isExplicitQuestion = questionForStream.includes("?") || QUESTION_WORD_RE.test(questionForStream.trim())
+            || /^(tell|walk|explain|describe|share|give|talk|show|write|implement|build|create|design)\b/i.test(questionForStream.trim());
+          if (!isExplicitQuestion
+            && questionForStream !== "[Continue]"
+            && !questionForStream.startsWith("Continue answering:")
+            && !questionForStream.startsWith("[Continue")
+            && questionForStream.trim().length > 0) {
+            questionForStream = `Interview context: "${questionForStream.trim()}". Infer the most likely interview question from this and give a strong first-person answer.`;
+            console.log(`[ws/answer] inferred_question sessionId=${sessionId} wrapped="${questionForStream.slice(0, 100)}"`);
+          }
+
+          // #5: Recency amplification — boost detection of topic that appeared in last answer
+          lastQuestionBySession.set(sessionId, questionForStream);
+
+          // If questionForStream normalized to empty, anchor to last known question so Enter always answers
+          if (!questionForStream.trim() || normalizeQuestionForSimilarity(questionForStream) === "") {
+            const prevQ = lastQuestionBySession.get(sessionId);
+            questionForStream = prevQ && prevQ !== "[Continue]"
+              ? `Continue answering: "${prevQ}"`
+              : "[Continue with latest interviewer context]";
+            lastQuestionBySession.set(sessionId, questionForStream);
+          }
+          const fp = normalizeQuestionForSimilarity(questionForStream) || "continue";
+          if (!force && isRecentDuplicate(sessionId, fp, questionText)) {
             console.log(`[ws/answer] duplicate suppressed sessionId=${sessionId} fp="${fp.slice(0, 60)}"`);
             return;
           }
-          rememberFingerprint(sessionId, fp);
+          rememberFingerprint(sessionId, fp, questionText);
           recordUserQuestion(sessionId, questionForStream);
           console.log(
             `[ws/answer] question sessionId=${sessionId} userId=${userId} chars=${questionForStream.length} force=${force} source=${submitSource} multi=${multiQuestionMode}`,
@@ -468,6 +612,13 @@ export function setupWsAnswer(httpServer: Server): void {
             wsAbortController.abort();
             abortSessionStream(sessionId);
           };
+          let onSocketCloseRemoved = false;
+          const removeOnSocketClose = () => {
+            if (!onSocketCloseRemoved) {
+              onSocketCloseRemoved = true;
+              ws.removeListener("close", onSocketClose);
+            }
+          };
           ws.once("close", onSocketClose);
 
           const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -475,6 +626,52 @@ export function setupWsAnswer(httpServer: Server): void {
           activeBySession.set(sessionId, { ws, userId, sessionId, requestId });
           safeSend(ws, { type: "assistant_start", sessionId, requestId });
           console.log(`[ws/answer] assistant_start sessionId=${sessionId} requestId=${requestId}`);
+
+          // ── Speculative replay ────────────────────────────────────────────
+          // If a background speculative stream was running for a similar question,
+          // flush its buffered chunks immediately so the answer appears instantly.
+          let speculativeHit = false;
+          const spec = speculativeStreams.get(sessionId);
+          if (spec && (spec.chunks.length > 0 || !spec.done)) {
+            const specNorm = spec.norm;
+            // Compare against raw questionText (before follow-up anchoring / stitching enrichment)
+            // because the speculative stream was started with the raw client-side question text.
+            const rawNorm = normalizeQuestionForSimilarity(questionText);
+            const realNorm = rawNorm || normalizeQuestionForSimilarity(questionForStream);
+            const similarity = realNorm ? levenshteinSimilarity(specNorm, realNorm) : 0;
+            const isRecent = (Date.now() - spec.ts) <= 15000;
+            if (similarity >= 0.70 && isRecent) {
+              console.log(`[ws/answer] speculative_hit sessionId=${sessionId} similarity=${similarity.toFixed(2)} chunks=${spec.chunks.length} done=${spec.done}`);
+              // Flush all chunks buffered so far
+              for (const chunk of spec.chunks) {
+                safeSend(ws, { type: "assistant_chunk", sessionId, requestId, text: chunk });
+              }
+              if (spec.done) {
+                // Stream already finished — send end immediately
+                speculativeStreams.delete(sessionId);
+                safeSend(ws, { type: "assistant_end", sessionId, requestId, cancelled: false });
+                removeOnSocketClose();
+              } else {
+                // Stream still in progress — adopt it: pipe remaining chunks as they arrive
+                spec.onChunk = (chunk: string) => {
+                  safeSend(ws, { type: "assistant_chunk", sessionId, requestId, text: chunk });
+                };
+                spec.onDone = () => {
+                  speculativeStreams.delete(sessionId);
+                  safeSend(ws, { type: "assistant_end", sessionId, requestId, cancelled: false });
+                  removeOnSocketClose();
+                };
+              }
+              speculativeHit = true;
+            }
+          }
+          if (!speculativeHit) {
+            speculativeStreams.get(sessionId)?.abortCtrl.abort();
+            speculativeStreams.delete(sessionId);
+          }
+          // ── End speculative replay ────────────────────────────────────────
+
+          if (speculativeHit) return;
 
           const generator = streamAssistantAnswer({
             meetingId: sessionId,
@@ -488,8 +685,8 @@ export function setupWsAnswer(httpServer: Server): void {
             model: typeof msg?.model === "string" ? msg.model : undefined,
             transport: "ws",
             abortSignal: wsAbortController.signal,
-            maxTokensOverride: 260,
-            temperatureOverride: 0.2,
+            maxTokensOverride: (msg?.format === "code_example" || msg?.format === "technical") ? undefined : 500,
+            temperatureOverride: 0.65,
             requestIdOverride: requestId,
             submitSource,
             lastInterviewerQuestion: typeof metadata?.lastInterviewerQuestion === "string" ? metadata.lastInterviewerQuestion : undefined,
@@ -497,6 +694,7 @@ export function setupWsAnswer(httpServer: Server): void {
             sessionJobDescription: typeof metadata?.jobDescription === "string" ? metadata.jobDescription : undefined,
             sessionSystemPrompt: typeof metadata?.systemPrompt === "string" ? metadata.systemPrompt : undefined,
             liveTranscript: typeof metadata?.liveTranscript === "string" ? metadata.liveTranscript : undefined,
+            conversationHistory: Array.isArray(metadata?.conversationHistory) ? metadata.conversationHistory : undefined,
           });
 
           let emittedChunkCount = 0;
@@ -505,6 +703,7 @@ export function setupWsAnswer(httpServer: Server): void {
           let fastCancelled = false;
           // Accumulate fast answer text so the refinement pass can check it against the rubric
           let fastAnswerText = "";
+          try {
           for await (const event of generator) {
             if (event.type === "start") {
               activeRequestId = event.requestId;
@@ -523,7 +722,7 @@ export function setupWsAnswer(httpServer: Server): void {
               fastCancelled = !!event.cancelled;
               if (emittedChunkCount === 0) {
                 const fallbackText = String(event.response?.answer || "").trim()
-                  || "I need a bit more context to answer that precisely. Could you clarify the question?";
+                  || "Based on our discussion so far, let me continue with what I was explaining.";
                 emittedChunkCount += 1;
                 emittedCharCount += fallbackText.length;
                 fastAnswerText += fallbackText;
@@ -580,6 +779,7 @@ export function setupWsAnswer(httpServer: Server): void {
               sessionJobDescription: typeof metadata?.jobDescription === "string" ? metadata.jobDescription : undefined,
               sessionSystemPrompt: typeof metadata?.systemPrompt === "string" ? metadata.systemPrompt : undefined,
               liveTranscript: typeof metadata?.liveTranscript === "string" ? metadata.liveTranscript : undefined,
+              conversationHistory: Array.isArray(metadata?.conversationHistory) ? metadata.conversationHistory : undefined,
               refineContext,
             });
 
@@ -616,7 +816,9 @@ export function setupWsAnswer(httpServer: Server): void {
             }
           }
 
-          ws.off("close", onSocketClose);
+          } finally {
+            removeOnSocketClose();
+          }
           const current = activeBySession.get(sessionId);
           if (current?.requestId === activeRequestId) {
             activeBySession.delete(sessionId);
@@ -641,6 +843,10 @@ export function setupWsAnswer(httpServer: Server): void {
         if (current && current.ws === ws) {
           activeBySession.delete(sessionId);
         }
+        // Clean up session-scoped Maps to prevent memory leak
+        lastQuestionBySession.delete(sessionId);
+        recentQuestionFingerprints.delete(sessionId);
+        lastRawTranscriptBySession.delete(sessionId);
       }
     });
   });

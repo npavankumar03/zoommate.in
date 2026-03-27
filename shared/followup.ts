@@ -137,12 +137,77 @@ const STRONG_FOLLOWUPS = new Set([
   "elaborate",
   "explain that",
   "explain more",
+  "explain",
   "what do you mean",
   "and then",
   "what next",
+  "next",
+  "continue",
+  "go on",
+  "and",
+  "so",
+  "okay",
+  "ok",
+  "yeah",
+  "yes",
+  "right",
+  "got it",
+  "i see",
+  "and so",
+  "what else",
+  "anything else",
+  "more",
+  "deeper",
+  "further",
+  // Common interview follow-ups
+  "break it down",
+  "walk me through",
+  "show me",
+  "give me an example",
+  "can you give an example",
+  "example",
+  "examples",
+  "show example",
+  "can you show",
+  "can you explain",
+  "can you elaborate",
+  "please explain",
+  "please elaborate",
+  "tell me",
+  "go ahead",
+  "i see but",
+  "okay but",
+  "alright",
+  "sure but",
+  "and how",
+  "and why",
+  "how exactly",
+  "why exactly",
+  "what specifically",
+  "more details",
+  "more detail",
+  "in detail",
+  "in more detail",
+  "describe",
+  "describe more",
+  "expand on that",
+  "expand on it",
+  "elaborate more",
+  "say more",
+  "tell me more about that",
+  "tell me more about it",
+  "can you tell me more",
+  "what about it",
+  "what about this",
+  "what exactly",
+  "how exactly",
+  "one more",
+  "one more thing",
+  "another example",
+  "another one",
 ]);
 
-const FOLLOWUP_CUE_RE = /\b(explain|explain more|tell me more|go deeper|elaborate|expand|dig deeper|what do you mean|what about that|about that|about it|how so|why|and then|what next|you said|you mentioned|you told|you just said|you just mentioned|as you said|earlier you|percentage you|number you|metric you|figure you|how much you|what number|what percentage|what was that|what did you mean|what did you say)\b/i;
+const FOLLOWUP_CUE_RE = /\b(explain|explain more|tell me more|go deeper|elaborate|expand|dig deeper|what do you mean|what about that|about that|about it|how so|why|and then|what next|you said|you mentioned|you told|you just said|you just mentioned|as you said|earlier you|percentage you|number you|metric you|figure you|how much you|what number|what percentage|what was that|what did you mean|what did you say|break it down|walk me through|give me an example|can you explain|can you elaborate|please explain|go ahead|expand on that|elaborate on that|describe more|say more|more details|in detail|show me|how exactly|why exactly|one more)\b/i;
 
 const COREF_TERMS = new Set([
   "that",
@@ -261,6 +326,11 @@ export function isFollowUp(q: string, opts: FollowUpOptions = {}): FollowUpResul
     if (hasCoref || startsWithContinuation) {
       confidence = 0.72;
       reason = "short_ambiguous";
+    }
+    // Very short utterances (1-3 words) with no concrete topic are almost always follow-up cues
+    if (!confidence && tokenCount <= 3) {
+      confidence = 0.70;
+      reason = "very_short_followup_cue";
     }
   }
   if (hasCoref) {

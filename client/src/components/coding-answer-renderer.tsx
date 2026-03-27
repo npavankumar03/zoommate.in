@@ -28,7 +28,77 @@ type ApproachSection  = { kind: "approach";   text: string };
 type EdgeSection      = { kind: "edge_cases"; text: string };
 type NoteSection      = { kind: "note";       title: string; text: string };
 type ProseSection     = { kind: "prose";      text: string };
-type Section = CodeSection | ComplexitySection | ApproachSection | EdgeSection | NoteSection | ProseSection;
+export type Section = CodeSection | ComplexitySection | ApproachSection | EdgeSection | NoteSection | ProseSection;
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function normalizeStructuredSections(sections: Section[] | undefined): Section[] {
+  if (!Array.isArray(sections) || sections.length === 0) return [];
+
+  const normalized: Section[] = [];
+
+  for (const raw of sections) {
+    if (!raw || typeof raw !== "object" || !("kind" in raw)) continue;
+
+    if (raw.kind === "code") {
+      const language = isNonEmptyString((raw as any).language) ? String((raw as any).language).trim() : "code";
+      const code = isNonEmptyString((raw as any).code) ? String((raw as any).code).trim() : "";
+      if (!code || /^undefined$/i.test(code)) continue;
+
+      const previous = normalized[normalized.length - 1];
+      if (previous?.kind === "code" && previous.language === language) {
+        previous.code = `${previous.code}\n${code}`.trim();
+        continue;
+      }
+
+      normalized.push({ kind: "code", language, code });
+      continue;
+    }
+
+    if (raw.kind === "complexity") {
+      const time = isNonEmptyString((raw as any).time) ? String((raw as any).time).trim() : "";
+      const space = isNonEmptyString((raw as any).space) ? String((raw as any).space).trim() : "";
+      if (!time && !space) continue;
+      normalized.push({ kind: "complexity", time, space });
+      continue;
+    }
+
+    if (raw.kind === "approach" || raw.kind === "edge_cases" || raw.kind === "prose") {
+      const text = isNonEmptyString((raw as any).text) ? String((raw as any).text).trim() : "";
+      if (!text || /^undefined$/i.test(text)) continue;
+      normalized.push({ kind: raw.kind, text } as Section);
+      continue;
+    }
+
+    if (raw.kind === "note") {
+      const title = isNonEmptyString((raw as any).title) ? String((raw as any).title).trim() : "Note";
+      const text = isNonEmptyString((raw as any).text) ? String((raw as any).text).trim() : "";
+      if (!text || /^undefined$/i.test(text)) continue;
+      normalized.push({ kind: "note", title, text });
+    }
+  }
+
+  return normalized;
+}
+
+function shouldFallbackToRawMarkdown(content: string, structuredSections?: Section[]): boolean {
+  const normalized = normalizeStructuredSections(structuredSections);
+  if (!structuredSections || structuredSections.length === 0) return false;
+  if (normalized.length === 0) return true;
+
+  const rawHasCodeFence = /```[\s\S]*?```/.test(content);
+  const structuredCodeBlocks = normalized.filter((s): s is CodeSection => s.kind === "code");
+
+  if (rawHasCodeFence && structuredCodeBlocks.length === 0) return true;
+  if (structuredCodeBlocks.some((s) => !isNonEmptyString(s.code) || /^undefined$/i.test(s.code))) return true;
+
+  const rawUndefinedCodeFence = /```(?:\w+)?\s*undefined\s*```/i.test(content);
+  if (rawUndefinedCodeFence) return true;
+
+  return false;
+}
 
 // ── Parser ─────────────────────────────────────────────────────────────────────
 
@@ -347,10 +417,14 @@ export function CodingAnswerRenderer({
 }: CodingAnswerRendererProps) {
   // Strip leading ellipsis artifacts from streaming
   const cleaned = content.replace(/^[\u2026.]{1,3}\s*/, "").trim();
+  const safeStructuredSections = normalizeStructuredSections(structuredSections);
 
   // Use pre-parsed sections from server when available
   if (structuredSections && structuredSections.length > 0) {
-    const sections = structuredSections;
+    if (shouldFallbackToRawMarkdown(cleaned, structuredSections)) {
+      return <MarkdownRenderer content={cleaned} className={className} />;
+    }
+    const sections = safeStructuredSections;
     return (
       <div className={`space-y-0.5 ${className || ""}`} style={{ minWidth: 0, width: "100%" }}>
         {isFollowUp && (
@@ -370,6 +444,10 @@ export function CodingAnswerRenderer({
   }
 
   const sections = parseSections(cleaned);
+  const safeParsedSections = normalizeStructuredSections(sections);
+  if (safeParsedSections.length === 0) {
+    return <MarkdownRenderer content={cleaned} className={className} />;
+  }
 
   return (
     <div className={`space-y-0.5 ${className || ""}`} style={{ minWidth: 0, width: "100%" }}>
@@ -382,7 +460,7 @@ export function CodingAnswerRenderer({
         </div>
       )}
 
-      {sections.map((section, i) => renderSection(section, i))}
+      {safeParsedSections.map((section, i) => renderSection(section, i))}
     </div>
   );
 }

@@ -33,6 +33,14 @@ export interface ComposeQuestionResult {
   isIncomplete: boolean;
 }
 
+export interface ResolvedInterviewTurn {
+  latestAsk: string;
+  kind: "new_question" | "follow_up" | "instruction" | "commentary" | "noise";
+  shouldAnswerNow: boolean;
+  unresolvedPriorAsk: string;
+  notes: string;
+}
+
 const sessionDedupMap = new Map<string, Array<{ norm: string; ts: number }>>();
 const DEDUP_WINDOW_MS = 12000;
 let dedupChecks = 0;
@@ -161,6 +169,27 @@ Rules:
 - Do NOT invent new meaning.
 - Preserve original intent.`;
 
+const TURN_RESOLVER_PROMPT = `You are a real-time interview turn resolver.
+Return ONLY valid JSON in this exact shape:
+{"latest_ask":"...","kind":"new_question|follow_up|instruction|commentary|noise","should_answer_now":true,"unresolved_prior_ask":"...","notes":"..."}
+
+Rules:
+- Read the latest transcript and recent interview state.
+- Decide what the interviewer most recently wants answered or responded to right now.
+- The transcript may contain multiple recent chunks from the same still-unanswered interviewer turn. Merge those recent related chunks into one clean latest_ask before answering.
+- Work from the most recent transcript content outward. Merge contiguous recent chunks only while they clearly belong to the same current interviewer turn. Stop when the topic changes.
+- Use the full latest interviewer speech, not just the strongest sub-question or last sentence fragment.
+- "latest_ask" can be a question, follow-up, instruction, scenario, challenge, or actionable interviewer request.
+- Do not require explicit question words. Imperative prompts, coding requests, scenario setups, and continued interviewer speech without question punctuation can still be answerable.
+- Preserve multi-part asks when the interviewer asked multiple things in one latest turn.
+- If the interviewer makes a statement and then challenges, reframes, narrows scope, or asks for reasoning, include that actionable intent in latest_ask.
+- If the latest turn is a follow-up, set kind="follow_up" and resolve it against the prior ask.
+- If the latest turn is a direct instruction/scenario/prompt that should still be answered, set kind="instruction" and should_answer_now=true.
+- If the latest turn is interviewer commentary, feedback, praise, challenge, or acknowledgment that still calls for a natural candidate response, set kind="commentary" and should_answer_now=true.
+- Use should_answer_now=false only for obvious noise, broken cut-off fragments, or content that truly does not need any candidate response.
+- If an older interviewer ask is still open and should remain pending, put it in unresolved_prior_ask.
+- Do not invent new content. Keep latest_ask concise but complete.`;
+
 /**
  * Collapses repetitive STT artifacts where the same phrase is captured
  * multiple times, e.g. "X and also X and also X and also X..."
@@ -227,25 +256,6 @@ function tryHeuristicExtraction(rawText: string): HeuristicResult | null {
 
   // Helper: capitalise first letter and ensure trailing "?"
   const q = (s: string) => s.charAt(0).toUpperCase() + s.slice(1).replace(/[?.!]*$/, "") + "?";
-
-  // ── Rhetorical Test / Noise Guard ─────────────────────────────────────────
-  if (/^(does\s+that\s+)?make\s+sense\??$/.test(lower) || /^(are\s+you\s+)?following\??$/.test(lower) || /^right\??$/.test(lower) || /^you\s+know\??$/.test(lower))
-    return null; // Force LLM or drop to ignore simple check-ins
-
-  // ── Code-Specific Inquiries ─────────────────────────────────────────────
-  if (/^(what\s+is\s+the\s+)?(time|space)\s+complexity/.test(lower))
-    return { question: q(text), type: "technical", confidence: 0.98 };
-
-  if (/^what\s+happens\s+on\s+line\s+\w+/.test(lower) || /^big\s+o\s+of/.test(lower))
-    return { question: q(text), type: "technical", confidence: 0.96 };
-
-  // ── Deep-Dive Technical Challenges ──────────────────────────────────────
-  if (/^(why\s+did\s+you\s+choose|why\s+not\s+use|what\s+are\s+the\s+trade-?offs?(?:\s+of)?|what\s+are\s+the\s+pros\s+and\s+cons|how\s+does\s+that\s+work|can\s+we\s+optimize|how\s+would\s+you\s+scale|can\s+you\s+elaborate)/.test(lower))
-    return { question: q(text), type: "technical", confidence: 0.95 };
-
-  // ── Hypothetical / Scenario Patterns ────────────────────────────────────
-  if (/^(suppose\s+you\s+have|imagine\s+a\s+situation|let'?s\s+say|if\s+you\s+were\s+to|what\s+if\s+(the\s+system|we))/.test(lower))
-    return { question: q(text), type: "technical", confidence: 0.94 };
 
   // ── Behavioral staples ──────────────────────────────────────────────────
   if (/^tell\s+me\s+about\s+yourself$/.test(lower))
@@ -579,6 +589,55 @@ export async function composeQuestionWithLLM(
     return {
       finalQuestion: fallback || draft,
       isIncomplete: /\b(and|or|also)\s*$/i.test(draft),
+    };
+  }
+}
+
+export async function resolveInterviewTurnWithLLM(
+  latestTranscript: string,
+  recentContext?: string,
+  sessionFacts?: string,
+  sessionId?: string,
+): Promise<ResolvedInterviewTurn> {
+  const transcript = (latestTranscript || "").trim();
+  if (!transcript) {
+    return { latestAsk: "", kind: "noise", shouldAnswerNow: false, unresolvedPriorAsk: "", notes: "Empty transcript" };
+  }
+
+  try {
+    const parts = [
+      `Latest transcript:\n"${transcript}"`,
+      recentContext ? `Recent context:\n${recentContext}` : "",
+      sessionFacts ? `Session facts:\n${sessionFacts}` : "",
+    ].filter(Boolean);
+    const raw = await callLLM("QUESTION_EXTRACTOR", TURN_RESOLVER_PROMPT, parts.join("\n\n"), sessionId);
+    const parsed = extractJsonObject(raw) || {};
+    const kindRaw = String(parsed.kind || "noise").trim();
+    const kind = (
+      kindRaw === "new_question"
+      || kindRaw === "follow_up"
+      || kindRaw === "instruction"
+      || kindRaw === "commentary"
+      || kindRaw === "noise"
+    ) ? kindRaw : "noise";
+
+    return {
+      latestAsk: typeof parsed.latest_ask === "string" ? parsed.latest_ask.trim() : "",
+      kind,
+      shouldAnswerNow: Boolean(parsed.should_answer_now),
+      unresolvedPriorAsk: typeof parsed.unresolved_prior_ask === "string" ? parsed.unresolved_prior_ask.trim() : "",
+      notes: typeof parsed.notes === "string" ? parsed.notes.trim() : "",
+    };
+  } catch (err: any) {
+    console.error("[questionDetect] Turn resolver LLM failed:", err.message);
+    const fallback = await extractQuestionsWithLLM(transcript, recentContext, sessionId);
+    const latestAsk = fallback[fallback.length - 1]?.text || "";
+    return {
+      latestAsk,
+      kind: latestAsk ? "new_question" : "noise",
+      shouldAnswerNow: Boolean(latestAsk),
+      unresolvedPriorAsk: "",
+      notes: "fallback",
     };
   }
 }

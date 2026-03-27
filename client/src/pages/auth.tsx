@@ -4,16 +4,11 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Zap, ArrowRight, Eye, EyeOff, Mail, RefreshCw } from "lucide-react";
+import { Zap, ArrowRight, Eye, EyeOff } from "lucide-react";
 import { useMutation } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { motion } from "framer-motion";
-import {
-  InputOTP,
-  InputOTPGroup,
-  InputOTPSlot,
-} from "@/components/ui/input-otp";
 
 export function LoginPage() {
   const [, navigate] = useLocation();
@@ -43,10 +38,6 @@ export function LoginPage() {
       return res.json();
     },
     onSuccess: (data: any) => {
-      if (data.requiresVerification) {
-        navigate(`/verify-email?userId=${data.userId}`);
-        return;
-      }
       if (data.role === "admin") {
         navigate("/admin");
       } else {
@@ -162,11 +153,7 @@ export function SignupPage() {
       const res = await apiRequest("POST", "/api/auth/signup", data);
       return res.json();
     },
-    onSuccess: (data: any) => {
-      if (data.requiresVerification) {
-        navigate(`/verify-email?userId=${data.userId}`);
-        return;
-      }
+    onSuccess: () => {
       navigate("/dashboard");
     },
     onError: (error: Error) => {
@@ -269,155 +256,6 @@ export function SignupPage() {
           Already have an account?{" "}
           <Link href="/login" className="text-primary font-medium" data-testid="link-login">
             Sign in
-          </Link>
-        </p>
-      </motion.div>
-    </div>
-  );
-}
-
-export function VerifyEmailPage() {
-  const [, navigate] = useLocation();
-  const { toast } = useToast();
-  const [code, setCode] = useState("");
-  const [cooldown, setCooldown] = useState(0);
-
-  const params = new URLSearchParams(window.location.search);
-  const userId = params.get("userId");
-
-  useEffect(() => {
-    if (!userId) {
-      navigate("/signup");
-    }
-  }, [userId]);
-
-  useEffect(() => {
-    if (cooldown <= 0) return;
-    const timer = setInterval(() => setCooldown((c) => c - 1), 1000);
-    return () => clearInterval(timer);
-  }, [cooldown]);
-
-  const verifyMutation = useMutation({
-    mutationFn: async (data: { userId: string; code: string }) => {
-      const res = await apiRequest("POST", "/api/auth/verify-email", data);
-      return res.json();
-    },
-    onSuccess: (data: any) => {
-      toast({ title: "Email verified!", description: "Welcome to Zoom Mate." });
-      if (data.role === "admin") {
-        navigate("/admin");
-      } else {
-        navigate("/dashboard");
-      }
-    },
-    onError: (error: Error) => {
-      toast({ title: "Verification failed", description: error.message, variant: "destructive" });
-    },
-  });
-
-  const resendMutation = useMutation({
-    mutationFn: async (data: { userId: string }) => {
-      const res = await apiRequest("POST", "/api/auth/resend-verification", data);
-      return res.json();
-    },
-    onSuccess: () => {
-      toast({ title: "Code resent", description: "A new verification code has been sent to your email." });
-      setCooldown(60);
-    },
-    onError: (error: Error) => {
-      toast({ title: "Resend failed", description: error.message, variant: "destructive" });
-    },
-  });
-
-  const handleVerify = () => {
-    if (!userId || code.length !== 6) return;
-    verifyMutation.mutate({ userId, code });
-  };
-
-  useEffect(() => {
-    if (code.length === 6 && userId) {
-      verifyMutation.mutate({ userId, code });
-    }
-  }, [code]);
-
-  if (!userId) return null;
-
-  return (
-    <div className="min-h-screen flex items-center justify-center p-4 relative">
-      <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-chart-2/5" />
-      <motion.div
-        initial={{ opacity: 0, y: 20 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.4 }}
-        className="w-full max-w-sm relative"
-      >
-        <div className="text-center mb-8">
-          <Link href="/">
-            <div className="inline-flex items-center gap-2 mb-4 cursor-pointer">
-              <div className="w-10 h-10 rounded-md bg-primary flex items-center justify-center">
-                <Zap className="w-6 h-6 text-primary-foreground" />
-              </div>
-              <span className="text-xl font-bold">Zoom Mate</span>
-            </div>
-          </Link>
-          <div className="w-16 h-16 rounded-full bg-primary/10 flex items-center justify-center mx-auto mb-4">
-            <Mail className="w-8 h-8 text-primary" />
-          </div>
-          <h1 className="text-2xl font-bold" data-testid="text-verify-title">Verify your email</h1>
-          <p className="text-sm text-muted-foreground mt-1">
-            We've sent a 6-digit verification code to your email address. Enter it below to complete your registration.
-          </p>
-        </div>
-        <Card className="p-6">
-          <div className="space-y-6">
-            <div className="flex justify-center">
-              <InputOTP
-                maxLength={6}
-                value={code}
-                onChange={setCode}
-                data-testid="input-verify-code"
-              >
-                <InputOTPGroup>
-                  <InputOTPSlot index={0} />
-                  <InputOTPSlot index={1} />
-                  <InputOTPSlot index={2} />
-                </InputOTPGroup>
-                <div className="flex items-center px-1 text-muted-foreground">—</div>
-                <InputOTPGroup>
-                  <InputOTPSlot index={3} />
-                  <InputOTPSlot index={4} />
-                  <InputOTPSlot index={5} />
-                </InputOTPGroup>
-              </InputOTP>
-            </div>
-            <Button
-              className="w-full"
-              disabled={code.length !== 6 || verifyMutation.isPending}
-              onClick={handleVerify}
-              data-testid="button-verify-submit"
-            >
-              {verifyMutation.isPending ? "Verifying..." : "Verify Email"}
-              <ArrowRight className="w-4 h-4 ml-1" />
-            </Button>
-            <div className="text-center">
-              <p className="text-xs text-muted-foreground mb-2">Didn't receive the code?</p>
-              <Button
-                variant="ghost"
-                size="sm"
-                disabled={cooldown > 0 || resendMutation.isPending}
-                onClick={() => resendMutation.mutate({ userId })}
-                data-testid="button-resend-code"
-              >
-                <RefreshCw className={`w-3 h-3 mr-1 ${resendMutation.isPending ? 'animate-spin' : ''}`} />
-                {cooldown > 0 ? `Resend in ${cooldown}s` : "Resend code"}
-              </Button>
-            </div>
-          </div>
-        </Card>
-        <p className="text-center text-sm text-muted-foreground mt-4">
-          Wrong account?{" "}
-          <Link href="/signup" className="text-primary font-medium">
-            Sign up again
           </Link>
         </p>
       </motion.div>

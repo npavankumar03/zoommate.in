@@ -13,25 +13,36 @@ function buildConversationHistory(sessionId: string): string {
 
 function buildFollowUpPack(sessionId: string, questionText: string): { pack: string; isFollowUp: boolean } {
   const state = getSessionState(sessionId);
+  const wordCount = questionText.trim().split(/\s+/).length;
+  const isShortOrAmbiguous = wordCount <= 8;
   const followUp = isFollowUp(questionText, { lastAssistantAt: state.lastAssistantAt });
-  if (!followUp.isFollowUp) return { pack: "", isFollowUp: false };
 
+  // Always treat short/ambiguous utterances as follow-ups if there is any recent context
   const anchor = resolveAnchorTurn(state);
   const relevantPairs = selectRelevantQAPairs(sessionId, questionText, 2, 900);
   const anchorQ = (anchor.lastUserQuestion || relevantPairs[0]?.q || "").slice(0, 400);
   const anchorA = (anchor.lastAssistantAnswer || relevantPairs[0]?.a || "").slice(0, 600);
+  const hasRecentContext = Boolean(anchorQ || anchorA);
+
+  // Only skip follow-up pack if: not a follow-up AND not short/ambiguous AND no recent context
+  if (!followUp.isFollowUp && !isShortOrAmbiguous && !hasRecentContext) return { pack: "", isFollowUp: false };
+  // If no recent context at all, nothing to anchor to
+  if (!hasRecentContext) return { pack: "", isFollowUp: false };
+
   const extraPair = relevantPairs.find((p) => p.q !== anchorQ || p.a !== anchorA);
   const extraBlock = extraPair
     ? `\n\nRelevant earlier QA:\nQ: ${extraPair.q.slice(0, 300)}\nA: ${extraPair.a.slice(0, 500)}`
     : "";
 
-  if (!anchorQ && !anchorA && !extraPair) return { pack: "", isFollowUp: false };
-
+  const isShortCue = wordCount <= 3;
   const pack = [
     "=== FOLLOW-UP CONTEXT (use this to answer precisely; do NOT be generic) ===",
-    `Previous question: ${anchorQ}`,
-    `Previous answer: ${anchorA}`,
-    "If the follow-up is ambiguous, ask ONE clarifying question, otherwise answer directly.",
+    `Latest interviewer topic: ${anchorQ}`,
+    `Last answer given: ${anchorA}`,
+    isShortCue
+      ? "SHORT FOLLOW-UP CUE DETECTED: Ignore the literal input. Bind directly to the latest interviewer topic above and expand the last answer. Do NOT ask for clarification."
+      : "Bind this input to the latest interviewer topic above. If the input is short, ambiguous, or incomplete, infer the full intent from the topic and answer directly.",
+    "Only ask for clarification if there is truly NO usable recent context in the session — otherwise always answer.",
     extraBlock,
   ].filter(Boolean).join("\n");
 
@@ -76,10 +87,12 @@ export async function generateOnEnter({
   const followUpPolicy = followUpDetected
     ? [
         "FOLLOW-UP POLICY:",
+        "- Bind to the latest interviewer topic automatically.",
         "- Start by referencing the prior answer in 1 sentence (e.g., \"On the caching point I mentioned...\").",
         "- Then expand with 2-5 bullets or a short paragraph.",
         "- End with one concrete example or next step if technical.",
-        "- If too ambiguous, ask ONE clarifying question.",
+        "- If short, ambiguous, or incomplete transcript — infer full intent from context and answer directly.",
+        "- Never ask for clarification unless there is truly NO usable recent context in the session.",
       ].join("\n")
     : "";
 
@@ -105,6 +118,13 @@ Do NOT:
 - Wait for question marks.
 - Block answers if detection logic doesn’t see a question.
 - Introduce new unrelated topics.
+- Ask for clarification — always infer and answer.
+
+Short utterance rules (apply when input is 6 words or less):
+- Treat it as a follow-up to the last active topic automatically.
+- Rewrite the vague input into a full contextual question based on conversation history, then answer it.
+- Anchor to the last discussed topic even if the input seems unrelated.
+- Answer even if the transcript is incomplete or cut off mid-sentence.
 
 ${followUpPolicy}`.trim();
 

@@ -76,14 +76,7 @@ export class WsMicStreamer {
 
   async start(existingStream?: MediaStream): Promise<void> {
     try {
-      this.stream = existingStream || await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-          sampleRate: 48000,
-        },
-      });
+      this.stream = existingStream || await navigator.mediaDevices.getUserMedia({ audio: true });
 
       this.connectWebSocket();
 

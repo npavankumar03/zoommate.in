@@ -70,8 +70,8 @@ function CodeBlock({ language, children }: { language: string; children: string 
       <div
         style={{
           width: "100%",
-          overflowX: "hidden",
-          overflowY: "visible",
+          overflowX: "auto",
+          overflowY: "hidden",
           background: "#1f2430",
           borderBottomLeftRadius: "0.75rem",
           borderBottomRightRadius: "0.75rem",
@@ -87,14 +87,11 @@ function CodeBlock({ language, children }: { language: string; children: string 
             fontSize: "0.82rem",
             padding: "1rem 1.1rem",
             background: "#1f2430",
-            whiteSpace: "pre-wrap",
-            overflowX: "hidden",
-            overflowWrap: "anywhere",
-            wordBreak: "break-word",
+            whiteSpace: "pre",
+            overflowX: "visible",
             display: "block",
             width: "100%",
           }}
-          wrapLongLines
         >
           {code}
         </SyntaxHighlighter>
@@ -103,7 +100,49 @@ function CodeBlock({ language, children }: { language: string; children: string 
   );
 }
 
-export function MarkdownRenderer({ content, className }: { content: string; className?: string }) {
+// Streaming renderer — uses the same ReactMarkdown pipeline as the final render
+// so bullets, bold, code blocks all format correctly from the first token.
+function StreamingMarkdown({ content, className }: { content: string; className?: string }) {
+  const stripped = content.replace(/^[\u2026.]{1,3}\s*/, "");
+  const completed = completePartialMarkdown(stripped);
+  return (
+    <div className={className} style={{ minWidth: 0, width: "100%" }}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          code({ node, className: codeClassName, children, ...props }) {
+            const match = /language-(\w+)/.exec(codeClassName || "");
+            const lang = match?.[1] || "";
+            const isInline = !match && !String(children).includes("\n");
+            if (/^(text|plain|plaintext)$/i.test(lang)) {
+              return <p className="mb-3 last:mb-0 whitespace-pre-wrap">{children}</p>;
+            }
+            if (isInline) {
+              return <code className="px-1 py-0.5 bg-muted rounded text-xs font-mono" {...props}>{children}</code>;
+            }
+            return <CodeBlock language={lang} children={String(children)} />;
+          },
+          p({ children }) { return <p className="mb-3 last:mb-0">{children}</p>; },
+          strong({ children }) { return <strong className="font-semibold">{children}</strong>; },
+          ul({ children }) { return <ul className="list-disc pl-4 mb-1.5 space-y-0.5">{children}</ul>; },
+          ol({ children }) { return <ol className="list-decimal pl-4 mb-1.5 space-y-0.5">{children}</ol>; },
+          li({ children }) { return <li className="leading-relaxed">{children}</li>; },
+          h1({ children }) { return <h1 className="text-base font-bold mb-1">{children}</h1>; },
+          h2({ children }) { return <h2 className="text-sm font-bold mb-1">{children}</h2>; },
+          h3({ children }) { return <h3 className="text-sm font-semibold mb-1">{children}</h3>; },
+        }}
+      >
+        {completed}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
+export function MarkdownRenderer({ content, className, streaming }: { content: string; className?: string; streaming?: boolean }) {
+  // During streaming use the fast inline renderer to avoid ReactMarkdown DOM thrashing
+  if (streaming) {
+    return <StreamingMarkdown content={content} className={className} />;
+  }
   // Strip leading ellipsis artifacts ("..." or "…") the AI emits mid-stream
   const stripped = content.replace(/^[\u2026.]{1,3}\s*/, "");
   const normalizedContent = completePartialMarkdown(normalizeQaSpacing(stripped));
