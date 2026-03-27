@@ -527,6 +527,9 @@ export default function MeetingSession() {
   type InterviewState = "listening" | "partial_detected" | "answering" | "cooldown";
   const interviewStateRef = useRef<InterviewState>("listening");
   const cooldownTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Debounce ref for auto-trigger: prevents firing on the first question alone when
+  // the interviewer is asking multiple questions in rapid succession.
+  const autoTriggerDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const getLiveVisionStream = useCallback((): MediaStream | null => {
     const candidates = [
@@ -4757,40 +4760,82 @@ export default function MeetingSession() {
     setDebugMeta((prev) => ({ ...prev, questionConf: advanced.confidence, sessionState: interviewStateRef.current }));
 
     if (canFinalTrigger && id) {
-      interviewStateRef.current = "answering"; // Lock: prevents races/duplicates until cooldown
-      rememberAutoTriggerFingerprint(finalFingerprint!, Date.now());
-      rememberAskedFingerprint(finalFingerprint!);
-      triggerMetricRef.current = { t_trigger_decision: Date.now(), t_final_detected: Date.now() };
-      setLastSubmitSource("transcript");
-      setInterpretedQuestion(trimmed);
-      setStreamingQuestion(trimmed);
-      showOptimisticAssistantState(trimmed);
-      const ws = wsAnswerRef.current;
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        startFirstChunkWatchdog("auto_final");
-        ws.send(JSON.stringify({
-          type: "question",
-          sessionId: id,
-          text: trimmed,
-          format: responseFormat === "custom" ? "custom" : responseFormat,
-          model: selectedModel,
-          quickMode: quickResponseMode,
-          docsMode,
-          metadata: {
-            mode: "final",
-            audioMode,
-            submitSource: "transcript",
-            customFormatPrompt: responseFormat === "custom" ? customPrompt : undefined,
-            docsMode,
-            systemPrompt: customPrompt || undefined,
-            jobDescription: conversationHistory || undefined,
-          },
-        }));
-      } else {
-        // WS not open: reset state so it doesn't lock forever
-        interviewStateRef.current = "listening";
-      }
-      triggerMetricRef.current.t_request_sent = Date.now();
+      // Capture state values at detection time (used as fallback if display is empty at fire time)
+      const capturedTrimmed = trimmed;
+      const capturedId = id;
+      const capturedFormat = responseFormat;
+      const capturedModel = selectedModel;
+      const capturedQuickMode = quickResponseMode;
+      const capturedDocsMode = docsMode;
+      const capturedCustomPrompt = customPrompt;
+      const capturedHistory = conversationHistory;
+      const capturedAudioMode = audioMode;
+
+      // Debounce: cancel any pending trigger and start a fresh 700ms window.
+      // This lets rapid-fire multi-question sequences accumulate in displaySegmentsRef
+      // before we fire, so the AI receives ALL questions together instead of just the first.
+      if (autoTriggerDebounceRef.current) clearTimeout(autoTriggerDebounceRef.current);
+
+      autoTriggerDebounceRef.current = setTimeout(() => {
+        autoTriggerDebounceRef.current = null;
+        // Abort if another trigger already locked state during the debounce window
+        if (interviewStateRef.current === "answering") return;
+
+        // Build multi-question text from all consecutive question segments in the display
+        // (newest-first in displaySegmentsRef, so reverse to chronological order).
+        const QSTART_RE = /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are|tell|walk|explain|give|describe|share|suppose|assume)\b/i;
+        const CAND_RE = /^Candidate:\s+/i;
+        const collectedQs: string[] = [];
+        let fragSkips = 0;
+        for (const seg of displaySegmentsRef.current.slice(0, 10)) {
+          const s = String(seg || "").trim();
+          if (!s || CAND_RE.test(s)) break;
+          if (s.includes("?") || QSTART_RE.test(s)) {
+            collectedQs.push(s);
+            fragSkips = 0;
+          } else {
+            if (s.split(/\s+/).filter(Boolean).length <= 2 && fragSkips < 2) fragSkips++;
+            else break;
+          }
+        }
+        const text = collectedQs.length > 1
+          ? collectedQs.slice().reverse().join(" ")
+          : capturedTrimmed;
+
+        interviewStateRef.current = "answering";
+        rememberAutoTriggerFingerprint(finalFingerprint!, Date.now());
+        rememberAskedFingerprint(finalFingerprint!);
+        triggerMetricRef.current = { t_trigger_decision: Date.now(), t_final_detected: Date.now() };
+        setLastSubmitSource("transcript");
+        setInterpretedQuestion(text);
+        setStreamingQuestion(text);
+        showOptimisticAssistantState(text);
+        const ws = wsAnswerRef.current;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          startFirstChunkWatchdog("auto_final");
+          ws.send(JSON.stringify({
+            type: "question",
+            sessionId: capturedId,
+            text,
+            format: capturedFormat === "custom" ? "custom" : capturedFormat,
+            model: capturedModel,
+            quickMode: capturedQuickMode,
+            docsMode: capturedDocsMode,
+            metadata: {
+              mode: "final",
+              audioMode: capturedAudioMode,
+              submitSource: "transcript",
+              customFormatPrompt: capturedFormat === "custom" ? capturedCustomPrompt : undefined,
+              docsMode: capturedDocsMode,
+              systemPrompt: capturedCustomPrompt || undefined,
+              jobDescription: capturedHistory || undefined,
+            },
+          }));
+          triggerMetricRef.current.t_request_sent = Date.now();
+        } else {
+          interviewStateRef.current = "listening";
+        }
+      }, 700);
     }
 
     try {
