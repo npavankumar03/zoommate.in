@@ -3840,9 +3840,8 @@ export default function MeetingSession() {
       rafPendingRef.current = null;
       const queue = wsTextQueueRef.current;
       if (!queue) return;
-      // Reveal 3 chars/frame normally (~180 char/s at 60fps — smooth typewriter),
-      // ramp up to 8 then 22 when the queue builds to avoid visible lag.
-      const speed = queue.length > 200 ? 22 : queue.length > 60 ? 8 : 3;
+      // Snappy default (5 chars/frame = ~300 char/s at 60fps), ramp up fast when behind.
+      const speed = queue.length > 150 ? 35 : queue.length > 40 ? 15 : 5;
       displayedAccRef.current += queue.slice(0, speed);
       wsTextQueueRef.current = queue.slice(speed);
       setStreamingAnswer(sanitizeDisplayedAnswerText(displayedAccRef.current));
@@ -8995,53 +8994,35 @@ export default function MeetingSession() {
                 >
                   {responsesLocal.length > 0 || shouldShowStreamingCard ? (
                     <div className="space-y-3">
-                      <AnimatePresence>
-                        {shouldShowStreamingCard && (
-                          <motion.div
-                            key="streaming-card"
-                            initial={{ opacity: 0, y: 8 }}
-                            animate={{ opacity: 1, y: 0 }}
-                            exit={{ opacity: 0, y: -4 }}
-                            transition={{ duration: 0.18, ease: "easeOut" }}
-                            className={`relative py-2 pl-3 transition-colors ${isStreaming ? "border-l-2 border-primary/50" : "border-l-2 border-transparent"}`}
-                            data-testid="card-streaming-response"
-                          >
-                            {(streamingAnswer || pendingResponse?.answer) ? (
-                              <div className="text-sm leading-relaxed">
-                                {streamingDisplayAsCode ? (
-                                  <MarkdownRenderer content={enforceCodeOnlyDisplay(streamingDisplayAnswer, streamingDisplayQuestion)} streaming={isStreaming} />
-                                ) : (
-                                  <MarkdownRenderer content={streamingDisplayAnswer} streaming={isStreaming} />
-                                )}
-                                {isStreaming && !isRefining && (
-                                  <span className="stream-cursor" />
-                                )}
-                                {isRefining && (
-                                  <span className="text-[10px] text-primary/70 ml-1.5 font-medium tracking-wide" style={{ animation: "thinking-pulse 1.2s ease-in-out infinite" }}>refining</span>
-                                )}
-                              </div>
-                            ) : (
-                              <div className="flex items-center gap-2 py-1.5" data-testid="badge-streaming-status">
-                                <div className="flex items-center gap-1">
-                                  {[0, 1, 2].map((i) => (
-                                    <span
-                                      key={i}
-                                      className="inline-block w-1.5 h-1.5 rounded-full bg-primary"
-                                      style={{ animation: "thinking-pulse 1.2s ease-in-out infinite", animationDelay: `${i * 0.15}s` }}
-                                    />
-                                  ))}
-                                </div>
-                                <span className="text-xs text-muted-foreground">Generating answer...</span>
-                              </div>
-                            )}
-                            {isStreaming && (
-                              <div className="absolute bottom-0 left-0 right-0 h-px overflow-hidden rounded-full opacity-60">
-                                <div className="h-full bg-primary stream-shimmer-bar" />
-                              </div>
-                            )}
-                          </motion.div>
-                        )}
-                      </AnimatePresence>
+                      {shouldShowStreamingCard && (
+                        <div data-testid="card-streaming-response">
+                          {(streamingAnswer || pendingResponse?.answer) ? (
+                            <div>
+                              <MarkdownRenderer
+                                content={streamingDisplayAsCode
+                                  ? enforceCodeOnlyDisplay(streamingDisplayAnswer, streamingDisplayQuestion)
+                                  : streamingDisplayAnswer}
+                                streaming={isStreaming}
+                              />
+                              {isStreaming && !isRefining && <span className="stream-cursor" />}
+                              {isRefining && (
+                                <span className="text-[11px] text-muted-foreground ml-2" style={{ animation: "thinking-pulse 1.4s ease-in-out infinite" }}>refining…</span>
+                              )}
+                            </div>
+                          ) : (
+                            <div className="flex items-center gap-2 py-2" data-testid="badge-streaming-status">
+                              {[0, 1, 2].map((i) => (
+                                <span
+                                  key={i}
+                                  className="inline-block w-1.5 h-1.5 rounded-full bg-primary/60"
+                                  style={{ animation: "thinking-pulse 1.2s ease-in-out infinite", animationDelay: `${i * 0.18}s` }}
+                                />
+                              ))}
+                              <span className="text-xs text-muted-foreground">Generating…</span>
+                            </div>
+                          )}
+                        </div>
+                      )}
 
                       {(showResponseHistory ? responsesLocal.slice(0, 6) : responsesLocal.slice(0, 1))
                         .map((resp) => {
