@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, memo } from "react";
 import { Link, useLocation, useParams } from "wouter";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -263,6 +263,36 @@ function rewriteMixedTopicQuestion(raw: string): string {
   return text;
 }
 
+interface ResponseCardProps {
+  resp: Response;
+  isHighlighted: boolean;
+  content: string;
+  onMount: (id: string, el: HTMLDivElement | null) => void;
+}
+
+const ResponseCard = memo(function ResponseCard({ resp, isHighlighted, content, onMount }: ResponseCardProps) {
+  const cardRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    onMount(resp.id, cardRef.current);
+    return () => { onMount(resp.id, null); };
+  }, [resp.id, onMount]);
+
+  return (
+    <div
+      ref={cardRef}
+      className={`py-2 ${isHighlighted ? "bg-primary/5 rounded px-2" : ""}`}
+      data-testid={`card-response-${resp.id}`}
+    >
+      <div className="text-sm leading-relaxed">
+        <MarkdownRenderer content={content} />
+      </div>
+      <div className="mt-1 text-[10px] text-muted-foreground/50">
+        {resp.createdAt ? new Date(resp.createdAt).toLocaleTimeString() : ""}
+      </div>
+    </div>
+  );
+});
+
 export default function MeetingSession() {
   const { id } = useParams<{ id: string }>();
   const [, setLocation] = useLocation();
@@ -359,6 +389,7 @@ export default function MeetingSession() {
   });
   const streamBufferRef = useRef<string>("");
   const flushTimerRef = useRef<number | null>(null);
+  const rafPendingRef = useRef<number | null>(null);
   const autoScrollEnabledRef = useRef(true);
   const autoScrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastAssistantAnswerRef = useRef<string>("");
@@ -3392,6 +3423,10 @@ export default function MeetingSession() {
     }, 180);
   }, [isNearBottom]);
 
+  const handleResponseCardMount = useCallback((id: string, el: HTMLDivElement | null) => {
+    responseCardRefs.current[id] = el;
+  }, []);
+
   const highlightAndScrollResponse = useCallback((responseId: string) => {
     if (!responseId) return;
     setHighlightResponseId(responseId);
@@ -3930,13 +3965,22 @@ export default function MeetingSession() {
             return;
           }
           streamingAccumulatorRef.current += chunk;
-          setStreamingAnswer(sanitizeDisplayedAnswerText(streamingAccumulatorRef.current));
+          if (!rafPendingRef.current) {
+            rafPendingRef.current = requestAnimationFrame(() => {
+              rafPendingRef.current = null;
+              setStreamingAnswer(sanitizeDisplayedAnswerText(streamingAccumulatorRef.current));
+            });
+          }
           return;
         }
 
         if (msg.type === "assistant_end") {
           if (activeWsStreamIdRef.current && msg.requestId && msg.requestId !== activeWsStreamIdRef.current) return;
           console.log("[ws] assistant_end received", { requestId: msg.requestId, cancelled: !!msg.cancelled });
+          if (rafPendingRef.current) {
+            cancelAnimationFrame(rafPendingRef.current);
+            rafPendingRef.current = null;
+          }
           if (flushTimerRef.current) {
             window.clearTimeout(flushTimerRef.current);
             flushTimerRef.current = null;
@@ -4087,6 +4131,10 @@ export default function MeetingSession() {
           if (cooldownTimerRef.current) clearTimeout(cooldownTimerRef.current);
           interviewStateRef.current = "listening";
           streamBufferRef.current = "";
+          if (rafPendingRef.current) {
+            cancelAnimationFrame(rafPendingRef.current);
+            rafPendingRef.current = null;
+          }
           clearStreamingRenderTimer();
           const errorMsg = String(msg.message || "Please try again");
           console.log("[ws] assistant_error", errorMsg);
@@ -8943,25 +8991,21 @@ export default function MeetingSession() {
                       )}
 
                       {(showResponseHistory ? responsesLocal.slice(0, 6) : responsesLocal.slice(0, 1))
-                        .map((resp) => (
-                          <div
-                            key={resp.id}
-                            ref={(el) => { responseCardRefs.current[resp.id] = el; }}
-                            className={`py-2 ${highlightResponseId === resp.id ? "bg-primary/5 rounded px-2" : ""}`}
-                            data-testid={`card-response-${resp.id}`}
-                          >
-                            <div className="text-sm leading-relaxed">
-                              {shouldDisplayAnswerAsCode(resp.question, resp.answer) ? (
-                                <MarkdownRenderer content={enforceCodeOnlyDisplay(resp.answer, resp.question)} />
-                              ) : (
-                                <MarkdownRenderer content={resp.answer} />
-                              )}
-                            </div>
-                            <div className="mt-1 text-[10px] text-muted-foreground/50">
-                              {resp.createdAt ? new Date(resp.createdAt).toLocaleTimeString() : ""}
-                            </div>
-                          </div>
-                        ))}
+                        .map((resp) => {
+                          const displayAsCode = shouldDisplayAnswerAsCode(resp.question, resp.answer);
+                          const content = displayAsCode
+                            ? enforceCodeOnlyDisplay(resp.answer, resp.question)
+                            : resp.answer;
+                          return (
+                            <ResponseCard
+                              key={resp.id}
+                              resp={resp}
+                              isHighlighted={highlightResponseId === resp.id}
+                              content={content}
+                              onMount={handleResponseCardMount}
+                            />
+                          );
+                        })}
                     </div>
                   ) : (
                     <div className="flex flex-col items-center justify-center h-full text-center py-12">
