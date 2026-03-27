@@ -4,7 +4,14 @@ import { URL } from "url";
 import { storage } from "../storage";
 import { streamAssistantAnswer, abortSessionStream, hasActiveStream } from "../assist/streamAssistantAnswer";
 import { getLastUnansweredInterviewerQuestion, getLatestSpokenReply, recordUserQuestion, getCodingProblemState, buildInterviewerIntelligenceBlock } from "../assist/sessionState";
-import { levenshteinSimilarity, normalizeQuestionForSimilarity } from "@shared/questionDetection";
+import {
+  detectQuestion,
+  extractQuestionFromSegment,
+  likelyContainsQuestion,
+  levenshteinSimilarity,
+  normalizeQuestionForSimilarity,
+  normalizeText,
+} from "@shared/questionDetection";
 import { getRefineConfig, buildRefineContext } from "../assist/refinePass";
 import { parseResponse } from "../assist/responseParser";
 import { streamLLM, resolveAutomaticInterviewModel } from "../llmRouter2";
@@ -94,8 +101,13 @@ interface AnswerSession {
   requestId: string;
 }
 
-// Known follow-up words/phrases that are always valid — never treat as noise/vague
-const KNOWN_FOLLOWUP_RE = /^(why|how so|how|what about|elaborate|explain|tell me more|go on|continue|and then|what next|what else|can you explain|can you elaborate|give me an example|okay|ok|sure|interesting|really|seriously|and|so|then|next|more|again|wait|huh|show me|keep going|proceed|expand|clarify|summarize|repeat|example|further|detail|go ahead|dive deeper|dig deeper|break it down|zoom in|say more|one more)\??$/i;
+// Known substantive follow-up phrases — keep these answerable/anchorable, but
+// do not treat generic acknowledgements like "okay" or "yeah" as follow-ups.
+const KNOWN_FOLLOWUP_RE = /^(why|how so|how come|how|what about(?:\s+\w.*)?|elaborate|explain|tell me more|go on|continue|and then|what next|what else|can you explain|can you elaborate|give me an example|show me|keep going|proceed|expand|clarify|summarize|repeat|example|further|detail|go ahead|dive deeper|dig deeper|break it down|zoom in|say more|one more|more detail)\??$/i;
+const STRICT_ANCHORABLE_FOLLOWUP_RE = /^(why|how so|how come|how|elaborate|explain|tell me more|go on|continue|expand|clarify|what next|what else|more detail|give me an example|show me|keep going|proceed|summarize|repeat|example|further|detail|go ahead|dive deeper|dig deeper|break it down|zoom in|say more|one more|what about(?:\s+\w.*)?|how about(?:\s+\w.*)?)\??$/i;
+const CONNECTOR_PREFIX_RE = /^(and\s+also|and|also|plus|as\s+well\s+as|or)\s+/i;
+const PERSONAL_OR_BEHAVIORAL_Q_RE = /\b(yourself|tell me about|time when|situation|challenge|strength|weakness|career|background|hobby)\b/i;
+const TOPIC_APPENDABLE_Q_RE = /\b(experience|worked with|worked on|used|use|familiar with|comfortable with|background in|knowledge of|exposure to|skills?|stack|technolog(?:y|ies)|tools?)\b/i;
 
 // Detects incomplete questions that end with a dangling preposition/article (sentence cut off mid-ask)
 function isDanglingStub(q: string): boolean {
@@ -105,31 +117,44 @@ function isDanglingStub(q: string): boolean {
   return /\b(in|with|at|for|on|about|of|from|to|by|and|or|the|a|an|any|some|your|our|their|its|this|that|these|those)\s*$/.test(q);
 }
 
+function extractSharedQuestionCandidate(text: string): string {
+  return extractQuestionFromSegment(String(text || "")) || "";
+}
+
+function hasSharedQuestionSignal(text: string): boolean {
+  const raw = String(text || "").trim();
+  if (!raw) return false;
+  return detectQuestion(raw) || likelyContainsQuestion(raw) || Boolean(extractSharedQuestionCandidate(raw));
+}
+
 function isVagueQuestion(text: string): boolean {
-  const q = String(text || "").toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
+  const q = normalizeText(String(text || ""));
   if (!q) return true;
   if (KNOWN_FOLLOWUP_RE.test(q)) return false;
+  const extracted = extractSharedQuestionCandidate(text);
+  if (extracted && !isDanglingStub(normalizeText(extracted))) return false;
   const words = q.split(" ").filter(Boolean);
   if (words.length <= 1 && !q.includes("?")) return true;
   // Partial/cut-off question stubs — interviewer didn't finish speaking
   if (isDanglingStub(q)) return true;
+  if (hasSharedQuestionSignal(text) && words.length >= 2) return false;
   if (/^(do you have experience|do you have experience in|have you worked on|tell me about)\??$/.test(q)) return true;
   return false;
 }
 
 function looksLikeInterviewNoise(text: string): boolean {
-  const q = String(text || "").toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
+  const q = normalizeText(String(text || ""));
   if (!q) return true;
   // Known follow-ups are never noise
   if (KNOWN_FOLLOWUP_RE.test(q)) return false;
+  if (KNOWN_TECH_TERM_RE.test(q.trim())) return false;
+  if (hasSharedQuestionSignal(text)) return false;
   const words = q.split(" ").filter(Boolean);
   if (words.length < 2 && !q.includes("?")) return true;
 
-  const hasQuestionCue = /\?|^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|tell|walk|explain|describe|share|give|talk|are you|have you|your experience|your background)\b/.test(q)
-    || /\b(tell me about|tell us about|walk me through|talk me through|describe a time|give me an example|have you worked|have you used|have you ever|are you familiar|are you comfortable with|your experience (with|in)|your background in)\b/.test(q);
   const hasInterviewCue = /\b(experience|project|api|apis|react|python|fastapi|fast api|fast apis|django|backend|frontend|system|design|challenge|work|role|aws|azure|gcp|cloud|kubernetes|docker|microservice|database|sql|nosql|java|typescript|golang|rust|spring|node|angular|vue)\b/.test(q);
   const hasFollowUpCue = /^(show me|keep going|one more|go on|go ahead|tell me more|explain more|elaborate more|more detail|what else|what next|and then|say more|dive deeper|dig deeper|expand on|break it down|walk me through that)\b/.test(q);
-  if (!hasQuestionCue && !hasInterviewCue && !hasFollowUpCue && words.length <= 12) return true;
+  if (!hasInterviewCue && !hasFollowUpCue && words.length <= 12) return true;
 
   const randomNoisePattern = /\b(call mum|road closed|downtown|island|laguna|nokia)\b/;
   if (randomNoisePattern.test(q) && !hasInterviewCue) return true;
@@ -141,13 +166,15 @@ function chooseBestQuestionSeed(candidates: Array<string | undefined | null>): s
   const cleaned = candidates
     .map((c) => String(c || "").trim())
     .filter(Boolean)
+    .map((text) => extractSharedQuestionCandidate(text) || text)
     .filter((text) => !looksLikeInterviewNoise(text));
   if (!cleaned.length) return "[Continue]";
 
   const scored = cleaned.map((text, idx) => {
     const vague = isVagueQuestion(text);
     const hasQuestionMark = text.includes("?");
-    const score = (vague ? 0 : 1000) + (hasQuestionMark ? 80 : 0) + Math.min(text.length, 400) - idx;
+    const sharedSignal = hasSharedQuestionSignal(text);
+    const score = (vague ? 0 : 1000) + (sharedSignal ? 120 : 0) + (hasQuestionMark ? 80 : 0) + Math.min(text.length, 400) - idx;
     return { text, score };
   });
   scored.sort((a, b) => b.score - a.score);
@@ -166,7 +193,9 @@ function extractLatestMergedSegment(raw: string): string {
   // Prefer last explicit question-like segment.
   for (let i = parts.length - 1; i >= 0; i--) {
     const p = parts[i];
-    if (/\?/.test(p) || /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|tell|walk|explain)\b/i.test(p)) {
+    const extracted = extractSharedQuestionCandidate(p);
+    if (extracted) return extracted;
+    if (hasSharedQuestionSignal(p)) {
       return p;
     }
   }
@@ -177,11 +206,12 @@ function extractLatestMergedSegment(raw: string): string {
 const KNOWN_TECH_TERM_RE = /^(flask|django|fastapi|react|angular|vue|python|java|javascript|typescript|nodejs|node\.?js|aws|azure|gcp|docker|kubernetes|redis|kafka|mongodb|postgres|postgresql|mysql|spring|terraform|ansible|graphql|microservices?|devops|git|linux|bash|celery|rabbitmq|elasticsearch|nginx|jenkins|airflow|spark|hadoop|pandas|numpy|pytorch|tensorflow|scikit|langchain|openai|llm|rag|pinecone|weaviate|next\.?js|tailwind|redux|webpack|vite|jest|pytest|junit|maven|gradle|intellij|pycharm|jupyter|postman|jira|confluence|bitbucket|github|gitlab|agile|scrum|kanban|ci.?cd|rest|soap|grpc|jwt|oauth|saml|ldap|ssl|tls|tcp|http|websocket|sql|nosql|orm|crud|solid|mvp|mvc|mvvm|tdd|bdd|ddd|design pattern|system design|data structure|algorithm|leetcode|hackerrank)s?\b$/i;
 
 function looksLikeNoiseSegment(text: string): boolean {
-  const q = String(text || "").toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
+  const q = normalizeText(String(text || ""));
   if (!q) return true;
   if (KNOWN_FOLLOWUP_RE.test(q)) return false;
   // Known tech terms alone are never noise — treat as implicit "do you have experience in X"
   if (KNOWN_TECH_TERM_RE.test(q.trim())) return false;
+  if (hasSharedQuestionSignal(text)) return false;
   const words = q.split(" ").filter(Boolean);
   if (words.length <= 1 && !q.includes("?")) return true;
 
@@ -196,19 +226,42 @@ function looksLikeNoiseSegment(text: string): boolean {
   const uniqueWords = new Set(words);
   if (uniqueWords.size === 1 && words.length > 1) return true;
 
-  const hasQuestionCue = /\?|^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|tell|walk|explain|describe|share|give|talk|are you|have you|your experience|your background)\b/.test(q)
-    || /\b(tell me about|tell us about|walk me through|talk me through|describe a time|give me an example|have you worked|have you used|have you ever|are you familiar|are you comfortable with|your experience with|your experience in|your background in)\b/.test(q);
-
   // Interview cue — must be a meaningful tech/interview term, not just any common word
   const hasInterviewCue = /\b(experience|react|python|fastapi|flask|django|api|apis|project|worked|aws|azure|gcp|cloud|kubernetes|docker|microservice|database|sql|nosql|java|typescript|golang|spring|node|angular|vue|devops|agile|scrum|architecture|system design|algorithm|data structure|machine learning|ci cd|deployment|testing|optimization)\b/.test(q);
 
   // Short segments (≤6 words) with no question cue AND no interview cue → noise
-  if (!hasQuestionCue && !hasInterviewCue && words.length <= 6) return true;
+  if (!hasInterviewCue && words.length <= 6) return true;
 
   // Medium segments (7–12 words) also need at least one signal
-  if (!hasQuestionCue && !hasInterviewCue && words.length <= 12) return true;
+  if (!hasInterviewCue && words.length <= 12) return true;
 
   return false;
+}
+
+function normalizeQuestionFragment(text: string): string {
+  return String(text || "").toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function isBehavioralOrPersonalQuestion(question: string): boolean {
+  return PERSONAL_OR_BEHAVIORAL_Q_RE.test(question);
+}
+
+function isTopicAppendableQuestion(question: string): boolean {
+  if (!question) return false;
+  if (isBehavioralOrPersonalQuestion(question)) return false;
+  return TOPIC_APPENDABLE_Q_RE.test(question) || /\b(do|does|did|have|has|are|is|can|could|would)\s+you\b/i.test(question);
+}
+
+function isSafeTopicTail(fragment: string): boolean {
+  const normalized = normalizeQuestionFragment(fragment);
+  if (!normalized) return false;
+  if (looksLikeInterviewNoise(fragment) || isDanglingStub(normalized)) return false;
+
+  const words = normalized.split(/\s+/).filter(Boolean);
+  if (words.length < 1 || words.length > 5) return false;
+
+  if (KNOWN_TECH_TERM_RE.test(normalized)) return true;
+  return /\b(api|backend|frontend|cloud|database|sql|nosql|devops|microservices?|system design|project|architecture|testing|security|scalability|performance)\b/i.test(normalized);
 }
 
 function extractStrictInterviewerQuestion(raw: string): string {
@@ -233,18 +286,20 @@ function extractStrictInterviewerQuestion(raw: string): string {
     if (isCandidateLine) continue;
     s = s.replace(/^interviewer\s*:\s*/i, "").trim();
     if (!s) continue;
-    if (looksLikeNoiseSegment(s)) continue;
+    const extracted = extractSharedQuestionCandidate(s);
+    const candidate = extracted || s;
+    if (looksLikeNoiseSegment(candidate)) continue;
 
-    const q = s.toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
+    const q = normalizeText(candidate);
     const words = q.split(" ").filter(Boolean).length;
-    const hasQMark = s.includes("?");
-    const startsQuestion = /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|tell|walk|explain|describe|share|give|talk|are you|have you|your experience|your background)\b/.test(q);
+    const hasQMark = candidate.includes("?");
+    const hasQuestionSignal = detectQuestion(candidate) || likelyContainsQuestion(candidate) || Boolean(extracted);
     const directWhDefinition = /^(what is|what's|define|explain)\b/.test(q);
     const hasInterviewCue = /\b(experience|project|worked|role|responsibility|domain|process|stakeholder|analysis|business|technical|start date|end date|month|year)\b/.test(q);
     const qTokens = q.split(/\s+/).filter((w) => w.length >= 4);
     const uniqueTokenCount = new Set(qTokens).size;
     const hasCompoundJoiner = /\b(and|also|as well as)\b/.test(q);
-    const punctuationSplitCount = s.split(/[?,]/).map((p) => p.trim()).filter(Boolean).length;
+    const punctuationSplitCount = candidate.split(/[?,]/).map((p) => p.trim()).filter(Boolean).length;
     const multiClauseBonus = punctuationSplitCount >= 2 ? Math.min(40, (punctuationSplitCount - 1) * 12) : 0;
     const partialStub = /^(when did you|do you have|what was your|have you worked with|tell me about)\s*$/.test(q)
       || isDanglingStub(q);
@@ -252,13 +307,13 @@ function extractStrictInterviewerQuestion(raw: string): string {
     // #6: candidate self-talk penalty — these patterns are almost never interviewer questions
     const isCandidateSelfTalk = /^(i have|i worked|i built|i implemented|i used|i developed|i created|i led|i managed|in my experience|at my previous|at my last|we built|we used|we implemented|my role|my project|my team|my experience)\b/.test(q);
     // #8: cased tech term boost — post-ASR correction, cased terms signal real interview content
-    const hasCasedTechTerm = /\b(AWS|Azure|GCP|React|Python|Java|TypeScript|Docker|Kubernetes|Redis|Kafka|Flask|Django|FastAPI|GraphQL|PostgreSQL|MongoDB|Spring|Terraform|Ansible|Jenkins|Node\.?js|Angular|Vue)\b/.test(s);
+    const hasCasedTechTerm = /\b(AWS|Azure|GCP|React|Python|Java|TypeScript|Docker|Kubernetes|Redis|Kafka|Flask|Django|FastAPI|GraphQL|PostgreSQL|MongoDB|Spring|Terraform|Ansible|Jenkins|Node\.?js|Angular|Vue)\b/.test(candidate);
     // #3: standalone tech entity — 1-3 word segment with just a tech name = implicit "tell me about X"
     const isImplicitTechQuestion = words <= 3 && hasCasedTechTerm && !isCandidateSelfTalk;
 
     let score = 0;
     score += hasQMark ? 80 : 0;
-    score += startsQuestion ? 50 : 0;
+    score += hasQuestionSignal ? 60 : 0;
     score += (directWhDefinition && words >= 3 && words <= 8) ? 85 : 0;
     score += hasInterviewCue ? 35 : 0;
     score += Math.min(50, Math.floor(uniqueTokenCount / 2) * 6);
@@ -273,23 +328,23 @@ function extractStrictInterviewerQuestion(raw: string): string {
     score -= isCandidateSelfTalk ? 150 : 0; // #6: penalise candidate self-talk heavily
     // Keep short direct questions (e.g. "what is mvcc?") from getting buried.
     const isKnownFollowUpPhrase = KNOWN_FOLLOWUP_RE.test(q) || /^(elaborate|explain|show me|tell me more|go on|keep going|more detail|give an example|can you expand|can you clarify|walk me through that|break it down|expand on that|zoom in|dig deeper)\b/i.test(q);
-    if (words <= 3 && !(hasQMark || startsQuestion) && !isKnownFollowUpPhrase && !isImplicitTechQuestion) score -= 80;
+    if (words <= 3 && !(hasQMark || hasQuestionSignal) && !isKnownFollowUpPhrase && !isImplicitTechQuestion) score -= 80;
     if (words <= 2 && !hasQMark && !isKnownFollowUpPhrase && !isImplicitTechQuestion) score -= 50;
 
     if (score > bestScore) {
       bestScore = score;
-      best = s;
+      best = candidate;
     }
   }
 
   // Reject the best candidate if it's still a dangling stub — return "" so the caller
   // falls back to the last unanswered interviewer question instead.
-  if (best && isDanglingStub(best.toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim())) {
+  if (best && isDanglingStub(normalizeText(best))) {
     return "";
   }
   if (best) {
     // Expand standalone tech term to a full question so the LLM has clear intent
-    const bestNorm = best.toLowerCase().replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim();
+    const bestNorm = normalizeText(best).replace(/\?/g, "").trim();
     if (KNOWN_TECH_TERM_RE.test(bestNorm)) {
       return `Do you have experience in ${best}?`;
     }
@@ -299,19 +354,21 @@ function extractStrictInterviewerQuestion(raw: string): string {
   // Fallback 1: latest explicit question-like segment.
   for (let i = segments.length - 1; i >= 0; i--) {
     const s = segments[i].replace(/^interviewer\s*:\s*/i, "").trim();
-    if (!s || looksLikeNoiseSegment(s)) continue;
-    const q = s.toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
+    const candidate = extractSharedQuestionCandidate(s) || s;
+    if (!candidate || looksLikeNoiseSegment(candidate)) continue;
+    const q = normalizeText(candidate);
     if (isDanglingStub(q)) continue; // skip dangling stubs in fallback too
-    if (s.includes("?") || /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|tell|walk|explain)\b/.test(q)) {
-      return s;
+    if (hasSharedQuestionSignal(candidate)) {
+      return candidate;
     }
   }
 
   // Fallback 2: latest non-noise segment.
   for (let i = segments.length - 1; i >= 0; i--) {
     const s = segments[i].replace(/^interviewer\s*:\s*/i, "").trim();
-    if (!s || looksLikeNoiseSegment(s)) continue;
-    return s;
+    const candidate = extractSharedQuestionCandidate(s) || s;
+    if (!candidate || looksLikeNoiseSegment(candidate)) continue;
+    return candidate;
   }
 
   return "";
@@ -508,16 +565,13 @@ export function setupWsAnswer(httpServer: Server): void {
             : chooseBestQuestionSeed([lastUnanswered?.text, latestSpokenReply?.text, "[Continue]"]);
 
           const QUESTION_WORD_RE = /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are|tell|walk|explain)\b/i;
+          const normalizedQuestionForStream = normalizeQuestionFragment(questionForStream);
 
-          // #1b: Any short utterance / follow-up word → anchor to last active topic
-          const BARE_FOLLOWUP_RE = /^(why|how so|how come|how|elaborate|explain|tell me more|go on|continue|expand|clarify|what next|what else|more detail|give an example|interesting|okay|ok|and|so|right|sure|really|huh|wait|yeah)\??$/i;
-          const wordCount = questionForStream.trim().split(/\s+/).filter(Boolean).length;
-          // Single word always anchors (even question words like "what", "why" alone = follow-up)
-          const isSingleWord = wordCount === 1;
-          // Also treat WH-starting fragments with ≤3 words as vague (e.g. "when building", "how about")
-          const isShortVague = wordCount <= 5 && !questionForStream.includes("?") &&
-            (!QUESTION_WORD_RE.test(questionForStream.trim()) || wordCount <= 3);
-          if (BARE_FOLLOWUP_RE.test(questionForStream.trim()) || isSingleWord || isShortVague) {
+          // #1b: Only anchor genuine follow-up cues, not generic acknowledgements or every single-word fragment.
+          const shouldAnchorShortFollowup =
+            !KNOWN_TECH_TERM_RE.test(normalizedQuestionForStream)
+            && STRICT_ANCHORABLE_FOLLOWUP_RE.test(questionForStream.trim());
+          if (shouldAnchorShortFollowup) {
             const prevQ = lastQuestionBySession.get(sessionId);
             if (prevQ && prevQ !== "[Continue]") {
               questionForStream = `${questionForStream.trim()} (follow-up to: "${prevQ}")`;
@@ -525,19 +579,20 @@ export function setupWsAnswer(httpServer: Server): void {
             }
           }
 
-          // #2: Continuation stitching — "and also X" / "plus X" → stitch onto previous question
-          const CONNECTOR_PREFIX = /^(and\s+also|and|also|plus|as\s+well\s+as|what\s+about|or)\s+/i;
-          const connectorMatch = CONNECTOR_PREFIX.exec(questionForStream);
+          // #2: Continuation stitching — only append onto prior questions when the previous
+          // question is actually a topic-appendable one like experience/background/used-with.
+          const connectorMatch = CONNECTOR_PREFIX_RE.exec(questionForStream);
           if (connectorMatch) {
             const tail = questionForStream.slice(connectorMatch[0].length).trim();
             const prevQ = lastQuestionBySession.get(sessionId);
-            if (prevQ && tail.length >= 2) {
-              questionForStream = `${prevQ} and also ${tail}`;
+            if (prevQ && prevQ !== "[Continue]" && isTopicAppendableQuestion(prevQ) && isSafeTopicTail(tail)) {
+              const prevNoQ = prevQ.replace(/\?\s*$/, "").trim();
+              questionForStream = `${prevNoQ} and also ${tail}?`;
               console.log(`[ws/answer] stitched continuation sessionId=${sessionId}`, { prevQ, tail, result: questionForStream });
             }
           }
 
-          // #2b: Bare tech-topic stitching — "Flask", "Django", "AWS" (no joiner) → stitch onto previous question
+          // #2b: Bare tech-topic stitching — only for appendable topic questions, not arbitrary prior asks.
           const bareTopicOnly =
             !connectorMatch
             && !QUESTION_WORD_RE.test(questionForStream.trim())
@@ -545,7 +600,7 @@ export function setupWsAnswer(httpServer: Server): void {
             && questionForStream.trim().split(/\s+/).filter(Boolean).length <= 4;
           if (bareTopicOnly) {
             const prevQ = lastQuestionBySession.get(sessionId);
-            if (prevQ && QUESTION_WORD_RE.test(prevQ.trim())) {
+            if (prevQ && prevQ !== "[Continue]" && isTopicAppendableQuestion(prevQ) && isSafeTopicTail(questionForStream)) {
               const prevNoQ = prevQ.replace(/\?\s*$/, "").trim();
               questionForStream = `${prevNoQ} and also ${questionForStream.trim()}?`;
               console.log(`[ws/answer] stitched bare topic sessionId=${sessionId}`, { prevQ, topic: questionForStream });
@@ -564,8 +619,8 @@ export function setupWsAnswer(httpServer: Server): void {
           // #4: Be conservative with ambiguous transcript.
           // Auto-triggered vague/noisy fragments should not be force-expanded into an invented question.
           // Manual submits may still pass through literally so the user can explicitly choose to answer them.
-          const isExplicitQuestion = questionForStream.includes("?") || QUESTION_WORD_RE.test(questionForStream.trim())
-            || /^(tell|walk|explain|describe|share|give|talk|show|write|implement|build|create|design)\b/i.test(questionForStream.trim());
+          const isExplicitQuestion = hasSharedQuestionSignal(questionForStream)
+            || /^(write|implement|build|create|design)\b/i.test(questionForStream.trim());
           const isAmbiguousImplicit =
             !isExplicitQuestion
             && questionForStream !== "[Continue]"

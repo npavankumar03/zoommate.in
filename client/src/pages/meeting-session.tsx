@@ -15,8 +15,11 @@ import { LiveCodeEditor } from "@/components/live-code-editor";
 import {
   detectQuestion,
   detectQuestionAdvanced,
+  extractQuestionFromSegment,
+  likelyContainsQuestion,
   normalizeForDedup,
   normalizeQuestionForSimilarity,
+  normalizeText,
   levenshteinSimilarity,
   isSubstantiveSegment,
 } from "@shared/questionDetection";
@@ -53,6 +56,39 @@ type LatestScreenContext = {
   answer: string;
   capturedAt: number;
 };
+
+function countExplicitQuestionPrompts(raw: string): number {
+  const text = String(raw || "").trim();
+  if (!text) return 0;
+
+  if (/^interviewer asked a main question with short follow-ups/i.test(text)) {
+    const lines = text
+      .split(/\n+/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const questionIndex = lines.findIndex((line) => /^questions:\s*$/i.test(line));
+    if (questionIndex >= 0) {
+      return lines.slice(questionIndex + 1).filter(Boolean).length;
+    }
+    return 2;
+  }
+
+  const qmarkCount = (text.match(/\?/g) || []).length;
+  if (qmarkCount >= 2) return qmarkCount;
+
+  const starterMatches = text.match(/\b(?:what|why|how|when|where|who|which|do you|does|did|can you|could you|would you|have you|has|is|are|tell me|walk me|explain|give me|describe|share|suppose|assume)\b/gi) || [];
+  return starterMatches.length;
+}
+
+function extractSharedQuestionCandidate(text: string): string {
+  return extractQuestionFromSegment(String(text || "")) || "";
+}
+
+function hasSharedQuestionSignal(text: string): boolean {
+  const raw = String(text || "").trim();
+  if (!raw) return false;
+  return detectQuestion(raw) || likelyContainsQuestion(raw) || Boolean(extractSharedQuestionCandidate(raw));
+}
 
 type VideoFrameCallbackVideo = HTMLVideoElement & {
   requestVideoFrameCallback?: (callback: () => void) => number;
@@ -734,18 +770,47 @@ export default function MeetingSession() {
     return nextIsMoreComplete;
   }, [wordOverlap]);
 
+  const isShortTailFragment = useCallback((fragment: string, fullText: string): boolean => {
+    const fragNorm = normalizeForDedup(fragment);
+    const fullNorm = normalizeForDedup(fullText);
+    if (!fragNorm || !fullNorm || fragNorm === fullNorm) return false;
+
+    const fragWords = fragNorm.split(/\s+/).filter(Boolean);
+    const fullWords = fullNorm.split(/\s+/).filter(Boolean);
+    if (fragWords.length < 1 || fragWords.length > 2) return false;
+    if (fullWords.length <= fragWords.length) return false;
+
+    return fullWords.slice(-fragWords.length).join(" ") === fragWords.join(" ");
+  }, []);
+
+  const hasLongerTailOwner = useCallback((fragment: string, texts: string[]): boolean => {
+    return texts.some((text) => isShortTailFragment(fragment, text));
+  }, [isShortTailFragment]);
+
+  const evictShortTailTexts = useCallback((incoming: string, texts: string[]): string[] => {
+    return texts.filter((text) => !isShortTailFragment(text, incoming));
+  }, [isShortTailFragment]);
+
   const upsertTranscriptSegment = useCallback((text: string) => {
     const next = String(text || "").trim();
     if (!next) return;
 
-    const latest = String(segmentsRef.current[0] || "").trim();
-    // Canonical transcript is detection-oriented: keep strict dedup only.
+    if (hasLongerTailOwner(next, segmentsRef.current)) return;
+
+    const pruned = evictShortTailTexts(next, segmentsRef.current);
+    const latest = String(pruned[0] || "").trim();
+
     if (latest && wordOverlap(latest, next) > 0.92 && wordOverlap(next, latest) > 0.92) return;
 
-    segmentsRef.current = [next, ...segmentsRef.current];
+    if (latest && shouldReplaceLatestTranscriptLine(latest, next)) {
+      segmentsRef.current = [next, ...pruned.slice(1)];
+    } else {
+      segmentsRef.current = [next, ...pruned];
+    }
+
     setTranscriptSegments([...segmentsRef.current]);
-    setTranscriptSegmentKeys((prev) => [`${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, ...prev]);
-  }, [wordOverlap]);
+    setTranscriptSegmentKeys(segmentsRef.current.map(() => `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`));
+  }, [evictShortTailTexts, hasLongerTailOwner, shouldReplaceLatestTranscriptLine, wordOverlap]);
 
   const upsertDisplayTranscriptSegment = useCallback((text: string, skipDedup = false) => {
     const next = String(text || "").trim();
@@ -2868,7 +2933,12 @@ export default function MeetingSession() {
       // Do not synthesize experience questions from pure numbers (e.g., ports like 443).
       if (/^\d{2,5}$/.test(fragment)) return "";
 
-      if (detectQuestion(fragment)) {
+      const sharedCandidate = extractSharedQuestionCandidate(fragment);
+      if (sharedCandidate) {
+        return sharedCandidate.endsWith("?") ? sharedCandidate : `${sharedCandidate}?`;
+      }
+
+      if (hasSharedQuestionSignal(fragment)) {
         return fragment.endsWith("?") ? fragment : `${fragment}?`;
       }
 
@@ -2878,7 +2948,7 @@ export default function MeetingSession() {
     const stop = new Set(["and", "also", "or", "yes", "no", "ok", "okay", "hmm", "uh", "um", "the", "a", "an", "in", "on", "with", "for", "to", "of", "experience"]);
     if (words.every((w) => stop.has(w.toLowerCase()))) return "";
 
-    const v = fragment.toLowerCase().replace(/\s+/g, " ").trim();
+    const v = normalizeText(fragment);
     // Implicit question rewrites for rough STT fragments.
     if (/\bexperience in\b/i.test(v)) {
       const topic = fragment.replace(/^.*?\bexperience in\b/i, "").trim();
@@ -2936,24 +3006,25 @@ export default function MeetingSession() {
       if (topic) return `Focus specifically on ${topic} — explain that part in detail.`;
     }
 
-    const aliased = normalizeInterviewTopicLabel(fragment);
-
-      if (words.length <= 3 && isLikelyInterviewTopic(aliased)) return `Do you have experience in ${aliased}?`;
-      if (words.length <= 3) return "";
-      return `Can you explain ${aliased}?`;
+      return "";
     }, []);
 
   const buildLiveQuestionCandidateFromPartial = useCallback((rawPartial: string): string => {
     const raw = String(rawPartial || "").replace(/\s+/g, " ").trim();
     if (!raw) return "";
-    const normalized = raw.toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
+    const normalized = normalizeText(raw);
     if (!normalized) return "";
 
     const questionStart = /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are|tell|walk|explain)\b/i;
     const joinerStart = /^(and also|and|also|plus|as well as|along with|including|in addition)\b/i;
     const wordCount = normalized.split(/\s+/).filter(Boolean).length;
 
-    if (detectQuestion(raw) || (questionStart.test(normalized) && wordCount >= 2)) {
+    const sharedCandidate = extractSharedQuestionCandidate(raw);
+    if (sharedCandidate) {
+      return sharedCandidate.endsWith("?") ? sharedCandidate : `${sharedCandidate}?`;
+    }
+
+    if (hasSharedQuestionSignal(raw) || (questionStart.test(normalized) && wordCount >= 2)) {
       return raw.endsWith("?") ? raw : `${raw}?`;
     }
 
@@ -2978,7 +3049,8 @@ export default function MeetingSession() {
   const isLikelyNoiseSegment = useCallback((raw: string): boolean => {
     const text = String(raw || "").trim();
     if (!text) return true;
-    const normalized = text.toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
+    const normalized = normalizeText(text);
+    if (hasSharedQuestionSignal(text)) return false;
     const words = normalized.split(" ").filter(Boolean);
     const hasQuestionCue =
       /\?/.test(text) ||
@@ -3063,7 +3135,9 @@ export default function MeetingSession() {
         .replace(/\s+\b(and also|and|also)\b\s*$/i, "")
         .replace(/\s+/g, " ")
         .trim();
-      if (/\?/.test(p) || /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|tell|walk|explain)\b/i.test(p)) {
+      const sharedCandidate = extractSharedQuestionCandidate(p);
+      if (sharedCandidate) return sharedCandidate;
+      if (hasSharedQuestionSignal(p)) {
         return p;
       }
     }
@@ -3080,20 +3154,22 @@ export default function MeetingSession() {
     let bestScore = -1e9;
     for (const { text, idx } of items) {
       if (isLikelyNoiseSegment(text)) continue;
-      const normalized = text.toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
+      const sharedCandidate = extractSharedQuestionCandidate(text);
+      const candidate = sharedCandidate || text;
+      const normalized = normalizeText(candidate);
       const words = normalized.split(" ").filter(Boolean);
-      const hasQMark = text.includes("?");
-      const startsLikeQuestion = /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|tell|walk|explain)\b/.test(normalized);
+      const hasQMark = candidate.includes("?");
+      const sharedSignal = hasSharedQuestionSignal(candidate);
       const hasInterviewCue = /\b(experience|react|python|fastapi|fast api|fast apis|apis|flask|django|java|javascript|typescript|nodejs|angular|vue|nextjs|spring|aws|azure|gcp|kubernetes|docker|terraform|mongodb|postgres|mysql|redis|kafka|graphql|microservice|serverless|backend|frontend|fullstack|devops|agile|scrum|machine learning|deep learning|llm|openai|pandas|pytorch|tensorflow|spark|snowflake|databricks|bigquery|selenium|jest|pytest|architecture|wipro|anthem|start date|end date|month|year|worked|resume|project|role|challenge|design|deploy|build|scalability|performance|system|database|api|sql|nosql|linux|bash|ci cd|github|gitlab|jenkins|datadog|grafana|prometheus)\b/.test(normalized);
       const partialStub = /^(when did you|do you have|what was your|have you worked with|tell me about)\s*$/.test(normalized);
       const dateSpecific = /\b(start date|end date|from|to|month|year|wipro)\b/.test(normalized);
-      const questionLike = hasQMark || startsLikeQuestion || (hasInterviewCue && words.length >= 4);
+      const questionLike = sharedSignal || hasQMark || (hasInterviewCue && words.length >= 4);
       if (!questionLike) continue;
 
       let score = 0;
       score += (100 - idx * 3); // recency bias (index 0 is newest)
       score += hasQMark ? 60 : 0;
-      score += startsLikeQuestion ? 35 : 0;
+      score += sharedSignal ? 45 : 0;
       score += hasInterviewCue ? 30 : 0;
       score += dateSpecific ? 70 : 0;
       score += Math.min(words.length, 22);
@@ -3101,7 +3177,7 @@ export default function MeetingSession() {
       score -= words.length <= 2 ? 70 : 0;
       if (score > bestScore) {
         bestScore = score;
-        best = text;
+        best = candidate;
       }
     }
     return best;
@@ -3164,15 +3240,17 @@ export default function MeetingSession() {
       for (const part of parts) {
         const clean = part.replace(/^interviewer\s*:\s*/i, "").trim();
         if (!clean) continue;
-        if (isLikelyNoiseSegment(clean)) continue;
-        const normalized = clean.toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
+        const sharedCandidate = extractSharedQuestionCandidate(clean);
+        const candidate = sharedCandidate || clean;
+        if (isLikelyNoiseSegment(candidate)) continue;
+        const normalized = normalizeText(candidate);
         const words = normalized.split(" ").filter(Boolean);
         const firstPersonHeavy =
           /\b(i|my|we|our)\b/.test(normalized)
           && /\b(have|worked|built|developed|implemented|focus|focused)\b/.test(normalized);
-        const overLongMonologue = words.length > 30 && !clean.includes("?");
-        const looksQuestion = clean.includes("?") || starters.test(normalized);
-        const advanced = detectQuestionAdvanced(clean);
+        const overLongMonologue = words.length > 30 && !candidate.includes("?");
+        const looksQuestion = Boolean(sharedCandidate) || candidate.includes("?") || starters.test(normalized);
+        const advanced = detectQuestionAdvanced(candidate);
         const hasInterviewCue =
           /\b(interview|experience|react|python|fastapi|fast api|fast apis|apis|flask|django|java|javascript|typescript|nodejs|angular|vue|nextjs|spring|aws|azure|gcp|kubernetes|docker|terraform|mongodb|postgres|mysql|redis|kafka|graphql|microservice|serverless|backend|frontend|fullstack|devops|agile|scrum|machine learning|deep learning|llm|openai|pandas|pytorch|tensorflow|spark|snowflake|databricks|bigquery|selenium|jest|pytest|architecture|api|sql|nosql|linux|bash|ci cd|github|gitlab|jenkins|datadog|grafana|prometheus|wipro|anthem|resume|project|role|challenge|design|deploy|build|scalability|performance|system|database|start date|end date|month|year|worked)\b/i.test(normalized);
         const partialStub = /^(when did you|do you have|what was your|have you worked with|tell me about|experience in)\s*$/i.test(normalized);
@@ -3181,12 +3259,12 @@ export default function MeetingSession() {
         const highQuality =
           looksQuestion &&
           words.length >= 1 &&
-          (advanced.confidence >= 0.5 || hasInterviewCue || /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are)\b/i.test(normalized));
+          (advanced.confidence >= 0.5 || advanced.isQuestion || hasInterviewCue || Boolean(sharedCandidate) || /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are)\b/i.test(normalized));
         if (!highQuality || partialStub || repeatedWordNoise || fillerOnly || firstPersonHeavy || overLongMonologue) continue;
-        const key = normalizeForDedup(clean);
+        const key = normalizeForDedup(candidate);
         if (!key || seen.has(key)) continue;
         seen.add(key);
-        out.push(clean);
+        out.push(candidate);
       }
     }
 
@@ -4702,9 +4780,10 @@ export default function MeetingSession() {
       }
     } else {
       flushPendingTranscriptLine();
-      pendingTranscriptLineRef.current = segmentForDisplay;
-      pendingTranscriptTsRef.current = Date.now();
-      setPendingTranscriptLine(segmentForDisplay);
+      const suppressPendingStray = hasLongerTailOwner(segmentForDisplay, segmentsRef.current);
+      pendingTranscriptLineRef.current = suppressPendingStray ? "" : segmentForDisplay;
+      pendingTranscriptTsRef.current = suppressPendingStray ? 0 : Date.now();
+      setPendingTranscriptLine(suppressPendingStray ? "" : segmentForDisplay);
       upsertDisplayTranscriptSegment(segmentForDisplay);
     }
     schedulePendingTranscriptFlush();
@@ -4801,10 +4880,17 @@ export default function MeetingSession() {
     if (finalIsQuestion || isSubstantiveStatement) {
       pendingContinuationTopicsRef.current = [];
       rememberBoundaryQuestionCandidate(trimmedForDetect, Date.now());
-      interviewerQuestionMemoryRef.current = [
-        { text: trimmedForDetect, answered: false, ts: Date.now() },
-        ...interviewerQuestionMemoryRef.current,
-      ].slice(0, 30);
+      const existingQuestionTexts = interviewerQuestionMemoryRef.current.map((q) => q.text);
+      if (!hasLongerTailOwner(trimmedForDetect, existingQuestionTexts)) {
+        const prunedQuestionMemory = evictShortTailTexts(trimmedForDetect, existingQuestionTexts);
+        const prunedExistingEntries = interviewerQuestionMemoryRef.current.filter((q) =>
+          prunedQuestionMemory.some((text) => normalizeForDedup(text) === normalizeForDedup(q.text)),
+        );
+        interviewerQuestionMemoryRef.current = [
+          { text: trimmedForDetect, answered: false, ts: Date.now() },
+          ...prunedExistingEntries.filter((q) => normalizeForDedup(q.text) !== normalizeForDedup(trimmedForDetect)),
+        ].slice(0, 30);
+      }
       // Invalidate stale interpreted question when a newer transcript question arrives.
       const currentInterpreted = interpretedQuestionRef.current?.trim() || "";
       if (!currentInterpreted || levenshteinSimilarity(
@@ -4903,6 +4989,7 @@ export default function MeetingSession() {
         const text = collectedQs.length > 1
           ? collectedQs.slice().reverse().join(" ")
           : capturedTrimmed;
+        const multiQuestionMode = collectedQs.length > 1 || countExplicitQuestionPrompts(text) >= 2;
 
         interviewStateRef.current = "answering";
         rememberAutoTriggerFingerprint(finalFingerprint!, Date.now());
@@ -4927,6 +5014,7 @@ export default function MeetingSession() {
               mode: "final",
               audioMode: capturedAudioMode,
               submitSource: "transcript",
+              multiQuestionMode,
               customFormatPrompt: capturedFormat === "custom" ? capturedCustomPrompt : undefined,
               docsMode: capturedDocsMode,
               systemPrompt: capturedCustomPrompt || undefined,
@@ -5001,6 +5089,8 @@ export default function MeetingSession() {
     safetyGuardEnabled,
     showOptimisticAssistantState,
     startFirstChunkWatchdog,
+    hasLongerTailOwner,
+    evictShortTailTexts,
   ]);
 
   const setupAudioAnalyser = useCallback((stream: MediaStream) => {
@@ -5860,6 +5950,7 @@ export default function MeetingSession() {
     const now = Date.now();
     triggerMetricRef.current = { t_trigger_decision: now };
     const submitSource: SubmitSeedSource = mode === "enter" ? "interpreted" : "transcript";
+    const multiQuestionMode = countExplicitQuestionPrompts(cleanedOverride) >= 2;
     setLastSubmitSource(submitSource);
     setInterpretedQuestion(cleanedOverride);
     setStreamingQuestion(cleanedOverride);
@@ -5889,6 +5980,7 @@ export default function MeetingSession() {
         mode,
         audioMode,
         submitSource,
+        multiQuestionMode,
         customFormatPrompt: responseFormat === "custom" ? customPrompt : undefined,
         docsMode,
         systemPrompt: customPrompt || undefined,
@@ -6239,19 +6331,23 @@ export default function MeetingSession() {
           .split(/(?=\b(?:what|why|how|when|where|who|which|do you|does|did|can you|could you|would you|have you|has|is|are|tell me|walk me|explain|give me|describe|share|suppose|assume)\b)/gi)
           .map((p) => p.trim())
           .filter(Boolean);
-      return chunks.filter((chunk) => {
-        const normalized = chunk.toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
+      return chunks
+        .map((chunk) => extractSharedQuestionCandidate(chunk) || chunk)
+        .filter((chunk) => {
+        const normalized = normalizeText(chunk);
         const words = normalized.split(/\s+/).filter(Boolean);
         if (words.length < 2 || words.length > 22) return false;
-        if (!QUESTION_START_RE.test(normalized) && !chunk.includes("?")) return false;
+        if (!extractSharedQuestionCandidate(chunk) && !QUESTION_START_RE.test(normalized) && !chunk.includes("?")) return false;
         return true;
       });
     };
     const isExplicitQuestion = (value: string): boolean => {
       const s = String(value || "").trim();
       if (!s) return false;
-      const q = s.toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
-      return s.includes("?") || QUESTION_START_RE.test(q);
+      const sharedCandidate = extractSharedQuestionCandidate(s);
+      if (sharedCandidate) return true;
+      const q = normalizeText(s);
+      return detectQuestion(s) || s.includes("?") || QUESTION_START_RE.test(q);
     };
 
     // Collect ALL unanswered interviewer questions since the last AI answer.
@@ -6971,6 +7067,7 @@ export default function MeetingSession() {
       const hasExperienceStub = windowSegs.some((s) =>
         /\b(do you have experience in|do i have experience in|have experience in|experience in)\b/i.test(s),
       );
+      if (!hasExperienceStub) return "";
       const topics: string[] = [];
       for (const raw of windowSegs) {
         if (!raw) continue;
@@ -6994,7 +7091,7 @@ export default function MeetingSession() {
       if (topics.length >= 2) {
         return `Do you have experience with ${topics.slice(0, 3).join(" and ")}?`;
       }
-      if (topics.length === 1 && hasExperienceStub) {
+      if (topics.length === 1) {
         return `Do you have experience with ${topics[0]}?`;
       }
       return "";
@@ -7049,14 +7146,17 @@ export default function MeetingSession() {
         for (const raw of recentSegments.slice(0, 8)) {
           const line = String(raw || "").trim();
           if (!line || isLikelyNoiseSegment(line)) continue;
+          const sharedCandidate = extractSharedQuestionCandidate(line);
+          if (sharedCandidate) return sharedCandidate.endsWith("?") ? sharedCandidate : `${sharedCandidate}?`;
           const chunks = line.includes("?")
             ? line.split("?").map((p) => p.trim()).filter(Boolean).map((p) => `${p}?`)
             : line.split(starterSplit).map((p) => p.trim()).filter(Boolean);
           for (const chunk of chunks.reverse()) {
-            const normalized = chunk.toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
+            const normalized = normalizeText(chunk);
             const words = normalized.split(/\s+/).filter(Boolean);
             const explicit =
-              chunk.includes("?")
+              Boolean(extractSharedQuestionCandidate(chunk))
+              || chunk.includes("?")
               || /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are|tell|walk|explain)\b/i.test(normalized);
             if (!explicit) continue;
             if (words.length < 2 || words.length > 22) continue;
@@ -7171,27 +7271,6 @@ export default function MeetingSession() {
       const inferredFromShort = inferQuestionFromShortFragments();
       if (inferredFromShort) return inferredFromShort;
 
-      const inferredSemantic = inferSemanticQuestionFromConversation();
-      if (inferredSemantic) return inferredSemantic;
-
-      const joined = window
-        .filter((s) => !isLikelyNoiseSegment(s))
-        .join(" ")
-        .replace(/\s+/g, " ")
-        .trim();
-      if (!joined) return "";
-
-      const topicPatterns: Array<{ re: RegExp; label: string }> = [
-        { re: /\breact\b/i, label: "React" },
-        { re: /\bflask\b/i, label: "Flask" },
-        { re: /\bfastapi|fast api|fast apis\b/i, label: "FastAPI" },
-        { re: /\bdjango\b/i, label: "Django" },
-        { re: /\bpython\b/i, label: "Python" },
-        { re: /\bdatabase|databases|sql|postgres|mysql|mongodb|oracle\b/i, label: "databases" },
-        { re: /\bkubernetes|docker|aws|azure|terraform|ansible\b/i, label: "cloud and DevOps" },
-      ];
-      const topic = topicPatterns.find((t) => t.re.test(joined))?.label || "";
-      if (topic) return `Can you share your hands-on experience with ${topic}?`;
       return "";
     };
 
