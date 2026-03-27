@@ -6254,9 +6254,15 @@ export default function MeetingSession() {
       const latestRawExplicit = splitExplicitQuestions(latestSanitized || latestRawLine)
         .map((q) => rewriteMixedTopicQuestion(cleanDetectedInterviewQuestion(q)))
         .filter(Boolean);
-      if (latestRawExplicit.length >= 1) {
-        const latestOnly = latestRawExplicit[latestRawExplicit.length - 1];
-        return { seedText: latestOnly, displayQuestion: latestOnly, source: "transcript" };
+      if (latestRawExplicit.length === 1) {
+        return { seedText: latestRawExplicit[0], displayQuestion: latestRawExplicit[0], source: "transcript" };
+      }
+      if (latestRawExplicit.length > 1) {
+        // Send all questions joined — server's extractInterviewerQuestions splits on "?" and
+        // builds a multiQuestionBlock so the AI answers every question, not just the last one.
+        const seedText = latestRawExplicit.join(" ");
+        const displayQuestion = latestRawExplicit.join(" / ");
+        return { seedText, displayQuestion, source: "transcript" };
       }
 
       if (!latestLooksExplicit) {
@@ -6382,9 +6388,13 @@ export default function MeetingSession() {
     // 2) if no explicit question in latest turn window, fall back to follow-up context
     // 3) only then use broader ranking/older fallback logic
     const latestLineExplicitQuestions = splitExplicitQuestions(latestUtterance);
-    if (latestLineExplicitQuestions.length >= 1) {
-      const latestOnly = latestLineExplicitQuestions[latestLineExplicitQuestions.length - 1];
-      return { seedText: latestOnly, displayQuestion: latestOnly, source: "transcript" };
+    if (latestLineExplicitQuestions.length === 1) {
+      return { seedText: latestLineExplicitQuestions[0], displayQuestion: latestLineExplicitQuestions[0], source: "transcript" };
+    }
+    if (latestLineExplicitQuestions.length > 1) {
+      const seedText = latestLineExplicitQuestions.join(" ");
+      const displayQuestion = latestLineExplicitQuestions.join(" / ");
+      return { seedText, displayQuestion, source: "transcript" };
     }
     // If latest line is a short topic fragment (single word or short tail),
     // attach it to the previous explicit question chain.
