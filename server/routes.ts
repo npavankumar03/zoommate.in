@@ -2834,12 +2834,21 @@ Return ONLY valid JSON. No explanation, no markdown, no code fences. Just the JS
         threshold,
       );
 
+      const shouldRecordQuestion = result.isQuestion && result.confidence >= threshold;
+      if (shouldRecordQuestion) {
+        recordInterviewerQuestion(
+          req.params.id,
+          String(result.cleanQuestion || result.questionSpan || text).trim(),
+        );
+      }
+
       res.json({
         is_question: result.isQuestion,
         confidence: result.confidence,
         question_span: result.questionSpan,
         clean_question: result.cleanQuestion,
         type: result.type,
+        recorded: shouldRecordQuestion,
       });
     } catch (error: any) {
       res.status(500).json({ message: error.message });

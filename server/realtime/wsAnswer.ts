@@ -3,7 +3,7 @@ import type { Server, IncomingMessage } from "http";
 import { URL } from "url";
 import { storage } from "../storage";
 import { streamAssistantAnswer, abortSessionStream, hasActiveStream } from "../assist/streamAssistantAnswer";
-import { getLastUnansweredInterviewerQuestion, getLatestSpokenReply, recordUserQuestion, getCodingProblemState, buildInterviewerIntelligenceBlock } from "../assist/sessionState";
+import { getLastUnansweredInterviewerQuestion, getLatestSpokenReply, getRecentQuestionHistory, markInterviewerQuestionAnswered, recordUserQuestion, getCodingProblemState, buildInterviewerIntelligenceBlock } from "../assist/sessionState";
 import {
   detectQuestion,
   extractQuestionFromSegment,
@@ -383,6 +383,29 @@ function safeSend(ws: WebSocket, payload: unknown) {
   }
 }
 
+function getUnansweredBackendQuestions(sessionId: string, maxItems = 3, maxAgeMs = 90_000): string[] {
+  const now = Date.now();
+  const seen = new Set<string>();
+  return getRecentQuestionHistory(sessionId, 12)
+    .filter((item) => !item.answered && (now - item.ts) <= maxAgeMs)
+    .slice()
+    .reverse()
+    .map((item) => String(item.text || "").trim())
+    .filter(Boolean)
+    .filter((question) => {
+      const norm = normalizeQuestionForSimilarity(question);
+      if (!norm || seen.has(norm)) return false;
+      seen.add(norm);
+      return true;
+    })
+    .slice(0, maxItems);
+}
+
+function buildQueuedQuestionPrompt(questions: string[]): string {
+  if (questions.length <= 1) return questions[0] || "";
+  return `Answer these interviewer questions separately in order:\n${questions.map((question, index) => `${index + 1}. ${question}`).join("\n")}`;
+}
+
 async function resolveUserId(req: IncomingMessage): Promise<string> {
   try {
     const cookieHeader = req.headers.cookie || "";
@@ -554,6 +577,10 @@ export function setupWsAnswer(httpServer: Server): void {
           const metadata = (msg?.metadata && typeof msg.metadata === "object") ? msg.metadata : {};
           const submitSource = typeof metadata.submitSource === "string" ? metadata.submitSource : "unknown";
           const multiQuestionMode = metadata.multiQuestionMode === true;
+          const requestMode = typeof metadata.mode === "string" ? metadata.mode : "enter";
+          const queuedBackendQuestions = requestMode === "enter" && submitSource !== "interpreted"
+            ? getUnansweredBackendQuestions(sessionId, 3)
+            : [];
           const lastUnanswered = getLastUnansweredInterviewerQuestion(sessionId);
           const latestSpokenReply = getLatestSpokenReply(sessionId);
           const primarySeed =
@@ -563,12 +590,18 @@ export function setupWsAnswer(httpServer: Server): void {
           let questionForStream = primarySeed
             ? primarySeed
             : chooseBestQuestionSeed([lastUnanswered?.text, latestSpokenReply?.text, "[Continue]"]);
+          const backendAnsweredQuestions = queuedBackendQuestions.slice();
+
+          if (queuedBackendQuestions.length > 0) {
+            questionForStream = buildQueuedQuestionPrompt(queuedBackendQuestions);
+          }
 
           const QUESTION_WORD_RE = /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are|tell|walk|explain)\b/i;
           const normalizedQuestionForStream = normalizeQuestionFragment(questionForStream);
 
           // #1b: Only anchor genuine follow-up cues, not generic acknowledgements or every single-word fragment.
           const shouldAnchorShortFollowup =
+            queuedBackendQuestions.length === 0 &&
             !KNOWN_TECH_TERM_RE.test(normalizedQuestionForStream)
             && STRICT_ANCHORABLE_FOLLOWUP_RE.test(questionForStream.trim());
           if (shouldAnchorShortFollowup) {
@@ -582,7 +615,7 @@ export function setupWsAnswer(httpServer: Server): void {
           // #2: Continuation stitching — only append onto prior questions when the previous
           // question is actually a topic-appendable one like experience/background/used-with.
           const connectorMatch = CONNECTOR_PREFIX_RE.exec(questionForStream);
-          if (connectorMatch) {
+          if (connectorMatch && queuedBackendQuestions.length === 0) {
             const tail = questionForStream.slice(connectorMatch[0].length).trim();
             const prevQ = lastQuestionBySession.get(sessionId);
             if (prevQ && prevQ !== "[Continue]" && isTopicAppendableQuestion(prevQ) && isSafeTopicTail(tail)) {
@@ -598,7 +631,7 @@ export function setupWsAnswer(httpServer: Server): void {
             && !QUESTION_WORD_RE.test(questionForStream.trim())
             && !questionForStream.includes("?")
             && questionForStream.trim().split(/\s+/).filter(Boolean).length <= 4;
-          if (bareTopicOnly) {
+          if (bareTopicOnly && queuedBackendQuestions.length === 0) {
             const prevQ = lastQuestionBySession.get(sessionId);
             if (prevQ && prevQ !== "[Continue]" && isTopicAppendableQuestion(prevQ) && isSafeTopicTail(questionForStream)) {
               const prevNoQ = prevQ.replace(/\?\s*$/, "").trim();
@@ -628,13 +661,14 @@ export function setupWsAnswer(httpServer: Server): void {
             && !questionForStream.startsWith("[Continue")
             && questionForStream.trim().length > 0
             && (isVagueQuestion(questionForStream) || looksLikeInterviewNoise(questionForStream));
-          if (isAmbiguousImplicit && !force) {
+          if (queuedBackendQuestions.length === 0 && isAmbiguousImplicit && !force) {
             console.log(`[ws/answer] suppressed_ambiguous_auto sessionId=${sessionId}`, {
               raw: questionForStream,
             });
             return;
           }
-          if (!isExplicitQuestion
+          if (queuedBackendQuestions.length === 0
+            && !isExplicitQuestion
             && !isAmbiguousImplicit
             && questionForStream !== "[Continue]"
             && !questionForStream.startsWith("Continue answering:")
@@ -806,6 +840,13 @@ export function setupWsAnswer(httpServer: Server): void {
             }
             if (event.type === "error") {
               safeSend(ws, { type: "error", sessionId, requestId: event.requestId, message: event.message || "stream failed" });
+            }
+          }
+
+          if (!fastCancelled && emittedChunkCount > 0 && backendAnsweredQuestions.length > 0) {
+            const answeredAt = Date.now();
+            for (const backendQuestion of backendAnsweredQuestions) {
+              markInterviewerQuestionAnswered(sessionId, backendQuestion, answeredAt);
             }
           }
 

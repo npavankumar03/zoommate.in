@@ -56,6 +56,12 @@ type LatestScreenContext = {
   answer: string;
   capturedAt: number;
 };
+type TranscriptQuestionDetection = {
+  rawText: string;
+  cleanQuestion: string;
+  confidence: number;
+  ts: number;
+};
 
 function countExplicitQuestionPrompts(raw: string): number {
   const text = String(raw || "").trim();
@@ -340,6 +346,7 @@ export default function MeetingSession() {
   const [, setTranscriptSegmentKeys] = useState<string[]>([]);
   const [displayTranscriptSegments, setDisplayTranscriptSegments] = useState<string[]>([]);
   const [displayTranscriptSegmentKeys, setDisplayTranscriptSegmentKeys] = useState<string[]>([]);
+  const [transcriptQuestionDetections, setTranscriptQuestionDetections] = useState<Record<string, TranscriptQuestionDetection>>({});
   const [interimText, setInterimText] = useState("");
   const [stagedTranscriptText, setStagedTranscriptText] = useState("");
   const [manualTypeText, setManualTypeText] = useState("");
@@ -879,6 +886,70 @@ export default function MeetingSession() {
   const replaceLatestDisplayTranscriptSegment = useCallback((text: string) => {
     upsertDisplayTranscriptSegment(text);
   }, [upsertDisplayTranscriptSegment]);
+
+  const rememberRealtimeInterviewerQuestion = useCallback((question: string) => {
+    const clean = String(question || "").trim();
+    const norm = normalizeForDedup(clean);
+    if (!clean || !norm) return;
+    const now = Date.now();
+    const existing = interviewerQuestionMemoryRef.current.find((item) => normalizeForDedup(item.text) === norm);
+    if (existing) {
+      existing.ts = now;
+      existing.answered = false;
+      if (!existing.text || existing.text.length < clean.length) {
+        existing.text = clean;
+      }
+    } else {
+      interviewerQuestionMemoryRef.current = [
+        { text: clean, answered: false, ts: now },
+        ...interviewerQuestionMemoryRef.current.filter((item) => normalizeForDedup(item.text) !== norm),
+      ].slice(0, 30);
+    }
+    setRecentQuestions((prev) => {
+      const next = [clean, ...prev.filter((item) => normalizeForDedup(item) !== norm)];
+      return next.slice(0, 10);
+    });
+  }, []);
+
+  const rememberTranscriptQuestionDetection = useCallback((rawText: string, cleanQuestion: string, confidence: number) => {
+    const raw = String(rawText || "").trim();
+    const clean = String(cleanQuestion || "").trim();
+    const norm = normalizeForDedup(raw);
+    if (!raw || !clean || !norm) return;
+    setTranscriptQuestionDetections((prev) => ({
+      ...prev,
+      [norm]: {
+        rawText: raw,
+        cleanQuestion: clean,
+        confidence,
+        ts: Date.now(),
+      },
+    }));
+    rememberRealtimeInterviewerQuestion(clean);
+  }, [rememberRealtimeInterviewerQuestion]);
+
+  const detectTranscriptQuestionRealtime = useCallback(async (text: string) => {
+    const clean = String(text || "").trim();
+    if (!id || !clean) return;
+    try {
+      const res = await fetch(`/api/meetings/${id}/detect-turn`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          text: clean,
+          audioMode,
+        }),
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data?.is_question && typeof data?.clean_question === "string" && data.clean_question.trim()) {
+        rememberTranscriptQuestionDetection(clean, data.clean_question, Number(data.confidence || 0));
+      }
+    } catch (error) {
+      console.warn("[meeting] realtime detect-turn failed", error);
+    }
+  }, [audioMode, id, rememberTranscriptQuestionDetection]);
 
   const rememberAskedFingerprint = useCallback((fingerprint: string) => {
     if (!fingerprint) return;
@@ -5059,6 +5130,9 @@ export default function MeetingSession() {
       const turn = { text: trimmed, startMs, endMs, speaker };
       transcriptPersistQueueRef.current.push(turn);
       scheduleTranscriptPersistFlush(socketConnected ? 4000 : 250);
+      if (speaker === "interviewer" || speaker === "unknown") {
+        void detectTranscriptQuestionRealtime(trimmed);
+      }
     } catch (e) {
       console.error("[meeting] turn finalize/detect failed", e);
     }
@@ -5101,6 +5175,7 @@ export default function MeetingSession() {
     startFirstChunkWatchdog,
     hasLongerTailOwner,
     evictShortTailTexts,
+    detectTranscriptQuestionRealtime,
   ]);
 
   const setupAudioAnalyser = useCallback((stream: MediaStream) => {
@@ -5809,6 +5884,7 @@ export default function MeetingSession() {
     setTranscriptSegmentKeys([]);
     setDisplayTranscriptSegments([]);
     setDisplayTranscriptSegmentKeys([]);
+    setTranscriptQuestionDetections({});
     setInterimText("");
     interimTextRef.current = "";
     setStagedTranscriptText("");
@@ -9169,31 +9245,33 @@ export default function MeetingSession() {
                           ? [liveText, ...displayTranscriptSegments.filter((seg) => normalizeForDedup(seg) !== normalizeForDedup(liveText))]
                           : displayTranscriptSegments).slice(0, 15);
                         return rows.map((seg, i) => {
-                          const adv = detectQuestionAdvanced(seg);
-                          const isQ = detectQuestion(seg) || (adv.isQuestion && adv.confidence >= 0.5);
+                          const normalizedSeg = normalizeForDedup(seg);
+                          const detection = normalizedSeg ? transcriptQuestionDetections[normalizedSeg] : undefined;
+                          const isQ = !!detection;
+                          const showCleanQuestion = !!detection
+                            && normalizedSeg !== normalizeForDedup(detection.cleanQuestion);
                           return (
-                            <motion.div
+                            <div
                               key={i === 0 && liveText ? "live-current" : (displayTranscriptSegmentKeys[liveText ? i - 1 : i] || `${seg}-${i}`)}
-                              initial={{ opacity: 0, x: -8 }}
-                              animate={{ opacity: 1, x: 0 }}
-                              transition={{ duration: 0.15 }}
-                              className={`text-sm leading-relaxed rounded px-2 py-1 ${isQ ? "text-foreground font-medium bg-primary/8 border-l-2 border-primary" : "text-foreground/80"}`}
+                              className={`rounded border px-2 py-1.5 ${isQ ? "border-primary/30 bg-primary/5" : "border-transparent text-foreground/80"}`}
                               data-testid={i === 0 && liveText ? "text-segment-live" : `text-segment-${i}`}
                             >
-                              {isQ && <MessageSquare className="w-3 h-3 text-primary inline mr-1.5 align-text-bottom" />}
-                              {seg}
-                            </motion.div>
+                              <p className="text-sm leading-relaxed text-foreground">{seg}</p>
+                              {showCleanQuestion && (
+                                <div className="mt-1 flex items-start gap-1.5 text-[11px] text-primary">
+                                  <MessageSquare className="mt-0.5 h-3 w-3 shrink-0" />
+                                  <span>Question: {detection.cleanQuestion}</span>
+                                </div>
+                              )}
+                            </div>
                           );
                         });
                       })()}
                     </div>
                   ) : (
                     <div className="flex flex-col items-center justify-center h-full text-center py-8">
-                      <div className="relative mb-3">
+                      <div className="mb-3">
                         <Mic className="w-6 h-6 text-muted-foreground/20" />
-                        <div className="absolute inset-0 flex items-center justify-center">
-                          <div className="w-8 h-8 rounded-full border border-primary/20 animate-ping" />
-                        </div>
                       </div>
                       <p className="text-xs text-muted-foreground">
                         {audioMode === "system"
