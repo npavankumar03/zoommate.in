@@ -674,7 +674,7 @@ function buildCodeTransitionPolicy(
         "- Start by referencing the prior answer in 1 sentence (e.g., \"On the caching point I mentioned...\").",
         "- Then expand naturally based on the user's requested format and style.",
         "- End with one concrete example or next step if technical.",
-        "- If the follow-up is ambiguous, infer the most likely intent from recent context and answer directly — never ask for clarification.",
+        "- If the follow-up is ambiguous, prefer the narrowest literal reading from recent context. Do not invent a new technology, scenario, or experience claim.",
       ].join("\n");
   }
 }

@@ -4002,6 +4002,16 @@ export default function MeetingSession() {
     // "Tell me about yourself" in interim instead of just "yourself".
     const tailPrefix = pendingQuestionTailRef.current.join(" ").replace(/\?\s*$/, "").trim();
     const displayDraft = tailPrefix ? `${tailPrefix} ${fastDraft}`.replace(/\s+/g, " ").trim() : fastDraft;
+    const liveCandidate = buildLiveQuestionCandidateFromPartial(fastDraft);
+    const partialLooksLikeNoise =
+      isLikelyNoiseSegment(displayDraft)
+      && !hasSharedQuestionSignal(displayDraft)
+      && !liveCandidate;
+    if (partialLooksLikeNoise) {
+      latestPartialQuestionCandidateRef.current = "";
+      latestPartialQuestionCandidateTsRef.current = 0;
+      return;
+    }
     setInterimText(displayDraft);
     interimTextRef.current = displayDraft;
     setStagedTranscriptText(displayDraft);
@@ -4014,7 +4024,6 @@ export default function MeetingSession() {
     // Keep light memory updates; heavy detection/merge runs on final text path.
     rememberContinuationTopics(rawLive, now);
     rememberInterimKeywords(fastDraft, now);
-    const liveCandidate = buildLiveQuestionCandidateFromPartial(fastDraft);
     if (liveCandidate) {
       latestPartialQuestionCandidateRef.current = liveCandidate;
       latestPartialQuestionCandidateTsRef.current = now;
@@ -4039,6 +4048,7 @@ export default function MeetingSession() {
     id,
     audioMode,
     isStreaming,
+    isLikelyNoiseSegment,
     upsertDisplayTranscriptSegment,
     isShortTailFragment,
   ]);
@@ -4802,6 +4812,14 @@ export default function MeetingSession() {
     ) {
       // Dropped finals do NOT clear interimText ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â interimHasUnsavedContentRef stays true
       // so the visible partial text stays on screen until the next real final commits it.
+      setInterimText("");
+      interimTextRef.current = "";
+      setStagedTranscriptText("");
+      interimHasUnsavedContentRef.current = false;
+      questionDraftRef.current = "";
+      lastDraftTextRef.current = "";
+      latestPartialQuestionCandidateRef.current = "";
+      latestPartialQuestionCandidateTsRef.current = 0;
       return;
     }
 
@@ -4833,7 +4851,7 @@ export default function MeetingSession() {
 
     // When stitching combined the fragment into a full question, use the stitched text for display
     // so that pendingTranscriptLineRef gets the full combined question, not just the raw fragment.
-    const segmentForDisplay = String(rawFinal || trimmed || "").replace(/\s+/g, " ").trim();
+    const segmentForDisplay = String(trimmed || rawFinal || "").replace(/\s+/g, " ").trim();
     upsertTranscriptSegment(trimmed);
     // Don't merge two independent questions into one line.
     // Allow grouping only when the pending text is a fragment (not yet a complete question)

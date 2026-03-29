@@ -2825,7 +2825,7 @@ Return ONLY valid JSON. No explanation, no markdown, no code fences. Just the JS
       const recentTurns = await storage.getRecentTranscriptTurns(req.params.id, 4);
       const recentContext = recentTurns.reverse().map((t) => t.text).join("\n");
       const memoryContext = await formatMemorySlotsForPrompt(req.userId, req.params.id);
-      const threshold = audioMode === "mic" ? 0.8 : 0.65;
+      const threshold = audioMode === "mic" ? 0.8 : 0.75;
 
       const result = await runDetectionPipeline(
         text,

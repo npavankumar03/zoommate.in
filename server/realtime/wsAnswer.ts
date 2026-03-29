@@ -472,10 +472,13 @@ async function resolveEnterWindowQuestion(
     }
   }
 
-  const fallbackQuestion =
-    state.lastPrompt
-    || fallbackText.trim()
-    || "";
+  const fallbackQuestion = hasPendingTranscript
+    ? ""
+    : (
+      state.lastPrompt
+      || fallbackText.trim()
+      || ""
+    );
 
   if (fallbackQuestion) {
     return {
