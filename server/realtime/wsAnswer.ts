@@ -430,66 +430,91 @@ async function resolveEnterWindowQuestion(
   const fallbackTranscript = String(liveTranscript || "").trim();
   const windowSource = snapshotText || fallbackTranscript;
   const currentWindowHash = buildQuestionWindowHash(windowSource);
+  const explicitFallback = String(fallbackText || "").trim();
   const previousQuestion =
     activeQuestion?.clean
     || lastGenerated.question
     || state.lastPrompt
-    || fallbackText.trim();
+    || explicitFallback;
+
+  const buildResolutionFromFrame = (
+    framedWindow: ReturnType<typeof resolveActiveQuestionWindow>,
+    windowHash: string,
+  ): EnterWindowResolution => {
+    const activeSupersedesWindow = Boolean(
+      activeQuestion?.clean
+      && framedWindow.cleanQuestion
+      && questionSupersedes(activeQuestion.clean, framedWindow.cleanQuestion),
+    );
+    const answeredQuestions = activeSupersedesWindow
+      ? [String(activeQuestion?.clean || "").trim()].filter(Boolean)
+      : framedWindow.questions.map((item) => item.text).filter(Boolean);
+    const questionNorms = activeSupersedesWindow
+      ? [String(activeQuestion?.norm || "").trim()].filter(Boolean)
+      : framedWindow.questions.map((item) => item.norm).filter(Boolean);
+    const displayQuestion = answeredQuestions.length > 1
+      ? answeredQuestions.map((question, index) => `${index + 1}. ${question}`).join("\n")
+      : (answeredQuestions[0] || framedWindow.cleanQuestion);
+    const prompt = answeredQuestions.length > 1
+      ? buildQueuedQuestionPrompt(answeredQuestions)
+      : (answeredQuestions[0] || framedWindow.cleanQuestion);
+    const answeredWindowHash = activeSupersedesWindow
+      ? (activeQuestion?.windowHash || windowHash)
+      : (framedWindow.windowHash || windowHash);
+    const repeatedWindow = Boolean(
+      answeredWindowHash
+      && lastGenerated.windowHash
+      && answeredWindowHash === lastGenerated.windowHash,
+    );
+    if (repeatedWindow && state.lastAnswerAt && (now - state.lastAnswerAt) < GENERATE_COOLDOWN_MS) {
+      return {
+        prompt: "",
+        displayQuestion: "",
+        answeredQuestions: [],
+        questionNorms: [],
+        advanceCursorOnSuccess: false,
+        windowHash: answeredWindowHash,
+        reusedPreviousQuestion: false,
+        reason: "cooldown",
+      };
+    }
+    if (repeatedWindow && lastGenerated.repeatCount >= 1) {
+      return {
+        prompt: "",
+        displayQuestion: "",
+        answeredQuestions: [],
+        questionNorms: [],
+        advanceCursorOnSuccess: false,
+        windowHash: answeredWindowHash,
+        reusedPreviousQuestion: false,
+        reason: "nothing_new",
+      };
+    }
+    return {
+      prompt,
+      displayQuestion,
+      answeredQuestions,
+      questionNorms,
+      advanceCursorOnSuccess: true,
+      windowHash: answeredWindowHash,
+      reusedPreviousQuestion: false,
+    };
+  };
 
   if (windowSource) {
     const framedWindow = resolveActiveQuestionWindow(windowSource, { previousQuestion });
     if (framedWindow.answerability === "complete" && framedWindow.questions.length > 0) {
-      const activeSupersedesWindow = Boolean(
-        activeQuestion?.clean
-        && framedWindow.cleanQuestion
-        && questionSupersedes(activeQuestion.clean, framedWindow.cleanQuestion),
-      );
-      const answeredQuestions = activeSupersedesWindow
-        ? [String(activeQuestion?.clean || "").trim()].filter(Boolean)
-        : framedWindow.questions.map((item) => item.text).filter(Boolean);
-      const questionNorms = activeSupersedesWindow
-        ? [String(activeQuestion?.norm || "").trim()].filter(Boolean)
-        : framedWindow.questions.map((item) => item.norm).filter(Boolean);
-      const displayQuestion = answeredQuestions.length > 1
-        ? answeredQuestions.map((question, index) => `${index + 1}. ${question}`).join("\n")
-        : (answeredQuestions[0] || framedWindow.cleanQuestion);
-      const prompt = answeredQuestions.length > 1
-        ? buildQueuedQuestionPrompt(answeredQuestions)
-        : (answeredQuestions[0] || framedWindow.cleanQuestion);
-      const repeatedWindow = Boolean(currentWindowHash && lastGenerated.windowHash && currentWindowHash === lastGenerated.windowHash);
-      if (repeatedWindow && state.lastAnswerAt && (now - state.lastAnswerAt) < GENERATE_COOLDOWN_MS) {
-        return {
-          prompt: "",
-          displayQuestion: "",
-          answeredQuestions: [],
-          questionNorms: [],
-          advanceCursorOnSuccess: false,
-          windowHash: currentWindowHash,
-          reusedPreviousQuestion: false,
-          reason: "cooldown",
-        };
+      return buildResolutionFromFrame(framedWindow, currentWindowHash);
+    }
+
+    if (explicitFallback && normalizeText(explicitFallback) !== normalizeText(windowSource)) {
+      const fallbackFrame = resolveActiveQuestionWindow(explicitFallback, { previousQuestion });
+      if (fallbackFrame.answerability === "complete" && fallbackFrame.questions.length > 0) {
+        return buildResolutionFromFrame(
+          fallbackFrame,
+          fallbackFrame.windowHash || buildQuestionWindowHash(explicitFallback),
+        );
       }
-      if (repeatedWindow && lastGenerated.repeatCount >= 1) {
-        return {
-          prompt: "",
-          displayQuestion: "",
-          answeredQuestions: [],
-          questionNorms: [],
-          advanceCursorOnSuccess: false,
-          windowHash: currentWindowHash,
-          reusedPreviousQuestion: false,
-          reason: "nothing_new",
-        };
-      }
-      return {
-        prompt,
-        displayQuestion,
-        answeredQuestions,
-        questionNorms,
-        advanceCursorOnSuccess: true,
-        windowHash: activeQuestion?.windowHash || currentWindowHash,
-        reusedPreviousQuestion: false,
-      };
     }
     return {
       prompt: "",

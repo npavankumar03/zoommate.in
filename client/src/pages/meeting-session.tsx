@@ -7868,12 +7868,12 @@ export default function MeetingSession() {
       showOptimisticAssistantState("Generating...");
       startFirstChunkWatchdog("enter_window");
       pendingQuestionForRequestRef.current = backendWindowHint;
-      wsAnswerRef.current.send(JSON.stringify({
-        type: "question",
-        sessionId: id,
-        text: "",
-        force: false,
-        format: responseFormat === "custom" ? "custom" : responseFormat,
+        wsAnswerRef.current.send(JSON.stringify({
+          type: "question",
+          sessionId: id,
+          text: backendWindowHint,
+          force: false,
+          format: responseFormat === "custom" ? "custom" : responseFormat,
         model: selectedModel,
         quickMode: quickResponseMode,
         docsMode,

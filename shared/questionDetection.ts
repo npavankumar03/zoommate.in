@@ -89,6 +89,15 @@ const QUESTION_PHRASES = [
   "share your background",
   "share a time",
   "thoughts on",
+  "write",
+  "implement",
+  "build",
+  "create",
+  "design",
+  "generate",
+  "show me",
+  "develop",
+  "make",
 ];
 
 const INTERVIEW_INTENT_KEYWORDS = /\b(experience|worked|used|familiar|comfortable|exposure|background|hands on|knowledge|certification|strong in|thoughts?|opinion|approach|perspective|take)\b/i;
@@ -524,7 +533,7 @@ export function detectQuestionAdvanced(text: string): {
     .trim();
   const words = normalized.split(" ").filter(Boolean);
   // Strip leading filler words so "Alright, write a function..." detects "write" as a command starter
-  const strippedNorm = normalized.replace(/^(alright|okay|ok|so|now|well|right|sure|let'?s|go ahead|actually|basically|essentially)[,.]?\s*/i, "").trim();
+  const strippedNorm = normalized.replace(/^(alright|okay|ok|so|now|well|right|sure|let'?s|go ahead|actually|basically|essentially|next|then|first|second|third|after that)[,.]?\s*/i, "").trim();
   const startsWh = /^(what|why|how|when|where|who|which)\b/.test(strippedNorm);
   const startsInterrogative = /^(what|why|how|when|where|who|which|can|could|would|should|is|are|do|does|did)\b/.test(strippedNorm);
   const startsCommand = /^(explain|tell me|tell us|walk me|walk us|describe|share|give me|give us|talk me through|talk us through|your experience|your thoughts|your opinion|your take|your approach|any experience|familiar with|comfortable with|experience with|experience in|have you|are you familiar|are you comfortable|write|implement|build|create|design|code|generate|show me|make|develop|define|list|find|calculate|solve|convert|parse|sort|search|optimize|refactor)/.test(strippedNorm);
@@ -764,7 +773,7 @@ export function likelyContainsQuestion(text: string): boolean {
   if (INTERROGATIVE_STARTERS.includes(firstWord)) return true;
 
   if (/\b(can|could|would|should|do|does|did|are|is|have|has)\s+you\b/.test(normalized)) return true;
-  if (/\b(tell me|walk me through|describe|explain|hit me with|talk about)\b/.test(normalized)) return true;
+  if (/\b(tell me|walk me through|describe|explain|hit me with|talk about|write|implement|build|create|design|generate|show me|develop|make)\b/.test(normalized)) return true;
   if (hasSecondPersonDeclarativeQuestionIntent(normalized)) return true;
 
   // Broader interview signals — "your thoughts on X", "any experience with X", "familiar with X" etc.
@@ -900,7 +909,7 @@ export function extractQuestionFromSegment(segment: string): string | null {
       }
     }
 
-    const questionStart = trimmed.search(/\b(what|why|how|when|where|who|which|can you|could you|would you|do you|have you|are you|tell me|explain|describe|walk me|hit me with|hit us with|you have|youve|youre)\b/i);
+    const questionStart = trimmed.search(/\b(what|why|how|when|where|who|which|can you|could you|would you|do you|have you|are you|tell me|explain|describe|walk me|hit me with|hit us with|write|implement|build|create|design|generate|show me|develop|make|you have|youve|youre)\b/i);
     if (questionStart > 0) {
       const questionPart = trimmed.slice(questionStart).trim();
       const qWords = questionPart.split(/\s+/);
@@ -916,6 +925,7 @@ export function extractQuestionFromSegment(segment: string): string | null {
     /^(so\s+)?ok(ay)?\s+(so\s+)?/i,
     /^(so\s+)?(um|uh|hmm|well|like|right|yeah|yes|alright|sure)\s+/i,
     /^(and\s+)?(the\s+)?(next|another|following)\s+(question\s+)?(is\s+)?/i,
+    /^(next|then|now|after that|first|second|third)[,:]?\s+/i,
     /^(question\s+(is\s+)?)/i,
     /^(let me ask you\s+)/i,
     /^(i want to ask\s+)/i,
@@ -944,7 +954,7 @@ export function extractQuestionFromSegment(segment: string): string | null {
     }
   }
 
-  const questionStart = cleaned.search(/\b(what|why|how|when|where|who|which|can you|could you|would you|do you|have you|are you|tell me|explain|describe|walk me|hit me with|hit us with|you have|youve|youre)\b/i);
+  const questionStart = cleaned.search(/\b(what|why|how|when|where|who|which|can you|could you|would you|do you|have you|are you|tell me|explain|describe|walk me|hit me with|hit us with|write|implement|build|create|design|generate|show me|develop|make|you have|youve|youre)\b/i);
   if (questionStart >= 0) {
     const questionPart = cleaned.slice(questionStart).trim();
     if (questionPart && detectQuestion(questionPart)) {
@@ -1190,7 +1200,7 @@ function detectPatternLabelsInternal(text: string): QuestionPatternLabel[] {
   const labels = new Set<QuestionPatternLabel>();
   const words = normalized.split(/\s+/).filter(Boolean);
 
-  if (/[?]$/.test(String(text || "").trim()) || /^(what|why|how|when|where|who|which|can|could|would|should|is|are|do|does|did|have|has|tell|explain|describe|walk)\b/.test(normalized)) {
+  if (/[?]$/.test(String(text || "").trim()) || /^(what|why|how|when|where|who|which|can|could|would|should|is|are|do|does|did|have|has|tell|explain|describe|walk|write|implement|build|create|design|generate|show|develop|make)\b/.test(normalized)) {
     labels.add("direct");
   }
   if (words.length === 1) labels.add("one_word");

@@ -37,6 +37,16 @@ function run(): void {
   assert.equal(mergedDrillDown.answerability, "complete");
   assert.equal(mergedDrillDown.cleanQuestion, "Explain more about how does the storage account work?");
 
+  const imperativeCoding = resolveActiveQuestionWindow(
+    "Next, write a Python function that reads a Json file and extracts all unique keys present in it.",
+    { previousQuestion: "How would you ensure fault tolerance if one service becomes unavailable?" },
+  );
+  assert.equal(imperativeCoding.answerability, "complete");
+  assert.equal(
+    imperativeCoding.cleanQuestion,
+    "Write a Python function that reads a Json file and extracts all unique keys present in it?",
+  );
+
   assert.ok(questionSupersedes("Tell me about yourself?", "Tell me about"));
   assert.equal(
     buildQuestionWindowHash("Tell me about yourself."),
