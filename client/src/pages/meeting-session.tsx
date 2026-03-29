@@ -4912,7 +4912,8 @@ export default function MeetingSession() {
 
     // When stitching combined the fragment into a full question, use the stitched text for display
     // so that pendingTranscriptLineRef gets the full combined question, not just the raw fragment.
-    const segmentForDisplay = String(trimmed || rawFinal || "").replace(/\s+/g, " ").trim();
+    const segmentForDisplay = cleanTranscriptForDisplay(String(trimmed || rawFinal || "").replace(/\s+/g, " ").trim())
+      || String(trimmed || rawFinal || "").replace(/\s+/g, " ").trim();
     upsertTranscriptSegment(trimmed);
     // Don't merge two independent questions into one line.
     // Allow grouping only when the pending text is a fragment (not yet a complete question)
@@ -9372,7 +9373,7 @@ export default function MeetingSession() {
                   {displayTranscriptSegments.length > 0 || interimText || stagedTranscriptText || pendingTranscriptLine ? (
                     <div className="space-y-1">
                       {(() => {
-                        const activeLiveText = [interimText || stagedTranscriptText]
+                        const activeLiveText = [cleanTranscriptForDisplay(interimText || stagedTranscriptText) || (interimText || stagedTranscriptText)]
                           .filter(Boolean)
                           .join(" ")
                           .replace(/\s+/g, " ")
@@ -9383,7 +9384,10 @@ export default function MeetingSession() {
                         const isTailEcho = !!activeLiveText && !!latestSeg
                           && (Date.now() - lastFinalizedAtRef.current) < 2_000
                           && isShortTailFragment(activeLiveText, latestSeg);
-                        const liveText = (isStaleEcho || isTailEcho) ? "" : activeLiveText;
+                        const isLooseLiveFragment = !!activeLiveText
+                          && activeLiveText.split(/\s+/).filter(Boolean).length <= 2
+                          && isLikelyIncompleteFragment(activeLiveText);
+                        const liveText = (isStaleEcho || isTailEcho || isLooseLiveFragment) ? "" : activeLiveText;
                         const rows = (liveText
                           ? [liveText, ...displayTranscriptSegments.filter((seg) => normalizeForDedup(seg) !== normalizeForDedup(liveText))]
                           : displayTranscriptSegments).slice(0, 15);
@@ -9394,9 +9398,10 @@ export default function MeetingSession() {
                           const detection = rowKey === "live-current"
                             ? undefined
                             : transcriptQuestionDetections[rowKey];
+                          const cleanedSeg = cleanTranscriptForDisplay(seg) || seg;
                           const renderedText = detection?.cleanQuestion
                             ? (/[?]$/.test(detection.cleanQuestion.trim()) ? detection.cleanQuestion.trim() : `${detection.cleanQuestion.trim()}?`)
-                            : seg;
+                            : cleanedSeg;
                           return (
                             <div
                               key={rowKey}

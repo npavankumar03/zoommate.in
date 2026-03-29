@@ -892,16 +892,9 @@ export function setupWsAnswer(httpServer: Server): void {
             });
             return;
           }
-          if (queuedBackendQuestions.length === 0
-            && !isExplicitQuestion
-            && !isAmbiguousImplicit
-            && questionForStream !== "[Continue]"
-            && !questionForStream.startsWith("Continue answering:")
-            && !questionForStream.startsWith("[Continue")
-            && questionForStream.trim().length > 0) {
-            questionForStream = `Interview topic or prompt: "${questionForStream.trim()}". Answer only what is directly supported here. Do not infer a more specific question than this text supports.`;
-            console.log(`[ws/answer] grounded_topic_prompt sessionId=${sessionId} wrapped="${questionForStream.slice(0, 120)}"`);
-          }
+          // For transcript-driven prompts, keep the literal resolved question/topic.
+          // Wrapping it in meta-instructions here tends to produce awkward refusals or
+          // over-explained answers for otherwise answerable interview prompts.
 
           // #5: Recency amplification — boost detection of topic that appeared in last answer
           lastQuestionBySession.set(sessionId, displayQuestionForUi || questionForStream);

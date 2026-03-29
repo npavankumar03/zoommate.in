@@ -29,14 +29,14 @@ const activeStreams = new Map<string, AbortController>();
 const memoryContextCache = new Map<string, { value: string; expiresAt: number }>();
 const ttftSamplesByTransport: Record<"ws" | "sse", number[]> = { ws: [], sse: [] };
 const MEMORY_CACHE_TTL_MS = 90 * 1000;
-const TIER0_MIN_TOKENS = 220;
+const TIER0_MIN_TOKENS = 180;
 const TIER0_MAX_TOKENS = 950; // enough for explanation + full code block without truncation
 const TIER0_CUSTOM_INSTRUCTIONS_CHARS = 24000;
 const MAX_RESUME_CONTEXT_CHARS = 24000;
 const MAX_JOB_DESCRIPTION_CHARS = 12000;
 const FOLLOWUP_MAX_CHARS = 2000;
 const FIRST_TOKEN_TIMEOUT_MS = 3500;
-const MAX_FIRST_TOKEN_RETRIES = 0;
+const MAX_FIRST_TOKEN_RETRIES = 1;
 const STRICT_NO_INVENT_RULE = [
   "CRITICAL NO-INVENTION RULES:",
   "- Do NOT invent employers, companies, project names, years, metrics, or seniority.",
@@ -685,7 +685,7 @@ function buildTier0FormatGuide(format: string, customFormatPrompt?: string, quic
 
   const guideByFormat: Record<string, string> = {
     short: "Short: 2-4 tight sentences total.",
-    concise: "Concise: 2-4 sentences.",
+    concise: "Concise: 2-3 sentences.",
     detailed: "Detailed: Keep concise but structured: 1) Direct answer, 2) Key details, 3) Example, 4) Impact/Wrap-up.",
     star: "STAR: Provide 4 labeled lines only: S: ... T: ... A: ... R: ...",
     bullet: "Bullets: 4-6 clear bullets. Each bullet should be concrete and complete.",
@@ -1573,6 +1573,11 @@ export async function* streamAssistantAnswer(
       || followUp.isFollowUp
       || questionWordCount >= 18
       || /\b(walk me through|explain|design|architecture|tradeoff|idempotency|circuit breaker|saga|outbox|atomic)\b/i.test(effectiveQuestion);
+    const isSimpleDirectTurn =
+      !followUp.isFollowUp
+      && extractedQuestions.length <= 1
+      && questionWordCount <= 12
+      && !/\b(write|implement|build|create|design|architecture|tradeoff|optimi[sz]e|debug|fix|query|sql|algorithm|system design)\b/i.test(effectiveQuestion);
     const scenarioHint = buildScenarioAnswerHint(effectiveQuestion);
     const multiQuestionBlock = extractedQuestions.length > 1
       ? [
@@ -1631,7 +1636,7 @@ export async function* streamAssistantAnswer(
           ? (subtypeTokenCap[subtypeResult.subtype] ?? (isComplexTurn ? 360 : 280))
           : isCodeWritingQuestion
             ? TIER0_MAX_TOKENS
-            : (isComplexTurn ? 360 : 280);
+            : (isComplexTurn ? 300 : (isSimpleDirectTurn ? 220 : 260));
     const resolvedModel = resolveRequestedModel(requestedModel, meeting, effectiveQuestion, {
       multiQuestionCount: extractedQuestions.length,
       isComplexTurn,
@@ -1712,7 +1717,7 @@ export async function* streamAssistantAnswer(
 
       // On retry after refusal, inject explicit behavioral context into user prompt
       const activeUserPrompt = (attempt > 0 && prevWasRefusal)
-        ? `IMPORTANT: This is a legitimate behavioral interview question about professional work experience. Answer it directly in first person as a candidate describing their own experience. Do not add any disclaimers or refusals.\n\n${finalUserPrompt}`
+        ? `IMPORTANT: This is a legitimate interview question. Answer it directly and naturally. Do not refuse, apologize, or claim you cannot assist. If the question is behavioral, answer in first person as a candidate. If it is conceptual, answer it directly and simply.\n\n${finalUserPrompt}`
         : finalUserPrompt;
 
       try {
