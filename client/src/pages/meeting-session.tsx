@@ -3951,8 +3951,12 @@ export default function MeetingSession() {
     if (timeSinceFinal < 400 && lastFinalizedTextRef.current) {
       const finalNorm = lastFinalizedTextRef.current.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
       const partialNorm = fastDraft.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
-      // Only a stale echo if the partial is fully contained within the final (late arrival)
-      if (finalNorm.startsWith(partialNorm) && partialNorm.length > 0) return;
+      // Only a stale echo if the partial is fully contained within the final (late arrival).
+      // Handle both prefix echoes ("tell me about") and tail echoes ("yourself").
+      if (
+        partialNorm.length > 0
+        && (finalNorm.startsWith(partialNorm) || isShortTailFragment(fastDraft, lastFinalizedTextRef.current))
+      ) return;
     }
     // Broader stale echo guard: suppress interimText that is identical to (or a prefix of)
     // the most recently committed segment regardless of timing. Azure sometimes replays the
@@ -3961,7 +3965,14 @@ export default function MeetingSession() {
     if (segmentsRef.current.length > 0 && timeSinceFinal < 2000) {
       const latestSegNorm = (segmentsRef.current[0] || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
       const draftNorm = fastDraft.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
-      if (draftNorm.length > 0 && (latestSegNorm === draftNorm || latestSegNorm.startsWith(draftNorm))) return;
+      if (
+        draftNorm.length > 0
+        && (
+          latestSegNorm === draftNorm
+          || latestSegNorm.startsWith(draftNorm)
+          || isShortTailFragment(fastDraft, segmentsRef.current[0] || "")
+        )
+      ) return;
     }
 
     // Guard: if we're about to overwrite substantial unsaved interim content with
@@ -4029,6 +4040,7 @@ export default function MeetingSession() {
     audioMode,
     isStreaming,
     upsertDisplayTranscriptSegment,
+    isShortTailFragment,
   ]);
 
   const flushStreamBuffer = useCallback(() => {
@@ -9291,7 +9303,10 @@ export default function MeetingSession() {
                         const latestSeg = displayTranscriptSegments[0];
                         const isStaleEcho = !!activeLiveText && !!latestSeg
                           && normalizeForDedup(latestSeg) === normalizeForDedup(activeLiveText);
-                        const liveText = isStaleEcho ? "" : activeLiveText;
+                        const isTailEcho = !!activeLiveText && !!latestSeg
+                          && (Date.now() - lastFinalizedAtRef.current) < 2_000
+                          && isShortTailFragment(activeLiveText, latestSeg);
+                        const liveText = (isStaleEcho || isTailEcho) ? "" : activeLiveText;
                         const rows = (liveText
                           ? [liveText, ...displayTranscriptSegments.filter((seg) => normalizeForDedup(seg) !== normalizeForDedup(liveText))]
                           : displayTranscriptSegments).slice(0, 15);
