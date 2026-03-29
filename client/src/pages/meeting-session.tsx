@@ -4132,13 +4132,26 @@ export default function MeetingSession() {
     firstChunkWatchdogRef.current = setTimeout(() => {
       if (!isAwaitingFirstChunkRef.current) return;
       console.warn(`[ws] first-chunk-timeout source=${source}`);
+      setIsStreaming(false);
+      setIsAwaitingFirstChunk(false);
+      isAwaitingFirstChunkRef.current = false;
+      setStreamingQuestion("");
+      setStreamingAnswer("");
+      setPendingResponse(null);
+      activeWsStreamIdRef.current = "";
+      streamingAccumulatorRef.current = "";
+      streamBufferRef.current = "";
+      wsTextQueueRef.current = "";
+      displayedAccRef.current = "";
+      clearStreamingRenderTimer();
+      interviewStateRef.current = "listening";
       toast({
         title: "Slow response from AI",
         description: "Request sent but no streamed chunks yet. Retrying Enter is safe.",
         variant: "destructive",
       });
     }, 10000);
-  }, [clearFirstChunkWatchdog, toast]);
+  }, [clearFirstChunkWatchdog, clearStreamingRenderTimer, toast]);
 
   const flushTranscriptPersistQueue = useCallback(async () => {
     if (!id || transcriptPersistInFlightRef.current) return;
@@ -4214,7 +4227,7 @@ export default function MeetingSession() {
         const msg = JSON.parse(String(event.data || "{}"));
         if (msg?.sessionId && msg.sessionId !== id) return;
 
-        if (msg.type === "no_question") {
+        if (msg.type === "no_question" || msg.type === "request_ignored") {
           clearFirstChunkWatchdog();
           setIsStreaming(false);
           setIsAwaitingFirstChunk(false);
@@ -4223,6 +4236,11 @@ export default function MeetingSession() {
           setStreamingAnswer("");
           setPendingResponse(null);
           activeWsStreamIdRef.current = "";
+          streamingAccumulatorRef.current = "";
+          streamBufferRef.current = "";
+          wsTextQueueRef.current = "";
+          displayedAccRef.current = "";
+          clearStreamingRenderTimer();
           interviewStateRef.current = "listening";
           return;
         }

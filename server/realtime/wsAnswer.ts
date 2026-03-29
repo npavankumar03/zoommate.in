@@ -824,6 +824,12 @@ export function setupWsAnswer(httpServer: Server): void {
             console.log(`[ws/answer] suppressed_ambiguous_auto sessionId=${sessionId}`, {
               raw: questionForStream,
             });
+            safeSend(ws, {
+              type: "request_ignored",
+              sessionId,
+              requestId: "",
+              reason: "ambiguous_question",
+            });
             return;
           }
           if (queuedBackendQuestions.length === 0
@@ -863,8 +869,14 @@ export function setupWsAnswer(httpServer: Server): void {
             }
           }
           const fp = normalizeQuestionForSimilarity(questionForStream) || "continue";
-          if (!force && isRecentDuplicate(sessionId, fp, questionText)) {
+          if (!force && !useBackendEnterWindow && isRecentDuplicate(sessionId, fp, questionText)) {
             console.log(`[ws/answer] duplicate suppressed sessionId=${sessionId} fp="${fp.slice(0, 60)}"`);
+            safeSend(ws, {
+              type: "request_ignored",
+              sessionId,
+              requestId: "",
+              reason: "duplicate_question",
+            });
             return;
           }
           rememberFingerprint(sessionId, fp, questionText);
