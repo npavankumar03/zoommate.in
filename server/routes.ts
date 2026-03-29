@@ -3,7 +3,7 @@ import { createServer, type Server } from "http";
 import crypto from "crypto";
 import { storage } from "./storage";
 import { generateResponse, generateStreamingResponse, analyzeScreen, analyzeScreenStream, analyzeMultiScreenStream, getAvailableModels } from "./openai";
-import { detectQuestion, detectQuestionAdvanced, normalizeForDedup, isSubstantiveSegment } from "@shared/questionDetection";
+import { detectQuestion, detectQuestionAdvanced, frameQuestionWindow, normalizeForDedup, isSubstantiveSegment } from "@shared/questionDetection";
 import { invalidateSettingsCache, getPrewarmedOpenAIKey, prewarmApiKey, FAST_MODEL, keepAliveAgent, resolveLLMConfig } from "./llmRouter";
 import { resolveAutomaticInterviewModel } from "./llmRouter2";
 import { streamOpenAIFast } from "./llmStream";
@@ -2774,9 +2774,13 @@ Return ONLY valid JSON. No explanation, no markdown, no code fences. Just the JS
       const t0 = Date.now();
 
       const advanced = detectQuestionAdvanced(text);
-      const cleanQuestion = text.trim();
+      const framed = frameQuestionWindow(text);
+      const cleanQuestion = framed.cleanQuestion || text.trim();
       // detectQuestionAdvanced is a superset of detectQuestion — use it exclusively to avoid double evaluation
-      const isLikelyQuestion = advanced.isQuestion && advanced.confidence >= 0.6;
+      const isLikelyQuestion =
+        framed.answerability === "complete"
+        && framed.questions.length > 0
+        && Math.max(advanced.confidence, framed.confidence) >= 0.72;
       const normalizedTurn = text.toLowerCase().replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim();
       const isShortAck = /^(yes|yeah|yep|yup|correct|right|sure|i do|i did|absolutely|of course|exactly)$/i.test(normalizedTurn);
 
@@ -2793,13 +2797,17 @@ Return ONLY valid JSON. No explanation, no markdown, no code fences. Just the JS
         endMs: typeof req.body?.endMs === "number" ? req.body.endMs : null,
         confidence: null,
         isQuestion: isLikelyQuestion,
-        questionType: isLikelyQuestion ? (advanced.type || "other") : null,
+        questionType: isLikelyQuestion ? (framed.labels[0] || advanced.type || "other") : null,
         cleanQuestion: isLikelyQuestion ? cleanQuestion : null,
       });
 
       if (isLikelyQuestion) {
         recordInterviewerQuestion(req.params.id, cleanQuestion || text);
-        enqueueQuestion(req.params.id, cleanQuestion || text);
+        enqueueQuestion(req.params.id, cleanQuestion || text, Date.now(), {
+          windowHash: framed.windowHash,
+          answerability: framed.answerability,
+          labels: framed.labels,
+        });
       } else if (speaker === "candidate" && (isSubstantiveSegment(text) || isShortAck || text.split(/\s+/).filter(Boolean).length <= 40)) {
         recordSpokenReply(req.params.id, text);
       }
@@ -2821,11 +2829,12 @@ Return ONLY valid JSON. No explanation, no markdown, no code fences. Just the JS
       const text = String(req.body?.text || "").trim();
       if (!text) return res.status(400).json({ message: "text is required" });
       const audioMode = typeof req.body?.audioMode === "string" ? req.body.audioMode : undefined;
+      const segmentKey = String(req.body?.segmentKey || "").trim();
 
       const recentTurns = await storage.getRecentTranscriptTurns(req.params.id, 4);
       const recentContext = recentTurns.reverse().map((t) => t.text).join("\n");
       const memoryContext = await formatMemorySlotsForPrompt(req.userId, req.params.id);
-      const threshold = audioMode === "mic" ? 0.8 : 0.75;
+      const threshold = audioMode === "mic" ? 0.85 : 0.8;
 
       const result = await runDetectionPipeline(
         text,
@@ -2835,14 +2844,26 @@ Return ONLY valid JSON. No explanation, no markdown, no code fences. Just the JS
         threshold,
       );
 
-      const shouldRecordQuestion = result.isQuestion && result.confidence >= threshold;
+      const framed = frameQuestionWindow(String(result.cleanQuestion || result.questionSpan || text).trim(), {
+        previousQuestion: recentContext,
+      });
+
+      const shouldRecordQuestion =
+        result.isQuestion
+        && result.confidence >= threshold
+        && framed.answerability === "complete"
+        && framed.questions.length > 0;
       if (shouldRecordQuestion) {
-        const detectedQuestion = String(result.cleanQuestion || result.questionSpan || text).trim();
+        const detectedQuestion = framed.cleanQuestion || String(result.cleanQuestion || result.questionSpan || text).trim();
         recordInterviewerQuestion(
           req.params.id,
           detectedQuestion,
         );
-        enqueueQuestion(req.params.id, detectedQuestion);
+        enqueueQuestion(req.params.id, detectedQuestion, Date.now(), {
+          windowHash: framed.windowHash,
+          answerability: framed.answerability,
+          labels: framed.labels,
+        });
       }
 
       res.json({
@@ -2852,6 +2873,21 @@ Return ONLY valid JSON. No explanation, no markdown, no code fences. Just the JS
         clean_question: result.cleanQuestion,
         type: result.type,
         recorded: shouldRecordQuestion,
+        segment_key: segmentKey || undefined,
+        framed: {
+          labels: framed.labels,
+          answerability: framed.answerability,
+          anchor: framed.anchor,
+          questions: framed.questions.map((item) => ({
+            text: item.text,
+            labels: item.labels,
+            confidence: item.confidence,
+            answerability: item.answerability,
+          })),
+          window_hash: framed.windowHash,
+          confidence: framed.confidence,
+          clean_question: framed.cleanQuestion,
+        },
       });
     } catch (error: any) {
       res.status(500).json({ message: error.message });

@@ -1086,3 +1086,299 @@ export function isNovelQuestion(newQuestion: string, lastQuestion: string, recen
 
   return true;
 }
+
+export type QuestionPatternLabel =
+  | "direct"
+  | "one_word"
+  | "keyword_prompt"
+  | "multi_question"
+  | "followup"
+  | "rapid_fire"
+  | "pause_based"
+  | "incomplete_prompt"
+  | "interrupt"
+  | "drill_down"
+  | "scenario"
+  | "comparison"
+  | "challenge"
+  | "rephrased_repeat"
+  | "silent_pressure"
+  | "binary"
+  | "metric_demand"
+  | "ownership_test"
+  | "ambiguous"
+  | "clarification"
+  | "resume_pointer"
+  | "assumption_check"
+  | "behavioral"
+  | "broad_to_narrow"
+  | "narrow_to_broad";
+
+export type QuestionAnswerability = "complete" | "fragment" | "no_question";
+export type QuestionAnchor = "none" | "current_window" | "previous_answer";
+
+export interface FramedQuestionItem {
+  text: string;
+  norm: string;
+  labels: QuestionPatternLabel[];
+  confidence: number;
+  answerability: QuestionAnswerability;
+}
+
+export interface FramedQuestionResult {
+  rawText: string;
+  normalizedText: string;
+  labels: QuestionPatternLabel[];
+  answerability: QuestionAnswerability;
+  anchor: QuestionAnchor;
+  questions: FramedQuestionItem[];
+  windowHash: string;
+  confidence: number;
+  cleanQuestion: string;
+  isQuestion: boolean;
+}
+
+function simpleStableHash(text: string): string {
+  let hash = 2166136261;
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function ensureSentenceCase(text: string): string {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return "";
+  return trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
+}
+
+export function ensureQuestionMark(text: string): string {
+  const trimmed = String(text || "").trim().replace(/[.]\s*$/, "");
+  if (!trimmed) return "";
+  return /[?]$/.test(trimmed) ? trimmed : `${trimmed}?`;
+}
+
+function isFollowupPhrase(normalized: string): boolean {
+  return /^(why|how|how so|how come|what happened next|what next|what else|tell me more|go deeper|dig deeper|dive deeper|go on|continue|expand|elaborate|clarify|break it down|example|give me one example|real case|when exactly|who decided|what was your part|how do you know|why that)\??$/.test(normalized);
+}
+
+function isPauseOrIncompletePrompt(normalized: string): boolean {
+  if (!normalized) return false;
+  if (/^(and|also|plus|or|so|hmm|hm|okay|ok|right|wait|hold on|then|next|backend|frontend|database|project|team|testing|scale|yourself|role|outcome|after that)\??$/.test(normalized)) {
+    return true;
+  }
+  if (/\b(in|with|at|for|on|about|of|from|to|by|and|or|the|a|an|any|some|your|our|their|its|this|that|these|those)\s*$/.test(normalized)) {
+    return true;
+  }
+  return /^(and your|and after|and the outcome|tell me about|what about|can you|could you|would you|do you|have you|are you|wait who|hold on did)\s*$/.test(normalized)
+    && !/[?]$/.test(normalized);
+}
+
+function detectPatternLabelsInternal(text: string): QuestionPatternLabel[] {
+  const normalized = normalizeForDedup(text || "");
+  if (!normalized) return [];
+
+  const labels = new Set<QuestionPatternLabel>();
+  const words = normalized.split(/\s+/).filter(Boolean);
+
+  if (/[?]$/.test(String(text || "").trim()) || /^(what|why|how|when|where|who|which|can|could|would|should|is|are|do|does|did|have|has|tell|explain|describe|walk)\b/.test(normalized)) {
+    labels.add("direct");
+  }
+  if (words.length === 1) labels.add("one_word");
+  if ((words.length <= 4 && STANDALONE_TECH_RE.test(normalized)) || /^(polymorphism|normalization|caching|database|project|team|scale|testing)$/.test(normalized)) {
+    labels.add("keyword_prompt");
+  }
+  if (isFollowupPhrase(normalized) || /^(and your|and after that|and the outcome|what do you mean|what exactly was your contribution)\b/.test(normalized)) {
+    labels.add("followup");
+  }
+  if (/^(wait|hold on)\b/.test(normalized)) labels.add("interrupt");
+  if (/\b(go deeper|explain in detail|how exactly|under the hood|drill down)\b/.test(normalized)) labels.add("drill_down");
+  if (/\b(what if|suppose|assume)\b/.test(normalized)) labels.add("scenario");
+  if (/\b(vs|versus|compare|difference between|better than)\b/.test(normalized)) labels.add("comparison");
+  if (/\b(are you sure|why not|that sounds expensive|but you said)\b/.test(normalized)) labels.add("challenge");
+  if (/^(yes or no|did you|did it|do you)\b/.test(normalized)) labels.add("binary");
+  if (/\b(how much|how many|what latency|what percentage|what was the improvement)\b/.test(normalized)) labels.add("metric_demand");
+  if (/\b(not the team|what exactly did you do|what was your part|your contribution)\b/.test(normalized)) labels.add("ownership_test");
+  if (/\b(i see .* here|you mentioned|this startup experience)\b/.test(normalized)) labels.add("resume_pointer");
+  if (/\b(so you were|so this was|so you deployed)\b/.test(normalized)) labels.add("assumption_check");
+  if (/\b(tell me about a time|give me an example when|describe a situation)\b/.test(normalized)) labels.add("behavioral");
+  if (/\b(focus on|focus only on)\b/.test(normalized)) labels.add("broad_to_narrow");
+  if (/^(how did .* work|how did login work)\b/.test(normalized) || /\b(explain the whole architecture|whole architecture)\b/.test(normalized)) {
+    labels.add("narrow_to_broad");
+  }
+  if (/^(right|correct|fair)\??$/.test(normalized)) labels.add("silent_pressure");
+  if (isPauseOrIncompletePrompt(normalized)) labels.add("incomplete_prompt");
+  if (/(\?|^)\s*(what|why|how|who|which|where|when|tell me|explain|describe|do you|have you|are you|can you|could you|would you)\b/gi.test(normalized) && splitSentences(ensureQuestionMark(text)).length > 1) {
+    labels.add("multi_question");
+  }
+  if (/\b(and then|who decided|what was your part|how do you know|what happened next)\b/.test(normalized)) labels.add("rapid_fire");
+  if (/\.\.\.|^so\b|^hmm\b|^okay\b/.test(String(text || "").trim().toLowerCase())) labels.add("pause_based");
+  if (/\b(what do you mean|can you clarify|could you clarify|what exactly)\b/.test(normalized)) labels.add("clarification");
+  if (!labels.size && likelyContainsQuestion(text)) labels.add("ambiguous");
+
+  return Array.from(labels);
+}
+
+export function detectQuestionPatternLabels(text: string): QuestionPatternLabel[] {
+  return detectPatternLabelsInternal(text);
+}
+
+function splitQuestionUnits(text: string): string[] {
+  const raw = String(text || "").trim();
+  if (!raw) return [];
+
+  const splitByLines = raw
+    .split(/\n+|\|+/)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .flatMap((part) => {
+      const withSentenceBreaks = part
+        .replace(/([?])\s+(?=(what|why|how|when|where|who|which|tell me|explain|describe|walk me|do you|have you|are you|can you|could you|would you)\b)/gi, "$1\n")
+        .replace(/,\s+(?=(what|why|how|when|where|who|which|tell me|explain|describe|walk me|do you|have you|are you|can you|could you|would you)\b)/gi, "\n");
+      return withSentenceBreaks.split(/\n+/).map((item) => item.trim()).filter(Boolean);
+    });
+
+  return splitByLines;
+}
+
+export function questionSupersedes(candidate: string, existing: string): boolean {
+  const next = normalizeForDedup(candidate || "");
+  const prev = normalizeForDedup(existing || "");
+  if (!next || !prev || next === prev) return false;
+
+  const nextWords = next.split(/\s+/).filter(Boolean);
+  const prevWords = prev.split(/\s+/).filter(Boolean);
+  if (nextWords.length < prevWords.length) return false;
+
+  const overlap = Math.max(computeWordOverlap(next, prev), computeWordOverlap(prev, next));
+  const prevLooksFragment = prevWords.length <= 4 || isPauseOrIncompletePrompt(prev) || isFollowupPhrase(prev);
+  if (prevLooksFragment && (next.includes(prev) || overlap >= 0.66)) return true;
+
+  const prevPrefix = prevWords.join(" ");
+  return Boolean(prevPrefix && next.startsWith(prevPrefix) && next.length > prev.length + 4);
+}
+
+export function dedupeAndSupersedeQuestions(questions: string[]): string[] {
+  const result: string[] = [];
+  for (const raw of questions) {
+    const next = ensureSentenceCase(String(raw || "").trim());
+    if (!next) continue;
+    const nextNorm = normalizeForDedup(next);
+    if (!nextNorm) continue;
+
+    let suppressed = false;
+    for (let i = result.length - 1; i >= 0; i--) {
+      const current = result[i];
+      const currentNorm = normalizeForDedup(current);
+      if (!currentNorm) continue;
+      if (currentNorm === nextNorm || questionSupersedes(current, next)) {
+        suppressed = true;
+        break;
+      }
+      if (questionSupersedes(next, current)) {
+        result.splice(i, 1);
+      }
+    }
+    if (!suppressed) result.push(next);
+  }
+  return result;
+}
+
+export function buildQuestionWindowHash(text: string): string {
+  const normalized = normalizeForDedup(String(text || ""));
+  return normalized ? `qwin_${simpleStableHash(normalized)}` : "";
+}
+
+export function frameQuestionWindow(
+  text: string,
+  options?: { previousQuestion?: string },
+): FramedQuestionResult {
+  const rawText = String(text || "").trim();
+  const normalizedText = normalizeForDedup(rawText);
+  const labels = detectPatternLabelsInternal(rawText);
+  const windowHash = buildQuestionWindowHash(rawText);
+
+  if (!normalizedText) {
+    return {
+      rawText,
+      normalizedText,
+      labels,
+      answerability: "no_question",
+      anchor: "none",
+      questions: [],
+      windowHash,
+      confidence: 0,
+      cleanQuestion: "",
+      isQuestion: false,
+    };
+  }
+
+  const extracted = extractQuestionFromSegment(rawText);
+  const units = splitQuestionUnits(rawText);
+  const explicitQuestions = dedupeAndSupersedeQuestions(
+    units
+      .map((unit) => extractQuestionFromSegment(unit) || (detectQuestion(unit) ? ensureSentenceCase(unit.trim()) : ""))
+      .filter(Boolean)
+      .map((unit) => ensureQuestionMark(unit)),
+  );
+
+  const answerability: QuestionAnswerability = (() => {
+    if (labels.includes("one_word") || labels.includes("keyword_prompt") || labels.includes("pause_based") || labels.includes("incomplete_prompt")) {
+      return "fragment";
+    }
+    if (!detectQuestion(rawText) && !likelyContainsQuestion(rawText) && !extracted && explicitQuestions.length === 0) {
+      return "no_question";
+    }
+    if (isPauseOrIncompletePrompt(normalizedText)) return "fragment";
+    if (explicitQuestions.length === 0 && !extracted) return "fragment";
+    return "complete";
+  })();
+
+  const anchor: QuestionAnchor =
+    answerability === "fragment" && labels.includes("followup") && options?.previousQuestion
+      ? "previous_answer"
+      : (answerability === "complete" ? "current_window" : "none");
+
+  const questions = (explicitQuestions.length > 0
+    ? explicitQuestions
+    : (extracted && answerability === "complete" ? [ensureQuestionMark(extracted)] : []))
+    .map((question) => {
+      const questionLabels = detectPatternLabelsInternal(question);
+      return {
+        text: question,
+        norm: normalizeForDedup(question),
+        labels: questionLabels,
+        confidence: Math.max(
+          detectQuestionAdvanced(question).confidence,
+          detect(question, "final").confidence,
+          answerability === "complete" ? 0.72 : 0.45,
+        ),
+        answerability: answerability === "complete" ? "complete" : "fragment",
+      } satisfies FramedQuestionItem;
+    });
+
+  const confidence = questions.length > 0
+    ? Math.max(...questions.map((item) => item.confidence))
+    : Math.max(
+        detectQuestionAdvanced(rawText).confidence,
+        detect(rawText, "final").confidence,
+        answerability === "fragment" ? 0.45 : 0,
+      );
+
+  return {
+    rawText,
+    normalizedText,
+    labels: Array.from(new Set<QuestionPatternLabel>([
+      ...labels,
+      ...(questions.length > 1 ? ["multi_question"] as QuestionPatternLabel[] : []),
+    ])),
+    answerability,
+    anchor,
+    questions,
+    windowHash,
+    confidence,
+    cleanQuestion: questions[0]?.text || "",
+    isQuestion: answerability === "complete" && questions.length > 0,
+  };
+}

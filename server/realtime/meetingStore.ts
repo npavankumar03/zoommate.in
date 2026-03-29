@@ -1,5 +1,23 @@
-import { computeWordOverlap, normalizeForDedup, levenshteinSimilarity, fingerprint } from "@shared/questionDetection";
+import {
+  computeWordOverlap,
+  normalizeForDedup,
+  levenshteinSimilarity,
+  fingerprint,
+  questionSupersedes,
+  type QuestionAnswerability,
+  type QuestionPatternLabel,
+} from "@shared/questionDetection";
 import type { AnswerStyle } from "@shared/schema";
+
+type QueuedQuestion = {
+  clean: string;
+  norm: string;
+  ts: number;
+  answeredTs?: number;
+  windowHash?: string;
+  answerability?: QuestionAnswerability;
+  labels?: QuestionPatternLabel[];
+};
 
 export type MeetingState = {
   phase: "IDLE" | "LISTENING" | "CANDIDATE" | "STREAMING_T0" | "REFINE_T1" | "DONE";
@@ -7,7 +25,7 @@ export type MeetingState = {
   finals: Array<{ text: string; ts: number }>;
   lastAnsweredFinalIndex: number;
   recentQuestions: Array<{ clean: string; ts: number }>;
-  questionQueue: Array<{ clean: string; norm: string; ts: number; answeredTs?: number }>;
+  questionQueue: QueuedQuestion[];
   recentAnswers: Array<{ key: string; question: string; answer: string; ts: number; responseId?: string }>;
   lastQuestionExtractTs?: number;
   lastTriggerAt?: number;
@@ -24,6 +42,7 @@ export type MeetingState = {
   lastAnswer?: string;
   lastAnswerAt?: number;
   lastPrompt?: string;
+  lastAnsweredWindowHash?: string;
   lastStyleUsed?: AnswerStyle;
   answerStyle?: AnswerStyle;
   pendingMeta?: { type: "brief" | "deeper"; ts: number };
@@ -153,25 +172,60 @@ export function normalizeQuestionKey(clean: string): string {
   return normalizeForDedup(clean || "");
 }
 
-export function enqueueQuestion(meetingId: string, clean: string, ts = Date.now()): void {
+export function enqueueQuestion(
+  meetingId: string,
+  clean: string,
+  ts = Date.now(),
+  meta?: {
+    windowHash?: string;
+    answerability?: QuestionAnswerability;
+    labels?: QuestionPatternLabel[];
+  },
+): void {
   const value = (clean || "").trim();
   if (!value) return;
   const norm = normalizeQuestionKey(value);
   if (!norm) return;
+  if (meta?.answerability === "fragment" || meta?.answerability === "no_question") return;
 
   const s = getState(meetingId);
+  let suppressedByExisting = false;
+  let replacedAny = false;
   const existing = s.questionQueue.find((q) => {
     if (ts - q.ts > 120000) return false;
     if (q.norm === norm) return true;
+    if (questionSupersedes(value, q.clean)) {
+      replacedAny = true;
+      return true;
+    }
+    if (questionSupersedes(q.clean, value)) {
+      suppressedByExisting = true;
+      return true;
+    }
     return computeWordOverlap(q.norm, norm) > 0.82 || computeWordOverlap(norm, q.norm) > 0.82;
   });
+  if (suppressedByExisting && existing) {
+    existing.ts = ts;
+    return;
+  }
   if (existing) {
     existing.ts = ts;
-    if (!existing.clean || existing.clean.length < value.length) {
+    if (!existing.clean || existing.clean.length < value.length || replacedAny) {
       existing.clean = value;
+      existing.norm = norm;
     }
+    if (meta?.windowHash) existing.windowHash = meta.windowHash;
+    if (meta?.answerability) existing.answerability = meta.answerability;
+    if (meta?.labels?.length) existing.labels = meta.labels;
   } else {
-    s.questionQueue.push({ clean: value, norm, ts });
+    s.questionQueue.push({
+      clean: value,
+      norm,
+      ts,
+      windowHash: meta?.windowHash,
+      answerability: meta?.answerability,
+      labels: meta?.labels,
+    });
     if (s.questionQueue.length > 100) s.questionQueue = s.questionQueue.slice(-100);
   }
 
@@ -209,7 +263,10 @@ export function markAnswered(
   const normSet = new Set(norms);
   const s = getState(meetingId);
   for (const item of s.questionQueue) {
-    if (normSet.has(item.norm)) {
+    const matched = normSet.has(item.norm)
+      || norms.some((norm) => questionSupersedes(norm, item.norm) || questionSupersedes(item.norm, norm))
+      || norms.some((norm) => computeWordOverlap(item.norm, norm) > 0.82 || computeWordOverlap(norm, item.norm) > 0.82);
+    if (matched) {
       item.answeredTs = answeredTs;
     }
   }
@@ -226,6 +283,11 @@ export function expireOldUnanswered(
       item.answeredTs = now;
     }
   }
+}
+
+export function setLastAnsweredWindowHash(meetingId: string, windowHash: string): void {
+  const s = getState(meetingId);
+  s.lastAnsweredWindowHash = String(windowHash || "").trim() || undefined;
 }
 
 export function isDuplicateAction(meetingId: string, key: string, windowMs = 12000): boolean {

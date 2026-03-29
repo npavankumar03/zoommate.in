@@ -10,7 +10,8 @@
     "check": "tsc",
     "db:push": "drizzle-kit push",
     "eval": "tsx server/eval/evalRunner.ts",
-    "eval:cases": "tsx server/eval/evalRunner.ts --cases"
+    "eval:cases": "tsx server/eval/evalRunner.ts --cases",
+    "eval:transcript": "tsx scripts/transcriptFramingRegression.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",

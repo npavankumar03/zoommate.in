@@ -3,7 +3,7 @@ import type { Server, IncomingMessage } from "http";
 import { URL } from "url";
 import { storage } from "../storage";
 import { streamAssistantAnswer, abortSessionStream, hasActiveStream } from "../assist/streamAssistantAnswer";
-import { getLastUnansweredInterviewerQuestion, getLatestSpokenReply, getRecentQuestionHistory, markInterviewerQuestionAnswered, recordUserQuestion, getCodingProblemState, buildInterviewerIntelligenceBlock } from "../assist/sessionState";
+import { getLastUnansweredInterviewerQuestion, getLatestSpokenReply, markInterviewerQuestionAnswered, recordUserQuestion, getCodingProblemState, buildInterviewerIntelligenceBlock } from "../assist/sessionState";
 import { orchestrate } from "../assist/orchestrator";
 import {
   getState as getMeetingState,
@@ -12,10 +12,14 @@ import {
   advanceCursor,
   markAnswered as markAnsweredInStore,
   normalizeQuestionKey,
+  getUnanswered as getUnansweredInStore,
+  setLastAnsweredWindowHash,
 } from "./meetingStore";
 import {
   detectQuestion,
   extractQuestionFromSegment,
+  frameQuestionWindow,
+  buildQuestionWindowHash,
   likelyContainsQuestion,
   levenshteinSimilarity,
   normalizeQuestionForSimilarity,
@@ -395,11 +399,11 @@ function safeSend(ws: WebSocket, payload: unknown) {
 function getUnansweredBackendQuestions(sessionId: string, maxItems = 3, maxAgeMs = 90_000): string[] {
   const now = Date.now();
   const seen = new Set<string>();
-  return getRecentQuestionHistory(sessionId, 12)
-    .filter((item) => !item.answered && (now - item.ts) <= maxAgeMs)
+  return getUnansweredInStore(sessionId, maxItems * 3)
+    .filter((item) => (now - item.ts) <= maxAgeMs)
     .slice()
-    .reverse()
-    .map((item) => String(item.text || "").trim())
+    .sort((a, b) => b.ts - a.ts)
+    .map((item) => String(item.clean || "").trim())
     .filter(Boolean)
     .filter((question) => {
       const norm = normalizeQuestionForSimilarity(question);
@@ -421,6 +425,8 @@ type EnterWindowResolution = {
   answeredQuestions: string[];
   questionNorms: string[];
   advanceCursorOnSuccess: boolean;
+  windowHash: string;
+  reusedPreviousQuestion: boolean;
 };
 
 async function resolveEnterWindowQuestion(
@@ -428,23 +434,24 @@ async function resolveEnterWindowQuestion(
   audioMode: "mic" | "system",
   fallbackText = "",
 ): Promise<EnterWindowResolution> {
-  const queuedQuestions = getUnansweredBackendQuestions(sessionId, 3);
-  if (queuedQuestions.length > 0) {
-    return {
-      prompt: buildQueuedQuestionPrompt(queuedQuestions),
-      displayQuestion: queuedQuestions.length === 1
-        ? queuedQuestions[0]
-        : queuedQuestions.map((question, index) => `${index + 1}. ${question}`).join("\n"),
-      answeredQuestions: queuedQuestions,
-      questionNorms: queuedQuestions.map((question) => normalizeQuestionKey(question)).filter(Boolean),
-      advanceCursorOnSuccess: true,
-    };
-  }
-
   const state = getMeetingState(sessionId);
   const hasPendingTranscript = state.finals.length > state.lastAnsweredFinalIndex || Boolean((state.partialText || "").trim());
+  const snapshotText = hasPendingTranscript ? getSnapshotFromCursor(sessionId, 3000, 0) : "";
+  const currentWindowHash = buildQuestionWindowHash(snapshotText);
   if (hasPendingTranscript) {
-    const snapshotText = getSnapshotFromCursor(sessionId, 3000, 0);
+    const framedWindow = frameQuestionWindow(snapshotText, { previousQuestion: state.lastPrompt });
+    if (framedWindow.answerability !== "complete" || framedWindow.questions.length === 0) {
+      return {
+        prompt: "",
+        displayQuestion: "",
+        answeredQuestions: [],
+        questionNorms: [],
+        advanceCursorOnSuccess: false,
+        windowHash: currentWindowHash,
+        reusedPreviousQuestion: false,
+      };
+    }
+
     const recentFinals = getRecentFinals(sessionId, 6);
     const decision = await orchestrate({
       meetingId: sessionId,
@@ -468,34 +475,59 @@ async function resolveEnterWindowQuestion(
         answeredQuestions,
         questionNorms: decision.questionNorms || [],
         advanceCursorOnSuccess: true,
+        windowHash: currentWindowHash,
+        reusedPreviousQuestion: false,
       };
     }
+
+    return {
+      prompt: "",
+      displayQuestion: "",
+      answeredQuestions: [],
+      questionNorms: [],
+      advanceCursorOnSuccess: false,
+      windowHash: currentWindowHash,
+      reusedPreviousQuestion: false,
+    };
   }
 
-  const fallbackQuestion = hasPendingTranscript
-    ? ""
-    : (
-      state.lastPrompt
-      || fallbackText.trim()
-      || ""
-    );
+  const queuedQuestions = getUnansweredBackendQuestions(sessionId, 3);
+  if (queuedQuestions.length > 0) {
+    return {
+      prompt: buildQueuedQuestionPrompt(queuedQuestions),
+      displayQuestion: queuedQuestions.length === 1
+        ? queuedQuestions[0]
+        : queuedQuestions.map((question, index) => `${index + 1}. ${question}`).join("\n"),
+      answeredQuestions: queuedQuestions,
+      questionNorms: queuedQuestions.map((question) => normalizeQuestionKey(question)).filter(Boolean),
+      advanceCursorOnSuccess: true,
+      windowHash: queuedQuestions.map((question) => normalizeQuestionKey(question)).join("|"),
+      reusedPreviousQuestion: false,
+    };
+  }
+
+  const fallbackQuestion = state.lastPrompt || fallbackText.trim() || "";
 
   if (fallbackQuestion) {
     return {
-      prompt: `Continue answering: "${fallbackQuestion}"`,
+      prompt: fallbackQuestion,
       displayQuestion: fallbackQuestion,
       answeredQuestions: [],
       questionNorms: [],
       advanceCursorOnSuccess: false,
+      windowHash: state.lastAnsweredWindowHash || buildQuestionWindowHash(fallbackQuestion),
+      reusedPreviousQuestion: true,
     };
   }
 
   return {
-    prompt: "[Continue with latest interviewer context]",
+    prompt: "",
     displayQuestion: "",
     answeredQuestions: [],
     questionNorms: [],
     advanceCursorOnSuccess: false,
+    windowHash: "",
+    reusedPreviousQuestion: false,
   };
 }
 
@@ -681,6 +713,8 @@ export function setupWsAnswer(httpServer: Server): void {
           let backendQuestionNorms: string[] = [];
           let advanceBackendCursorOnSuccess = false;
           let queuedBackendQuestions: string[] = [];
+          let resolvedWindowHash = "";
+          let reusedPreviousQuestion = false;
 
           if (useBackendEnterWindow) {
             const enterResolution = await resolveEnterWindowQuestion(sessionId, audioMode, questionText);
@@ -690,6 +724,8 @@ export function setupWsAnswer(httpServer: Server): void {
             backendQuestionNorms = enterResolution.questionNorms.slice();
             advanceBackendCursorOnSuccess = enterResolution.advanceCursorOnSuccess;
             queuedBackendQuestions = backendAnsweredQuestions.slice();
+            resolvedWindowHash = enterResolution.windowHash;
+            reusedPreviousQuestion = enterResolution.reusedPreviousQuestion;
           } else {
             queuedBackendQuestions = requestMode === "enter" && submitSource !== "interpreted"
               ? getUnansweredBackendQuestions(sessionId, 3)
@@ -707,6 +743,16 @@ export function setupWsAnswer(httpServer: Server): void {
               backendQuestionNorms = queuedBackendQuestions.map((question) => normalizeQuestionKey(question)).filter(Boolean);
               advanceBackendCursorOnSuccess = true;
             }
+          }
+
+          if (useBackendEnterWindow && !questionForStream.trim()) {
+            safeSend(ws, {
+              type: "no_question",
+              sessionId,
+              requestId: "",
+              reason: "insufficient_context",
+            });
+            return;
           }
 
           const QUESTION_WORD_RE = /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are|tell|walk|explain)\b/i;
@@ -754,7 +800,7 @@ export function setupWsAnswer(httpServer: Server): void {
           }
 
           // #3: Incomplete/empty transcript — anchor to last known question so answer is always contextual
-          if (questionForStream === "[Continue]" || questionForStream.trim().length === 0) {
+          if (!useBackendEnterWindow && (questionForStream === "[Continue]" || questionForStream.trim().length === 0)) {
             const prevQ = lastQuestionBySession.get(sessionId);
             if (prevQ && prevQ !== "[Continue]") {
               questionForStream = `Continue answering: "${prevQ}"`;
@@ -792,10 +838,10 @@ export function setupWsAnswer(httpServer: Server): void {
           }
 
           // #5: Recency amplification — boost detection of topic that appeared in last answer
-          lastQuestionBySession.set(sessionId, questionForStream);
+          lastQuestionBySession.set(sessionId, displayQuestionForUi || questionForStream);
 
           // If questionForStream normalized to empty, anchor to last known question so Enter always answers
-          if (!questionForStream.trim() || normalizeQuestionForSimilarity(questionForStream) === "") {
+          if (!useBackendEnterWindow && (!questionForStream.trim() || normalizeQuestionForSimilarity(questionForStream) === "")) {
             const prevQ = lastQuestionBySession.get(sessionId);
             questionForStream = prevQ && prevQ !== "[Continue]"
               ? `Continue answering: "${prevQ}"`
@@ -981,8 +1027,16 @@ export function setupWsAnswer(httpServer: Server): void {
             if (advanceBackendCursorOnSuccess) {
               advanceCursor(sessionId);
             }
+            if (resolvedWindowHash) {
+              setLastAnsweredWindowHash(sessionId, resolvedWindowHash);
+            }
           } else if (!fastCancelled && emittedChunkCount > 0 && advanceBackendCursorOnSuccess) {
             advanceCursor(sessionId);
+            if (resolvedWindowHash) {
+              setLastAnsweredWindowHash(sessionId, resolvedWindowHash);
+            }
+          } else if (!fastCancelled && emittedChunkCount > 0 && reusedPreviousQuestion && resolvedWindowHash) {
+            setLastAnsweredWindowHash(sessionId, resolvedWindowHash);
           }
 
           // --- TYPED REFINEMENT PASS ---

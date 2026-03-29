@@ -57,9 +57,11 @@ type LatestScreenContext = {
   capturedAt: number;
 };
 type TranscriptQuestionDetection = {
+  segmentKey: string;
   rawText: string;
   cleanQuestion: string;
   confidence: number;
+  labels?: string[];
   ts: number;
 };
 
@@ -911,26 +913,29 @@ export default function MeetingSession() {
     });
   }, []);
 
-  const rememberTranscriptQuestionDetection = useCallback((rawText: string, cleanQuestion: string, confidence: number) => {
+  const rememberTranscriptQuestionDetection = useCallback((segmentKey: string, rawText: string, cleanQuestion: string, confidence: number, labels?: string[]) => {
+    const key = String(segmentKey || "").trim();
     const raw = String(rawText || "").trim();
     const clean = String(cleanQuestion || "").trim();
-    const norm = normalizeForDedup(raw);
-    if (!raw || !clean || !norm) return;
+    if (!key || !raw || !clean) return;
     setTranscriptQuestionDetections((prev) => ({
       ...prev,
-      [norm]: {
+      [key]: {
+        segmentKey: key,
         rawText: raw,
         cleanQuestion: clean,
         confidence,
+        labels,
         ts: Date.now(),
       },
     }));
     rememberRealtimeInterviewerQuestion(clean);
   }, [rememberRealtimeInterviewerQuestion]);
 
-  const detectTranscriptQuestionRealtime = useCallback(async (text: string) => {
+  const detectTranscriptQuestionRealtime = useCallback(async (text: string, segmentKey: string) => {
     const clean = String(text || "").trim();
-    if (!id || !clean) return;
+    const key = String(segmentKey || "").trim();
+    if (!id || !clean || !key) return;
     try {
       const res = await fetch(`/api/meetings/${id}/detect-turn`, {
         method: "POST",
@@ -938,13 +943,20 @@ export default function MeetingSession() {
         credentials: "include",
         body: JSON.stringify({
           text: clean,
+          segmentKey: key,
           audioMode,
         }),
       });
       if (!res.ok) return;
       const data = await res.json();
-      if (data?.is_question && typeof data?.clean_question === "string" && data.clean_question.trim()) {
-        rememberTranscriptQuestionDetection(clean, data.clean_question, Number(data.confidence || 0));
+      const framedQuestion = typeof data?.framed?.clean_question === "string" ? data.framed.clean_question.trim() : "";
+      const cleanQuestion = typeof data?.clean_question === "string" ? data.clean_question.trim() : "";
+      const chosenQuestion = framedQuestion || cleanQuestion;
+      if (data?.recorded && chosenQuestion) {
+        const labels = Array.isArray(data?.framed?.labels)
+          ? data.framed.labels.filter((label: unknown) => typeof label === "string")
+          : undefined;
+        rememberTranscriptQuestionDetection(key, clean, chosenQuestion, Number(data.confidence || 0), labels);
       }
     } catch (error) {
       console.warn("[meeting] realtime detect-turn failed", error);
@@ -4202,6 +4214,19 @@ export default function MeetingSession() {
         const msg = JSON.parse(String(event.data || "{}"));
         if (msg?.sessionId && msg.sessionId !== id) return;
 
+        if (msg.type === "no_question") {
+          clearFirstChunkWatchdog();
+          setIsStreaming(false);
+          setIsAwaitingFirstChunk(false);
+          isAwaitingFirstChunkRef.current = false;
+          setStreamingQuestion("");
+          setStreamingAnswer("");
+          setPendingResponse(null);
+          activeWsStreamIdRef.current = "";
+          interviewStateRef.current = "listening";
+          return;
+        }
+
         if (msg.type === "assistant_start") {
           console.log("[ws] assistant_start received", { requestId: msg.requestId, sessionId: msg.sessionId });
           activeWsStreamIdRef.current = String(msg.requestId || "");
@@ -4896,6 +4921,7 @@ export default function MeetingSession() {
       setPendingTranscriptLine(suppressPendingStray ? "" : segmentForDisplay);
       upsertDisplayTranscriptSegment(segmentForDisplay);
     }
+    const latestDisplaySegmentKey = displaySegmentKeysRef.current[0] || "";
     schedulePendingTranscriptFlush();
 
     // No auto-fire: answers only triggered by Enter key press.
@@ -5151,7 +5177,7 @@ export default function MeetingSession() {
       transcriptPersistQueueRef.current.push(turn);
       scheduleTranscriptPersistFlush(socketConnected ? 4000 : 250);
       if (speaker === "interviewer" || speaker === "unknown") {
-        void detectTranscriptQuestionRealtime(trimmed);
+        void detectTranscriptQuestionRealtime(trimmed, latestDisplaySegmentKey);
       }
     } catch (e) {
       console.error("[meeting] turn finalize/detect failed", e);
@@ -7784,8 +7810,7 @@ export default function MeetingSession() {
       .join("\n")
       .trim();
     const backendWindowHint =
-      recentQuestions[0]?.trim()
-      || pendingSnapshot
+      pendingSnapshot
       || draftSnapshot
       || latestSegmentSnapshot
       || interimSnapshot
@@ -7811,7 +7836,7 @@ export default function MeetingSession() {
         type: "question",
         sessionId: id,
         text: "",
-        force: true,
+        force: false,
         format: responseFormat === "custom" ? "custom" : responseFormat,
         model: selectedModel,
         quickMode: quickResponseMode,
@@ -7992,7 +8017,7 @@ export default function MeetingSession() {
         type: "question",
         sessionId: id,
         text: safeSeed.seedText,
-        force: true,
+        force: false,
         format: resolveFormat(safeSeed.seedText),
         model: selectedModel,
         quickMode: quickResponseMode,
@@ -9329,14 +9354,18 @@ export default function MeetingSession() {
                           ? [liveText, ...displayTranscriptSegments.filter((seg) => normalizeForDedup(seg) !== normalizeForDedup(liveText))]
                           : displayTranscriptSegments).slice(0, 15);
                         return rows.map((seg, i) => {
-                          const normalizedSeg = normalizeForDedup(seg);
-                          const detection = normalizedSeg ? transcriptQuestionDetections[normalizedSeg] : undefined;
+                          const rowKey = i === 0 && liveText
+                            ? "live-current"
+                            : (displayTranscriptSegmentKeys[liveText ? i - 1 : i] || `${seg}-${i}`);
+                          const detection = rowKey === "live-current"
+                            ? undefined
+                            : transcriptQuestionDetections[rowKey];
                           const renderedText = detection?.cleanQuestion
                             ? (/[?]$/.test(detection.cleanQuestion.trim()) ? detection.cleanQuestion.trim() : `${detection.cleanQuestion.trim()}?`)
                             : seg;
                           return (
                             <div
-                              key={i === 0 && liveText ? "live-current" : (displayTranscriptSegmentKeys[liveText ? i - 1 : i] || `${seg}-${i}`)}
+                              key={rowKey}
                               className="rounded px-2 py-1.5"
                               data-testid={i === 0 && liveText ? "text-segment-live" : `text-segment-${i}`}
                             >

@@ -707,22 +707,20 @@ export async function runDetectionPipeline(
   }
 
   // Fast-path: standalone tech term (≤3 words, no other question structure)
-  // LLM classifier cannot reliably classify "Flask" alone — bypass all 3 LLM calls.
+  // Treat as a fragment, not a full interviewer question. Bare topics should only
+  // become answerable when a later turn completes or strongly anchors them.
   const rawWords = rawText.trim().split(/\s+/).filter(Boolean);
   if (rawWords.length <= 3 && STANDALONE_TECH_RE.test(rawText) && !INTERVIEW_SIGNAL_RE.test(rawText.toLowerCase())) {
-    const cleanQuestion = `Do you have experience with ${rawText}?`;
-    const normalizedForDedup = normalizeForDedup(cleanQuestion);
-    if (isDuplicateQuestion(sessionId, normalizedForDedup)) {
-      return {
-        isQuestion: false, rawText, questionSpan: rawText, cleanQuestion,
-        type: "technical", confidence: 0.75, notes: "Duplicate suppressed",
-        passedRuleGate: true, passedLLMClassifier: true,
-      };
-    }
     return {
-      isQuestion: true, rawText, questionSpan: rawText, cleanQuestion,
-      type: "technical", confidence: 0.75, notes: "Standalone tech term fast-path",
-      passedRuleGate: true, passedLLMClassifier: true,
+      isQuestion: false,
+      rawText,
+      questionSpan: rawText,
+      cleanQuestion: rawText,
+      type: "technical",
+      confidence: 0.45,
+      notes: "Standalone tech fragment",
+      passedRuleGate: false,
+      passedLLMClassifier: false,
     };
   }
 
