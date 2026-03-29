@@ -3,16 +3,16 @@ import type { Server, IncomingMessage } from "http";
 import { URL } from "url";
 import { storage } from "../storage";
 import { streamAssistantAnswer, abortSessionStream, hasActiveStream } from "../assist/streamAssistantAnswer";
-import { getLastUnansweredInterviewerQuestion, getLatestSpokenReply, markInterviewerQuestionAnswered, recordUserQuestion, getCodingProblemState, buildInterviewerIntelligenceBlock } from "../assist/sessionState";
+import { markInterviewerQuestionAnswered, recordUserQuestion, getCodingProblemState, buildInterviewerIntelligenceBlock } from "../assist/sessionState";
 import {
   getState as getMeetingState,
   getSnapshotFromCursor,
   advanceCursor,
   markAnswered as markAnsweredInStore,
-  normalizeQuestionKey,
+  markGeneratedTopic,
+  getLastGeneratedTopic,
   getActiveQuestion,
   setActiveQuestion,
-  getUnanswered as getUnansweredInStore,
   setLastAnsweredWindowHash,
 } from "./meetingStore";
 import {
@@ -397,24 +397,6 @@ function safeSend(ws: WebSocket, payload: unknown) {
   }
 }
 
-function getUnansweredBackendQuestions(sessionId: string, maxItems = 3, maxAgeMs = 90_000): string[] {
-  const now = Date.now();
-  const seen = new Set<string>();
-  return getUnansweredInStore(sessionId, maxItems * 3)
-    .filter((item) => (now - item.ts) <= maxAgeMs)
-    .slice()
-    .sort((a, b) => b.ts - a.ts)
-    .map((item) => String(item.clean || "").trim())
-    .filter(Boolean)
-    .filter((question) => {
-      const norm = normalizeQuestionForSimilarity(question);
-      if (!norm || seen.has(norm)) return false;
-      seen.add(norm);
-      return true;
-    })
-    .slice(0, maxItems);
-}
-
 function buildQueuedQuestionPrompt(questions: string[]): string {
   if (questions.length <= 1) return questions[0] || "";
   return `Answer these interviewer questions separately in order:\n${questions.map((question, index) => `${index + 1}. ${question}`).join("\n")}`;
@@ -428,7 +410,7 @@ type EnterWindowResolution = {
   advanceCursorOnSuccess: boolean;
   windowHash: string;
   reusedPreviousQuestion: boolean;
-  reason?: "cooldown" | "no_active_question" | "insufficient_context";
+  reason?: "cooldown" | "no_active_question" | "insufficient_context" | "nothing_new";
 };
 
 const GENERATE_COOLDOWN_MS = 5000;
@@ -440,6 +422,8 @@ async function resolveEnterWindowQuestion(
   liveTranscript = "",
 ): Promise<EnterWindowResolution> {
   const state = getMeetingState(sessionId);
+  const lastGenerated = getLastGeneratedTopic(sessionId);
+  const activeQuestion = getActiveQuestion(sessionId);
   const now = Date.now();
   const hasPendingTranscript = state.finals.length > state.lastAnsweredFinalIndex || Boolean((state.partialText || "").trim());
   const snapshotText = hasPendingTranscript ? getSnapshotFromCursor(sessionId, 3000, 0) : "";
@@ -447,15 +431,14 @@ async function resolveEnterWindowQuestion(
   const windowSource = snapshotText || fallbackTranscript;
   const currentWindowHash = buildQuestionWindowHash(windowSource);
   const previousQuestion =
-    getActiveQuestion(sessionId)?.clean
+    activeQuestion?.clean
+    || lastGenerated.question
     || state.lastPrompt
-    || getLastUnansweredInterviewerQuestion(sessionId)?.text
     || fallbackText.trim();
 
   if (windowSource) {
     const framedWindow = resolveActiveQuestionWindow(windowSource, { previousQuestion });
     if (framedWindow.answerability === "complete" && framedWindow.questions.length > 0) {
-      const activeQuestion = getActiveQuestion(sessionId);
       const activeSupersedesWindow = Boolean(
         activeQuestion?.clean
         && framedWindow.cleanQuestion
@@ -473,7 +456,7 @@ async function resolveEnterWindowQuestion(
       const prompt = answeredQuestions.length > 1
         ? buildQueuedQuestionPrompt(answeredQuestions)
         : (answeredQuestions[0] || framedWindow.cleanQuestion);
-      const repeatedWindow = Boolean(currentWindowHash && state.lastAnsweredWindowHash && currentWindowHash === state.lastAnsweredWindowHash);
+      const repeatedWindow = Boolean(currentWindowHash && lastGenerated.windowHash && currentWindowHash === lastGenerated.windowHash);
       if (repeatedWindow && state.lastAnswerAt && (now - state.lastAnswerAt) < GENERATE_COOLDOWN_MS) {
         return {
           prompt: "",
@@ -486,6 +469,18 @@ async function resolveEnterWindowQuestion(
           reason: "cooldown",
         };
       }
+      if (repeatedWindow && lastGenerated.repeatCount >= 1) {
+        return {
+          prompt: "",
+          displayQuestion: "",
+          answeredQuestions: [],
+          questionNorms: [],
+          advanceCursorOnSuccess: false,
+          windowHash: currentWindowHash,
+          reusedPreviousQuestion: false,
+          reason: "nothing_new",
+        };
+      }
       return {
         prompt,
         displayQuestion,
@@ -496,30 +491,6 @@ async function resolveEnterWindowQuestion(
         reusedPreviousQuestion: false,
       };
     }
-    if (currentWindowHash && state.lastAnsweredWindowHash && currentWindowHash === state.lastAnsweredWindowHash && previousQuestion) {
-      if (state.lastAnswerAt && (now - state.lastAnswerAt) < GENERATE_COOLDOWN_MS) {
-        return {
-          prompt: "",
-          displayQuestion: "",
-          answeredQuestions: [],
-          questionNorms: [],
-          advanceCursorOnSuccess: false,
-          windowHash: currentWindowHash,
-          reusedPreviousQuestion: false,
-          reason: "cooldown",
-        };
-      }
-      return {
-        prompt: previousQuestion,
-        displayQuestion: previousQuestion,
-        answeredQuestions: [],
-        questionNorms: [],
-        advanceCursorOnSuccess: false,
-        windowHash: currentWindowHash,
-        reusedPreviousQuestion: true,
-      };
-    }
-
     return {
       prompt: "",
       displayQuestion: "",
@@ -532,7 +503,11 @@ async function resolveEnterWindowQuestion(
     };
   }
 
-  const fallbackQuestion = previousQuestion || "";
+  const fallbackQuestion = activeQuestion?.clean || previousQuestion || "";
+  const fallbackWindowHash =
+    activeQuestion?.windowHash
+    || lastGenerated.windowHash
+    || buildQuestionWindowHash(fallbackQuestion);
 
   if (fallbackQuestion) {
     if (state.lastAnswerAt && (now - state.lastAnswerAt) < GENERATE_COOLDOWN_MS) {
@@ -542,9 +517,21 @@ async function resolveEnterWindowQuestion(
         answeredQuestions: [],
         questionNorms: [],
         advanceCursorOnSuccess: false,
-        windowHash: state.lastAnsweredWindowHash || buildQuestionWindowHash(fallbackQuestion),
+        windowHash: fallbackWindowHash,
         reusedPreviousQuestion: false,
         reason: "cooldown",
+      };
+    }
+    if (lastGenerated.windowHash === fallbackWindowHash && lastGenerated.repeatCount >= 1) {
+      return {
+        prompt: "",
+        displayQuestion: "",
+        answeredQuestions: [],
+        questionNorms: [],
+        advanceCursorOnSuccess: false,
+        windowHash: fallbackWindowHash,
+        reusedPreviousQuestion: false,
+        reason: "nothing_new",
       };
     }
     return {
@@ -553,7 +540,7 @@ async function resolveEnterWindowQuestion(
       answeredQuestions: [],
       questionNorms: [],
       advanceCursorOnSuccess: false,
-      windowHash: state.lastAnsweredWindowHash || buildQuestionWindowHash(fallbackQuestion),
+      windowHash: fallbackWindowHash,
       reusedPreviousQuestion: true,
     };
   }
@@ -744,14 +731,12 @@ export function setupWsAnswer(httpServer: Server): void {
           const requestMode = typeof metadata.mode === "string" ? metadata.mode : "enter";
           const audioMode = metadata.audioMode === "mic" ? "mic" : "system";
           const useBackendEnterWindow = requestMode === "enter" && submitSource === "enter_window";
-          const lastUnanswered = getLastUnansweredInterviewerQuestion(sessionId);
-          const latestSpokenReply = getLatestSpokenReply(sessionId);
           let questionForStream = "";
           let displayQuestionForUi = "";
           let backendAnsweredQuestions: string[] = [];
           let backendQuestionNorms: string[] = [];
           let advanceBackendCursorOnSuccess = false;
-          let queuedBackendQuestions: string[] = [];
+          const queuedBackendQuestions: string[] = [];
           let resolvedWindowHash = "";
           let reusedPreviousQuestion = false;
           let enterIgnoredReason: EnterWindowResolution["reason"];
@@ -768,35 +753,42 @@ export function setupWsAnswer(httpServer: Server): void {
             backendAnsweredQuestions = enterResolution.answeredQuestions.slice();
             backendQuestionNorms = enterResolution.questionNorms.slice();
             advanceBackendCursorOnSuccess = enterResolution.advanceCursorOnSuccess;
-            queuedBackendQuestions = backendAnsweredQuestions.slice();
             resolvedWindowHash = enterResolution.windowHash;
             reusedPreviousQuestion = enterResolution.reusedPreviousQuestion;
             enterIgnoredReason = enterResolution.reason;
           } else {
-            queuedBackendQuestions = requestMode === "enter" && submitSource !== "interpreted"
-              ? getUnansweredBackendQuestions(sessionId, 3)
-              : [];
-            const primarySeed =
-              (multiQuestionMode
-                ? questionText.trim()
-                : (extractStrictInterviewerQuestion(questionText.trim()) || extractLatestMergedSegment(questionText.trim())));
-            questionForStream = primarySeed
-              ? primarySeed
-              : chooseBestQuestionSeed([lastUnanswered?.text, latestSpokenReply?.text, "[Continue]"]);
-            backendAnsweredQuestions = queuedBackendQuestions.slice();
-            if (queuedBackendQuestions.length > 0) {
-              questionForStream = buildQueuedQuestionPrompt(queuedBackendQuestions);
-              backendQuestionNorms = queuedBackendQuestions.map((question) => normalizeQuestionKey(question)).filter(Boolean);
-              advanceBackendCursorOnSuccess = true;
-            }
+            const activeSeed =
+              getActiveQuestion(sessionId)?.clean
+              || getLastGeneratedTopic(sessionId).question
+              || "";
+            const explicitFrame = resolveActiveQuestionWindow(questionText.trim(), {
+              previousQuestion: activeSeed,
+            });
+            questionForStream = explicitFrame.isQuestion
+              ? (
+                multiQuestionMode && explicitFrame.questions.length > 1
+                  ? buildQueuedQuestionPrompt(explicitFrame.questions.map((item) => item.text))
+                  : explicitFrame.cleanQuestion
+              )
+              : questionText.trim();
+            displayQuestionForUi = explicitFrame.isQuestion
+              ? (
+                explicitFrame.questions.length > 1
+                  ? explicitFrame.questions.map((item, index) => `${index + 1}. ${item.text}`).join("\n")
+                  : explicitFrame.cleanQuestion
+              )
+              : questionText.trim();
+            resolvedWindowHash = explicitFrame.windowHash || buildQuestionWindowHash(questionText.trim());
           }
 
-          if (useBackendEnterWindow && !questionForStream.trim()) {
+          if (!questionForStream.trim()) {
             safeSend(ws, {
               type: "request_ignored",
               sessionId,
               requestId: "",
-              reason: enterIgnoredReason || "insufficient_context",
+              reason: useBackendEnterWindow
+                ? (enterIgnoredReason || "insufficient_context")
+                : "no_active_question",
             });
             return;
           }
@@ -805,12 +797,9 @@ export function setupWsAnswer(httpServer: Server): void {
           const normalizedQuestionForStream = normalizeQuestionFragment(questionForStream);
 
           // #1b: Only anchor genuine follow-up cues, not generic acknowledgements or every single-word fragment.
-          const shouldAnchorShortFollowup =
-            queuedBackendQuestions.length === 0 &&
-            !KNOWN_TECH_TERM_RE.test(normalizedQuestionForStream)
-            && STRICT_ANCHORABLE_FOLLOWUP_RE.test(questionForStream.trim());
+          const shouldAnchorShortFollowup = false;
           if (shouldAnchorShortFollowup) {
-            const prevQ = lastQuestionBySession.get(sessionId);
+            const prevQ = lastQuestionBySession.get(sessionId) || "";
             if (prevQ && prevQ !== "[Continue]") {
               questionForStream = `${questionForStream.trim()} (follow-up to: "${prevQ}")`;
               console.log(`[ws/answer] anchored_short_utterance sessionId=${sessionId}`, { expanded: questionForStream });
@@ -820,9 +809,9 @@ export function setupWsAnswer(httpServer: Server): void {
           // #2: Continuation stitching — only append onto prior questions when the previous
           // question is actually a topic-appendable one like experience/background/used-with.
           const connectorMatch = CONNECTOR_PREFIX_RE.exec(questionForStream);
-          if (connectorMatch && queuedBackendQuestions.length === 0) {
-            const tail = questionForStream.slice(connectorMatch[0].length).trim();
-            const prevQ = lastQuestionBySession.get(sessionId);
+          if (connectorMatch && false && queuedBackendQuestions.length === 0) {
+            const tail = questionForStream.slice((connectorMatch?.[0] || "").length).trim();
+            const prevQ = lastQuestionBySession.get(sessionId) || "";
             if (prevQ && prevQ !== "[Continue]" && isTopicAppendableQuestion(prevQ) && isSafeTopicTail(tail)) {
               const prevNoQ = prevQ.replace(/\?\s*$/, "").trim();
               questionForStream = `${prevNoQ} and also ${tail}?`;
@@ -836,8 +825,8 @@ export function setupWsAnswer(httpServer: Server): void {
             && !QUESTION_WORD_RE.test(questionForStream.trim())
             && !questionForStream.includes("?")
             && questionForStream.trim().split(/\s+/).filter(Boolean).length <= 4;
-          if (bareTopicOnly && queuedBackendQuestions.length === 0) {
-            const prevQ = lastQuestionBySession.get(sessionId);
+          if (false && bareTopicOnly && queuedBackendQuestions.length === 0) {
+            const prevQ = lastQuestionBySession.get(sessionId) || "";
             if (prevQ && prevQ !== "[Continue]" && isTopicAppendableQuestion(prevQ) && isSafeTopicTail(questionForStream)) {
               const prevNoQ = prevQ.replace(/\?\s*$/, "").trim();
               questionForStream = `${prevNoQ} and also ${questionForStream.trim()}?`;
@@ -846,8 +835,8 @@ export function setupWsAnswer(httpServer: Server): void {
           }
 
           // #3: Incomplete/empty transcript — anchor to last known question so answer is always contextual
-          if (!useBackendEnterWindow && (questionForStream === "[Continue]" || questionForStream.trim().length === 0)) {
-            const prevQ = lastQuestionBySession.get(sessionId);
+          if (false && !useBackendEnterWindow && (questionForStream === "[Continue]" || questionForStream.trim().length === 0)) {
+            const prevQ = lastQuestionBySession.get(sessionId) || "";
             if (prevQ && prevQ !== "[Continue]") {
               questionForStream = `Continue answering: "${prevQ}"`;
               console.log(`[ws/answer] anchored_incomplete sessionId=${sessionId}`, { anchor: questionForStream });
@@ -893,45 +882,30 @@ export function setupWsAnswer(httpServer: Server): void {
           lastQuestionBySession.set(sessionId, displayQuestionForUi || questionForStream);
 
           // If questionForStream normalized to empty, anchor to last known question so Enter always answers
-          if (!useBackendEnterWindow && (!questionForStream.trim() || normalizeQuestionForSimilarity(questionForStream) === "")) {
-            const prevQ = lastQuestionBySession.get(sessionId);
+          if (false && !useBackendEnterWindow && (!questionForStream.trim() || normalizeQuestionForSimilarity(questionForStream) === "")) {
+            const prevQ = lastQuestionBySession.get(sessionId) || "";
             questionForStream = prevQ && prevQ !== "[Continue]"
               ? `Continue answering: "${prevQ}"`
               : "[Continue with latest interviewer context]";
             lastQuestionBySession.set(sessionId, questionForStream);
           }
           if (!displayQuestionForUi.trim()) {
-            if (queuedBackendQuestions.length > 0) {
-              displayQuestionForUi = queuedBackendQuestions.length === 1
-                ? queuedBackendQuestions[0]
-                : queuedBackendQuestions.map((question, index) => `${index + 1}. ${question}`).join("\n");
-            } else {
-              displayQuestionForUi = questionForStream
-                .replace(/^Answer these interviewer questions separately in order:\s*/i, "")
-                .replace(/^Interview topic or prompt:\s*/i, "")
-                .replace(/^Continue answering:\s*/i, "")
-                .replace(/^["[]|["\]]$/g, "")
-                .trim();
-            }
+            displayQuestionForUi = questionForStream.trim();
           }
           const plainDisplayQuestion = displayQuestionForUi
-            .replace(/^Answer these interviewer questions separately in order:\s*/i, "")
-            .replace(/^Interview topic or prompt:\s*/i, "")
-            .replace(/^Continue answering:\s*/i, "")
-            .replace(/^["[]|["\]]$/g, "")
             .trim()
             .split(/\n+/)
             .map((line) => line.replace(/^\d+\.\s*/, "").trim())
             .filter(Boolean)
             .slice(-1)[0] || "";
-          if (plainDisplayQuestion && !/^Continue answering:/i.test(questionForStream)) {
+          if (plainDisplayQuestion) {
             const activeState = getMeetingState(sessionId);
             activeState.lastPrompt = plainDisplayQuestion;
             setActiveQuestion(sessionId, plainDisplayQuestion, Date.now(), {
               windowHash: resolvedWindowHash || buildQuestionWindowHash(plainDisplayQuestion),
             });
           }
-          const fp = normalizeQuestionForSimilarity(questionForStream) || "continue";
+          const fp = normalizeQuestionForSimilarity(questionForStream) || "question";
           if (!force && !useBackendEnterWindow && isRecentDuplicate(sessionId, fp, questionText)) {
             console.log(`[ws/answer] duplicate suppressed sessionId=${sessionId} fp="${fp.slice(0, 60)}"`);
             safeSend(ws, {
@@ -1116,6 +1090,14 @@ export function setupWsAnswer(httpServer: Server): void {
             }
           } else if (!fastCancelled && emittedChunkCount > 0 && reusedPreviousQuestion && resolvedWindowHash) {
             setLastAnsweredWindowHash(sessionId, resolvedWindowHash);
+          }
+          if (!fastCancelled && emittedChunkCount > 0) {
+            markGeneratedTopic(
+              sessionId,
+              plainDisplayQuestion || displayQuestionForUi || questionForStream,
+              resolvedWindowHash || buildQuestionWindowHash(plainDisplayQuestion || displayQuestionForUi || questionForStream),
+              Date.now(),
+            );
           }
 
           // --- TYPED REFINEMENT PASS ---

@@ -1116,6 +1116,7 @@ export type QuestionPatternLabel =
 
 export type QuestionAnswerability = "complete" | "fragment" | "no_question";
 export type QuestionAnchor = "none" | "current_window" | "previous_answer";
+export type ActiveTopicKind = "complete" | "fragment" | "none" | "multi";
 
 export interface FramedQuestionItem {
   text: string;
@@ -1128,15 +1129,22 @@ export interface FramedQuestionItem {
 export interface FramedQuestionResult {
   rawText: string;
   normalizedText: string;
+  text: string;
+  kind: ActiveTopicKind;
   labels: QuestionPatternLabel[];
   answerability: QuestionAnswerability;
   anchor: QuestionAnchor;
+  followupToPrevious: boolean;
   questions: FramedQuestionItem[];
+  sourceTurnIds: string[];
   windowHash: string;
   confidence: number;
+  stable: boolean;
   cleanQuestion: string;
   isQuestion: boolean;
 }
+
+export type ActiveTopicFrame = FramedQuestionResult;
 
 function simpleStableHash(text: string): string {
   let hash = 2166136261;
@@ -1366,12 +1374,17 @@ export function frameQuestionWindow(
     return {
       rawText,
       normalizedText,
+      text: "",
+      kind: "none",
       labels,
       answerability: "no_question",
       anchor: "none",
+      followupToPrevious: false,
       questions: [],
+      sourceTurnIds: [],
       windowHash,
       confidence: 0,
+      stable: false,
       cleanQuestion: "",
       isQuestion: false,
     };
@@ -1432,15 +1445,20 @@ export function frameQuestionWindow(
   return {
     rawText,
     normalizedText,
+    text: questions[0]?.text || "",
+    kind: questions.length > 1 ? "multi" : answerability === "no_question" ? "none" : answerability,
     labels: Array.from(new Set<QuestionPatternLabel>([
       ...labels,
       ...(questions.length > 1 ? ["multi_question"] as QuestionPatternLabel[] : []),
     ])),
     answerability,
     anchor,
+    followupToPrevious: false,
     questions,
+    sourceTurnIds: [],
     windowHash,
     confidence,
+    stable: answerability === "complete" && confidence >= 0.7,
     cleanQuestion: questions[0]?.text || "",
     isQuestion: answerability === "complete" && questions.length > 0,
   };
@@ -1468,9 +1486,12 @@ export function resolveActiveQuestionWindow(
   const mergedConfidence = Math.max(base.confidence, 0.8);
   return {
     ...base,
+    text: mergedQuestion,
+    kind: "complete",
     labels: mergedLabels,
     answerability: "complete",
     anchor: "previous_answer",
+    followupToPrevious: true,
     questions: [{
       text: mergedQuestion,
       norm: normalizeForDedup(mergedQuestion),
@@ -1479,6 +1500,7 @@ export function resolveActiveQuestionWindow(
       answerability: "complete",
     }],
     confidence: mergedConfidence,
+    stable: true,
     cleanQuestion: mergedQuestion,
     isQuestion: true,
   };

@@ -7863,9 +7863,9 @@ export default function MeetingSession() {
       setLastSubmitSource("enter_window");
       lastEnterSeedRef.current = { text: backendWindowHint, ts: now };
       lastEnterSegmentCountRef.current = segmentsRef.current.length;
-      setInterpretedQuestion(backendWindowHint || INTERPRETED_PLACEHOLDER);
-      setStreamingQuestion(backendWindowHint || "Answering...");
-      showOptimisticAssistantState(backendWindowHint || "Answering...");
+      setInterpretedQuestion(INTERPRETED_PLACEHOLDER);
+      setStreamingQuestion("Generating...");
+      showOptimisticAssistantState("Generating...");
       startFirstChunkWatchdog("enter_window");
       pendingQuestionForRequestRef.current = backendWindowHint;
       wsAnswerRef.current.send(JSON.stringify({
@@ -8323,7 +8323,10 @@ export default function MeetingSession() {
   const buildScreenAnalysisContext = useCallback(() => {
     const interpreted = interpretedQuestionRef.current.trim();
     const streamQuestion = streamingQuestionRef.current.trim();
-    const latestQuestion = interpreted || streamQuestion || recentQuestions[0] || "";
+    const latestFramedQuestion = interviewerQuestionMemoryRef.current
+      .map((q) => cleanDetectedInterviewQuestion(String(q.text || "").trim()))
+      .find(Boolean) || "";
+    const latestQuestion = interpreted || streamQuestion || latestFramedQuestion || "";
     const latestQuestionLooksCodeRelated =
       isCodeRequestQuestion(latestQuestion)
       || isExplainFollowup(latestQuestion)
@@ -8392,7 +8395,7 @@ export default function MeetingSession() {
         explanationFirstSuffix,
       ].join("\n"),
     };
-  }, [meeting, recentQuestions, isCodeRequestQuestion, isExplainFollowup, wantsLineByLineExplanation, isModifyCodeFollowup]);
+  }, [meeting, isCodeRequestQuestion, isExplainFollowup, wantsLineByLineExplanation, isModifyCodeFollowup]);
 
   const stopVisionScreenShare = useCallback(() => {
     const stream = getLiveVisionStream();

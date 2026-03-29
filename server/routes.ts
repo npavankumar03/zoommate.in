@@ -2781,6 +2781,7 @@ Return ONLY valid JSON. No explanation, no markdown, no code fences. Just the JS
       const isLikelyQuestion =
         framed.answerability === "complete"
         && framed.questions.length > 0
+        && framed.stable
         && Math.max(advanced.confidence, framed.confidence) >= 0.72;
       const normalizedTurn = text.toLowerCase().replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim();
       const isShortAck = /^(yes|yeah|yep|yup|correct|right|sure|i do|i did|absolutely|of course|exactly)$/i.test(normalizedTurn);
@@ -2862,6 +2863,7 @@ Return ONLY valid JSON. No explanation, no markdown, no code fences. Just the JS
         result.isQuestion
         && result.confidence >= threshold
         && framed.answerability === "complete"
+        && framed.stable
         && framed.questions.length > 0;
       if (shouldRecordQuestion) {
         const detectedQuestion = framed.cleanQuestion || String(result.cleanQuestion || result.questionSpan || text).trim();
@@ -2890,17 +2892,22 @@ Return ONLY valid JSON. No explanation, no markdown, no code fences. Just the JS
         recorded: shouldRecordQuestion,
         segment_key: segmentKey || undefined,
         framed: {
+          text: framed.text,
+          kind: framed.kind,
           labels: framed.labels,
           answerability: framed.answerability,
           anchor: framed.anchor,
+          followup_to_previous: framed.followupToPrevious,
           questions: framed.questions.map((item) => ({
             text: item.text,
             labels: item.labels,
             confidence: item.confidence,
             answerability: item.answerability,
           })),
+          source_turn_ids: framed.sourceTurnIds,
           window_hash: framed.windowHash,
           confidence: framed.confidence,
+          stable: framed.stable,
           clean_question: framed.cleanQuestion,
         },
       });

@@ -31,6 +31,10 @@ export type MeetingState = {
   lastQuestionExtractTs?: number;
   lastTriggerAt?: number;
   lastAutoTriggerAt?: number;
+  lastGeneratedQuestion?: string;
+  lastGeneratedWindowHash?: string;
+  lastGeneratedAt?: number;
+  lastGeneratedRepeatCount: number;
   recentAskedFingerprints: Array<{ fp: string; ts: number }>;
   partialFingerprint?: string;
   partialFingerprintCount: number;
@@ -68,6 +72,7 @@ function createState(): MeetingState {
     recentQuestions: [],
     questionQueue: [],
     recentAnswers: [],
+    lastGeneratedRepeatCount: 0,
     recentAskedFingerprints: [],
     partialFingerprintCount: 0,
     partialFingerprintSinceTs: 0,
@@ -365,6 +370,38 @@ export function expireOldUnanswered(
 export function setLastAnsweredWindowHash(meetingId: string, windowHash: string): void {
   const s = getState(meetingId);
   s.lastAnsweredWindowHash = String(windowHash || "").trim() || undefined;
+}
+
+export function markGeneratedTopic(
+  meetingId: string,
+  question: string,
+  windowHash: string,
+  ts = Date.now(),
+): void {
+  const s = getState(meetingId);
+  const cleanQuestion = String(question || "").trim();
+  const cleanHash = String(windowHash || "").trim();
+  if (!cleanQuestion && !cleanHash) return;
+  if (cleanHash && s.lastGeneratedWindowHash === cleanHash) {
+    s.lastGeneratedRepeatCount += 1;
+  } else {
+    s.lastGeneratedRepeatCount = 0;
+  }
+  s.lastGeneratedQuestion = cleanQuestion || s.lastGeneratedQuestion;
+  s.lastGeneratedWindowHash = cleanHash || s.lastGeneratedWindowHash;
+  s.lastGeneratedAt = ts;
+}
+
+export function getLastGeneratedTopic(
+  meetingId: string,
+): { question?: string; windowHash?: string; ts?: number; repeatCount: number } {
+  const s = getState(meetingId);
+  return {
+    question: s.lastGeneratedQuestion,
+    windowHash: s.lastGeneratedWindowHash,
+    ts: s.lastGeneratedAt,
+    repeatCount: s.lastGeneratedRepeatCount,
+  };
 }
 
 export function isDuplicateAction(meetingId: string, key: string, windowMs = 12000): boolean {
