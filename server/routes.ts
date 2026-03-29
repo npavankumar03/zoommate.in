@@ -3,7 +3,7 @@ import { createServer, type Server } from "http";
 import crypto from "crypto";
 import { storage } from "./storage";
 import { generateResponse, generateStreamingResponse, analyzeScreen, analyzeScreenStream, analyzeMultiScreenStream, getAvailableModels } from "./openai";
-import { detectQuestion, detectQuestionAdvanced, frameQuestionWindow, normalizeForDedup, isSubstantiveSegment } from "@shared/questionDetection";
+import { detectQuestion, detectQuestionAdvanced, normalizeForDedup, isSubstantiveSegment, resolveActiveQuestionWindow } from "@shared/questionDetection";
 import { invalidateSettingsCache, getPrewarmedOpenAIKey, prewarmApiKey, FAST_MODEL, keepAliveAgent, resolveLLMConfig } from "./llmRouter";
 import { resolveAutomaticInterviewModel } from "./llmRouter2";
 import { streamOpenAIFast } from "./llmStream";
@@ -25,7 +25,7 @@ import { encryptSettingValue, decryptSettingValue } from "./settingsCrypto";
 import { runDetectionPipeline, extractQuestionsWithLLM, composeQuestionWithLLM, normalizeQuestion, isDuplicateQuestion } from "./assist/questionDetect";
 import { streamAssistantAnswer } from "./assist/answerStream";
 import { orchestrate } from "./assist/orchestrator";
-import { getState as getMeetingState, getRecentFinals, setAnswerStyle, getAnswerStyle, setCodeContext, enqueueQuestion } from "./realtime/meetingStore";
+import { getState as getMeetingState, getRecentFinals, setAnswerStyle, getAnswerStyle, setCodeContext, enqueueQuestion, getActiveQuestion, setActiveQuestion } from "./realtime/meetingStore";
 import { recordInterviewerQuestion, recordSpokenReply, getCodingProblemState } from "./assist/sessionState";
 import { getStructuredInterviewAnswer } from "./assist/structuredAnswer";
 import { indexDocumentForRag, retrieveDocumentContext } from "./rag";
@@ -2774,7 +2774,8 @@ Return ONLY valid JSON. No explanation, no markdown, no code fences. Just the JS
       const t0 = Date.now();
 
       const advanced = detectQuestionAdvanced(text);
-      const framed = frameQuestionWindow(text);
+      const activeQuestion = getActiveQuestion(req.params.id)?.clean || "";
+      const framed = resolveActiveQuestionWindow(text, { previousQuestion: activeQuestion });
       const cleanQuestion = framed.cleanQuestion || text.trim();
       // detectQuestionAdvanced is a superset of detectQuestion — use it exclusively to avoid double evaluation
       const isLikelyQuestion =
@@ -2804,6 +2805,11 @@ Return ONLY valid JSON. No explanation, no markdown, no code fences. Just the JS
       if (isLikelyQuestion) {
         recordInterviewerQuestion(req.params.id, cleanQuestion || text);
         enqueueQuestion(req.params.id, cleanQuestion || text, Date.now(), {
+          windowHash: framed.windowHash,
+          answerability: framed.answerability,
+          labels: framed.labels,
+        });
+        setActiveQuestion(req.params.id, cleanQuestion || text, Date.now(), {
           windowHash: framed.windowHash,
           answerability: framed.answerability,
           labels: framed.labels,
@@ -2844,8 +2850,12 @@ Return ONLY valid JSON. No explanation, no markdown, no code fences. Just the JS
         threshold,
       );
 
-      const framed = frameQuestionWindow(String(result.cleanQuestion || result.questionSpan || text).trim(), {
-        previousQuestion: recentContext,
+      const latestRecentTurn = recentTurns[0];
+      const previousQuestion = getActiveQuestion(req.params.id)?.clean
+        || getMeetingState(req.params.id).lastPrompt
+        || String(latestRecentTurn?.cleanQuestion || latestRecentTurn?.text || "").trim();
+      const framed = resolveActiveQuestionWindow(String(result.cleanQuestion || result.questionSpan || text).trim(), {
+        previousQuestion,
       });
 
       const shouldRecordQuestion =
@@ -2860,6 +2870,11 @@ Return ONLY valid JSON. No explanation, no markdown, no code fences. Just the JS
           detectedQuestion,
         );
         enqueueQuestion(req.params.id, detectedQuestion, Date.now(), {
+          windowHash: framed.windowHash,
+          answerability: framed.answerability,
+          labels: framed.labels,
+        });
+        setActiveQuestion(req.params.id, detectedQuestion, Date.now(), {
           windowHash: framed.windowHash,
           answerability: framed.answerability,
           labels: framed.labels,

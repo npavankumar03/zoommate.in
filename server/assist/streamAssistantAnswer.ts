@@ -1256,6 +1256,13 @@ export async function* streamAssistantAnswer(
     const simpleSystemPromptOnly = Boolean(sessionSystemPrompt && sessionSystemPrompt.trim());
     const hasCustomPrompt = Boolean(meetingSettings.customInstructions && meetingSettings.customInstructions.trim());
     const strictCustomPromptMode = Boolean(hasCustomPrompt || simpleSystemPromptOnly);
+    const strictQaFormatRequested = /(?:interviewer\s*\/\s*candidate|question\s*\/\s*answer|question\s+and\s+answer|^interviewer:\s*<question>|^candidate:\s*<answer>|return\s+.*interviewer.*candidate)/im.test(
+      [
+        meetingSettings.customInstructions || "",
+        sessionSystemPrompt || "",
+        customFormatPrompt || "",
+      ].join("\n"),
+    );
 
     let effectiveInstructions = strictCustomPromptMode
       ? STRICT_NO_INVENT_RULE
@@ -1840,7 +1847,7 @@ export async function* streamAssistantAnswer(
     }
 
     fullAnswer = postprocessFinalAnswer(effectiveQuestion, fullAnswer, enforceNoBulletsFromPrompt);
-    if (strictCustomPromptMode) {
+    if (strictQaFormatRequested) {
       fullAnswer = enforceStrictQaFormat(effectiveQuestion, fullAnswer);
     }
 
@@ -1876,10 +1883,10 @@ export async function* streamAssistantAnswer(
             "Improve this draft answer using available context.",
             "Keep same facts, improve precision and interview quality.",
             "Preserve and follow the user's custom instructions exactly when present.",
-            strictCustomPromptMode
+            strictQaFormatRequested
               ? "Return the final answer in exact Interviewer / Candidate format if the custom instructions require it. Preserve first-person candidate voice and requested styling."
               : "Return first-person singular candidate answer only.",
-            strictCustomPromptMode
+            strictQaFormatRequested
               ? "Do not collapse the Interviewer and Candidate sections into one paragraph."
               : "Return paragraph-only format (no bullet points / numbered lists).",
             "Keep interview-ready tone and avoid assistant/meta wording.",
@@ -1894,7 +1901,7 @@ export async function* streamAssistantAnswer(
           { maxTokens: isComplexTurn ? 360 : 220, temperature: 0.2, cacheUserId: userId, model: resolvedModel },
         );
         let cleanRefined = postprocessFinalAnswer(effectiveQuestion, (refined || "").trim(), enforceNoBulletsFromPrompt);
-        if (strictCustomPromptMode) {
+        if (strictQaFormatRequested) {
           cleanRefined = enforceStrictQaFormat(effectiveQuestion, cleanRefined);
         }
         if (

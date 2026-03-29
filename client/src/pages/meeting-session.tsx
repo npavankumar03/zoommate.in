@@ -22,6 +22,7 @@ import {
   normalizeText,
   levenshteinSimilarity,
   isSubstantiveSegment,
+  questionSupersedes,
 } from "@shared/questionDetection";
 import { isFollowUp } from "@shared/followup";
 import { AzureRecognizer, checkAzureAvailability } from "@/lib/stt/azureRecognizer";
@@ -405,7 +406,6 @@ export default function MeetingSession() {
   });
   const [socketConnected, setSocketConnected] = useState(false);
   const [responsesLocal, setResponsesLocal] = useState<Response[]>([]);
-  const [showResponseHistory, setShowResponseHistory] = useState(false);
   const [highlightResponseId, setHighlightResponseId] = useState<string | null>(null);
   const [selectedQuestionFilter, setSelectedQuestionFilter] = useState<string>("");
   const [recentQuestions, setRecentQuestions] = useState<string[]>([]);
@@ -894,21 +894,33 @@ export default function MeetingSession() {
     const norm = normalizeForDedup(clean);
     if (!clean || !norm) return;
     const now = Date.now();
-    const existing = interviewerQuestionMemoryRef.current.find((item) => normalizeForDedup(item.text) === norm);
+    const existing = interviewerQuestionMemoryRef.current.find((item) =>
+      normalizeForDedup(item.text) === norm
+      || questionSupersedes(clean, item.text)
+      || questionSupersedes(item.text, clean),
+    );
     if (existing) {
       existing.ts = now;
       existing.answered = false;
-      if (!existing.text || existing.text.length < clean.length) {
+      if (!existing.text || existing.text.length < clean.length || questionSupersedes(clean, existing.text)) {
         existing.text = clean;
       }
     } else {
       interviewerQuestionMemoryRef.current = [
         { text: clean, answered: false, ts: now },
-        ...interviewerQuestionMemoryRef.current.filter((item) => normalizeForDedup(item.text) !== norm),
+        ...interviewerQuestionMemoryRef.current.filter((item) =>
+          normalizeForDedup(item.text) !== norm
+          && !questionSupersedes(clean, item.text)
+          && !questionSupersedes(item.text, clean),
+        ),
       ].slice(0, 30);
     }
     setRecentQuestions((prev) => {
-      const next = [clean, ...prev.filter((item) => normalizeForDedup(item) !== norm)];
+      const next = [clean, ...prev.filter((item) =>
+        normalizeForDedup(item) !== norm
+        && !questionSupersedes(clean, item)
+        && !questionSupersedes(item, clean),
+      )];
       return next.slice(0, 10);
     });
   }, []);
@@ -4242,6 +4254,17 @@ export default function MeetingSession() {
           displayedAccRef.current = "";
           clearStreamingRenderTimer();
           interviewStateRef.current = "listening";
+          if (msg.type === "request_ignored" && msg.reason === "cooldown") {
+            toast({
+              title: "Please wait a few seconds",
+              description: "The current topic was just answered. Retry after a short pause.",
+            });
+          } else if (msg.type === "request_ignored" && (msg.reason === "no_active_question" || msg.reason === "insufficient_context")) {
+            toast({
+              title: "Still listening",
+              description: "No stable interviewer question was ready yet.",
+            });
+          }
           return;
         }
 
@@ -4322,10 +4345,9 @@ export default function MeetingSession() {
             isAwaitingFirstChunkRef.current = false;
             return;
           }
-          // Subsequent chunks: accumulate full WS text, queue for smooth reveal
+          // Subsequent chunks: render directly so the active answer pane stays simple and stable.
           streamingAccumulatorRef.current += chunk;
-          streamBufferRef.current += chunk;
-          queueStreamFlush();
+          setStreamingAnswer(sanitizeDisplayedAnswerText(streamingAccumulatorRef.current));
           return;
         }
 
@@ -4340,12 +4362,8 @@ export default function MeetingSession() {
             window.clearTimeout(flushTimerRef.current);
             flushTimerRef.current = null;
           }
-          // Flush any buffered text so the full answer shows immediately.
           clearFirstChunkWatchdog();
           clearStreamingRenderTimer();
-          const buffered = streamBufferRef.current;
-          streamBufferRef.current = "";
-          streamingAccumulatorRef.current += buffered;
           const finalAnswer = sanitizeDisplayedAnswerText(streamingAccumulatorRef.current);
           // Layer 2 echo protection: record this answer so isAiFeedbackLoop can filter it if mic picks it up
           if (finalAnswer.trim()) {
@@ -8245,11 +8263,6 @@ export default function MeetingSession() {
     askStreamingQuestion(question);
   }, [askStreamingQuestion]);
 
-  const handleCopilotAsk = () => {
-    console.log("[submit] send icon clicked");
-    submitCurrentQuestion("send_icon");
-  };
-
   // Retry: re-sends the last interpreted question
   const handleRetry = useCallback(() => {
     const q = interpretedQuestionRef.current || streamingQuestionRef.current;
@@ -9408,29 +9421,8 @@ export default function MeetingSession() {
                 </div>
 
                 <div className="p-3 border-t space-y-2 shrink-0">
-                  <Button
-                    className="w-full h-10 text-sm"
-                    variant="secondary"
-                    onClick={handleSendTranscript}
-                    disabled={isStreaming}
-                    data-testid="button-send-transcript"
-                  >
-                    <Sparkles className="w-3 h-3 mr-1.5" />
-                    Generate Answer from Transcript
-                  </Button>
-                  <div className="flex items-center gap-2">
-                  <Button
-                    size="icon"
-                    className="h-10 w-10 shrink-0"
-                    onClick={handleCopilotAsk}
-                    disabled={isStreaming}
-                    data-testid="button-ask"
-                  >
-                      {isStreaming ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
-                    </Button>
-                  </div>
                   <p className="text-center text-xs text-muted-foreground/70">
-                    <kbd className="px-1 py-0.5 border rounded font-mono bg-muted text-[10px]">Enter</kbd> to generate answer from live conversation
+                    Finalized transcript stays here. Use <kbd className="px-1 py-0.5 border rounded font-mono bg-muted text-[10px]">Enter</kbd> or <span className="font-medium text-foreground">Generate</span> in AI Insights for the current topic.
                   </p>
                 </div>
               </div>
@@ -9528,14 +9520,9 @@ export default function MeetingSession() {
                       Generate
                     </Button>
                   </div>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    className="h-7 text-xs"
-                    onClick={() => setShowResponseHistory((v) => !v)}
-                  >
-                    {showResponseHistory ? "Hide History" : `View History (${responsesLocal.length})`}
-                  </Button>
+                  <span className="text-xs text-muted-foreground">
+                    {responsesLocal.length > 0 ? `${responsesLocal.length} recent response${responsesLocal.length === 1 ? "" : "s"}` : "Waiting for a generated response"}
+                  </span>
                 </div>
                 <div
                   className="flex-1 overflow-y-auto min-h-0 p-3"
@@ -9577,22 +9564,21 @@ export default function MeetingSession() {
                         </div>
                       )}
 
-                      {(showResponseHistory ? responsesLocal.slice(0, 6) : responsesLocal.slice(0, 1))
-                        .map((resp) => {
-                          const displayAsCode = shouldDisplayAnswerAsCode(resp.question, resp.answer);
-                          const content = displayAsCode
-                            ? enforceCodeOnlyDisplay(resp.answer, resp.question)
-                            : resp.answer;
-                          return (
-                            <ResponseCard
-                              key={resp.id}
-                              resp={resp}
-                              isHighlighted={highlightResponseId === resp.id}
-                              content={content}
-                              onMount={handleResponseCardMount}
-                            />
-                          );
-                        })}
+                      {!shouldShowStreamingCard && newestResponse ? (() => {
+                        const displayAsCode = shouldDisplayAnswerAsCode(newestResponse.question, newestResponse.answer);
+                        const content = displayAsCode
+                          ? enforceCodeOnlyDisplay(newestResponse.answer, newestResponse.question)
+                          : newestResponse.answer;
+                        return (
+                          <ResponseCard
+                            key={newestResponse.id}
+                            resp={newestResponse}
+                            isHighlighted={highlightResponseId === newestResponse.id}
+                            content={content}
+                            onMount={handleResponseCardMount}
+                          />
+                        );
+                      })() : null}
                     </div>
                   ) : (
                     <div className="flex flex-col items-center justify-center h-full text-center py-12">
@@ -9713,6 +9699,28 @@ export default function MeetingSession() {
                   </div>
                 </div>
                 <div className="px-3 py-2 border-b">
+                  <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Recent Responses</h3>
+                </div>
+                <div className="max-h-[220px] overflow-y-auto px-3 py-2 space-y-2 border-b">
+                  {responsesLocal.length === 0 ? (
+                    <p className="text-xs text-muted-foreground">Generated answers will appear here.</p>
+                  ) : (
+                    responsesLocal.slice(0, 5).map((resp) => (
+                      <div key={resp.id} className="rounded-md border p-2 bg-muted/20">
+                        <p className="text-[11px] font-medium text-foreground line-clamp-2">
+                          {resp.question || "Recent answer"}
+                        </p>
+                        <p className="mt-1 text-[11px] text-muted-foreground line-clamp-4">
+                          {String(resp.answer || "")
+                            .replace(/```[\s\S]*?```/g, "[code]")
+                            .replace(/\s+/g, " ")
+                            .trim()}
+                        </p>
+                      </div>
+                    ))
+                  )}
+                </div>
+                <div className="px-3 py-2 border-b">
                   <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Recent Questions</h3>
                 </div>
                 <div className="flex-1 overflow-y-auto p-3 space-y-2" style={{ minHeight: 0 }}>
@@ -9748,26 +9756,6 @@ export default function MeetingSession() {
                         </button>
                       </div>
                     ))
-                  )}
-                </div>
-                <div className="border-t px-3 py-2">
-                  <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">History</h4>
-                </div>
-                <div className="flex-1 overflow-y-auto px-3 py-2 space-y-2" style={{ minHeight: 0 }}>
-                  {selectedQuestionFilter ? (
-                    responsesLocal
-                      .filter((resp) => normalizeForDedup(resp.question || "") === normalizeForDedup(selectedQuestionFilter))
-                      .map((resp) => (
-                        <div key={resp.id} className="text-xs text-muted-foreground leading-relaxed border rounded-md p-2 bg-muted/20">
-                          {shouldDisplayAnswerAsCode(resp.question, resp.answer) ? (
-                            <MarkdownRenderer content={enforceCodeOnlyDisplay(resp.answer, resp.question)} />
-                          ) : (
-                            <MarkdownRenderer content={resp.answer} />
-                          )}
-                        </div>
-                      ))
-                  ) : (
-                    <p className="text-xs text-muted-foreground">Select a question to view its answer history.</p>
                   )}
                 </div>
               </div>

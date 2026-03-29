@@ -4,26 +4,27 @@ import { URL } from "url";
 import { storage } from "../storage";
 import { streamAssistantAnswer, abortSessionStream, hasActiveStream } from "../assist/streamAssistantAnswer";
 import { getLastUnansweredInterviewerQuestion, getLatestSpokenReply, markInterviewerQuestionAnswered, recordUserQuestion, getCodingProblemState, buildInterviewerIntelligenceBlock } from "../assist/sessionState";
-import { orchestrate } from "../assist/orchestrator";
 import {
   getState as getMeetingState,
-  getRecentFinals,
   getSnapshotFromCursor,
   advanceCursor,
   markAnswered as markAnsweredInStore,
   normalizeQuestionKey,
+  getActiveQuestion,
+  setActiveQuestion,
   getUnanswered as getUnansweredInStore,
   setLastAnsweredWindowHash,
 } from "./meetingStore";
 import {
   detectQuestion,
   extractQuestionFromSegment,
-  frameQuestionWindow,
   buildQuestionWindowHash,
   likelyContainsQuestion,
   levenshteinSimilarity,
   normalizeQuestionForSimilarity,
   normalizeText,
+  questionSupersedes,
+  resolveActiveQuestionWindow,
 } from "@shared/questionDetection";
 import { getRefineConfig, buildRefineContext } from "../assist/refinePass";
 import { parseResponse } from "../assist/responseParser";
@@ -427,56 +428,95 @@ type EnterWindowResolution = {
   advanceCursorOnSuccess: boolean;
   windowHash: string;
   reusedPreviousQuestion: boolean;
+  reason?: "cooldown" | "no_active_question" | "insufficient_context";
 };
+
+const GENERATE_COOLDOWN_MS = 5000;
 
 async function resolveEnterWindowQuestion(
   sessionId: string,
   audioMode: "mic" | "system",
   fallbackText = "",
+  liveTranscript = "",
 ): Promise<EnterWindowResolution> {
   const state = getMeetingState(sessionId);
+  const now = Date.now();
   const hasPendingTranscript = state.finals.length > state.lastAnsweredFinalIndex || Boolean((state.partialText || "").trim());
   const snapshotText = hasPendingTranscript ? getSnapshotFromCursor(sessionId, 3000, 0) : "";
-  const currentWindowHash = buildQuestionWindowHash(snapshotText);
-  if (hasPendingTranscript) {
-    const framedWindow = frameQuestionWindow(snapshotText, { previousQuestion: state.lastPrompt });
-    if (framedWindow.answerability !== "complete" || framedWindow.questions.length === 0) {
+  const fallbackTranscript = String(liveTranscript || "").trim();
+  const windowSource = snapshotText || fallbackTranscript;
+  const currentWindowHash = buildQuestionWindowHash(windowSource);
+  const previousQuestion =
+    getActiveQuestion(sessionId)?.clean
+    || state.lastPrompt
+    || getLastUnansweredInterviewerQuestion(sessionId)?.text
+    || fallbackText.trim();
+
+  if (windowSource) {
+    const framedWindow = resolveActiveQuestionWindow(windowSource, { previousQuestion });
+    if (framedWindow.answerability === "complete" && framedWindow.questions.length > 0) {
+      const activeQuestion = getActiveQuestion(sessionId);
+      const activeSupersedesWindow = Boolean(
+        activeQuestion?.clean
+        && framedWindow.cleanQuestion
+        && questionSupersedes(activeQuestion.clean, framedWindow.cleanQuestion),
+      );
+      const answeredQuestions = activeSupersedesWindow
+        ? [String(activeQuestion?.clean || "").trim()].filter(Boolean)
+        : framedWindow.questions.map((item) => item.text).filter(Boolean);
+      const questionNorms = activeSupersedesWindow
+        ? [String(activeQuestion?.norm || "").trim()].filter(Boolean)
+        : framedWindow.questions.map((item) => item.norm).filter(Boolean);
+      const displayQuestion = answeredQuestions.length > 1
+        ? answeredQuestions.map((question, index) => `${index + 1}. ${question}`).join("\n")
+        : (answeredQuestions[0] || framedWindow.cleanQuestion);
+      const prompt = answeredQuestions.length > 1
+        ? buildQueuedQuestionPrompt(answeredQuestions)
+        : (answeredQuestions[0] || framedWindow.cleanQuestion);
+      const repeatedWindow = Boolean(currentWindowHash && state.lastAnsweredWindowHash && currentWindowHash === state.lastAnsweredWindowHash);
+      if (repeatedWindow && state.lastAnswerAt && (now - state.lastAnswerAt) < GENERATE_COOLDOWN_MS) {
+        return {
+          prompt: "",
+          displayQuestion: "",
+          answeredQuestions: [],
+          questionNorms: [],
+          advanceCursorOnSuccess: false,
+          windowHash: currentWindowHash,
+          reusedPreviousQuestion: false,
+          reason: "cooldown",
+        };
+      }
       return {
-        prompt: "",
-        displayQuestion: "",
+        prompt,
+        displayQuestion,
+        answeredQuestions,
+        questionNorms,
+        advanceCursorOnSuccess: true,
+        windowHash: activeQuestion?.windowHash || currentWindowHash,
+        reusedPreviousQuestion: false,
+      };
+    }
+    if (currentWindowHash && state.lastAnsweredWindowHash && currentWindowHash === state.lastAnsweredWindowHash && previousQuestion) {
+      if (state.lastAnswerAt && (now - state.lastAnswerAt) < GENERATE_COOLDOWN_MS) {
+        return {
+          prompt: "",
+          displayQuestion: "",
+          answeredQuestions: [],
+          questionNorms: [],
+          advanceCursorOnSuccess: false,
+          windowHash: currentWindowHash,
+          reusedPreviousQuestion: false,
+          reason: "cooldown",
+        };
+      }
+      return {
+        prompt: previousQuestion,
+        displayQuestion: previousQuestion,
         answeredQuestions: [],
         questionNorms: [],
         advanceCursorOnSuccess: false,
         windowHash: currentWindowHash,
-        reusedPreviousQuestion: false,
-      };
-    }
-
-    const recentFinals = getRecentFinals(sessionId, 6);
-    const decision = await orchestrate({
-      meetingId: sessionId,
-      mode: "enter",
-      audioMode,
-      snapshotText,
-      recentFinals,
-      state,
-    });
-
-    if (
-      (decision.action === "answer" || decision.action === "rewrite_brief" || decision.action === "rewrite_deeper")
-      && decision.displayQuestion.trim()
-    ) {
-      const answeredQuestions = decision.questions
-        .map((question) => String(question.clean || question.text || "").trim())
-        .filter(Boolean);
-      return {
-        prompt: decision.llmPrompt || decision.displayQuestion,
-        displayQuestion: decision.displayQuestion,
-        answeredQuestions,
-        questionNorms: decision.questionNorms || [],
-        advanceCursorOnSuccess: true,
-        windowHash: currentWindowHash,
-        reusedPreviousQuestion: false,
+        reusedPreviousQuestion: true,
       };
     }
 
@@ -488,27 +528,25 @@ async function resolveEnterWindowQuestion(
       advanceCursorOnSuccess: false,
       windowHash: currentWindowHash,
       reusedPreviousQuestion: false,
+      reason: "insufficient_context",
     };
   }
 
-  const queuedQuestions = getUnansweredBackendQuestions(sessionId, 3);
-  if (queuedQuestions.length > 0) {
-    return {
-      prompt: buildQueuedQuestionPrompt(queuedQuestions),
-      displayQuestion: queuedQuestions.length === 1
-        ? queuedQuestions[0]
-        : queuedQuestions.map((question, index) => `${index + 1}. ${question}`).join("\n"),
-      answeredQuestions: queuedQuestions,
-      questionNorms: queuedQuestions.map((question) => normalizeQuestionKey(question)).filter(Boolean),
-      advanceCursorOnSuccess: true,
-      windowHash: queuedQuestions.map((question) => normalizeQuestionKey(question)).join("|"),
-      reusedPreviousQuestion: false,
-    };
-  }
-
-  const fallbackQuestion = state.lastPrompt || fallbackText.trim() || "";
+  const fallbackQuestion = previousQuestion || "";
 
   if (fallbackQuestion) {
+    if (state.lastAnswerAt && (now - state.lastAnswerAt) < GENERATE_COOLDOWN_MS) {
+      return {
+        prompt: "",
+        displayQuestion: "",
+        answeredQuestions: [],
+        questionNorms: [],
+        advanceCursorOnSuccess: false,
+        windowHash: state.lastAnsweredWindowHash || buildQuestionWindowHash(fallbackQuestion),
+        reusedPreviousQuestion: false,
+        reason: "cooldown",
+      };
+    }
     return {
       prompt: fallbackQuestion,
       displayQuestion: fallbackQuestion,
@@ -528,6 +566,7 @@ async function resolveEnterWindowQuestion(
     advanceCursorOnSuccess: false,
     windowHash: "",
     reusedPreviousQuestion: false,
+    reason: "no_active_question",
   };
 }
 
@@ -715,9 +754,15 @@ export function setupWsAnswer(httpServer: Server): void {
           let queuedBackendQuestions: string[] = [];
           let resolvedWindowHash = "";
           let reusedPreviousQuestion = false;
+          let enterIgnoredReason: EnterWindowResolution["reason"];
 
           if (useBackendEnterWindow) {
-            const enterResolution = await resolveEnterWindowQuestion(sessionId, audioMode, questionText);
+            const enterResolution = await resolveEnterWindowQuestion(
+              sessionId,
+              audioMode,
+              questionText,
+              typeof metadata?.liveTranscript === "string" ? metadata.liveTranscript : "",
+            );
             questionForStream = enterResolution.prompt;
             displayQuestionForUi = enterResolution.displayQuestion;
             backendAnsweredQuestions = enterResolution.answeredQuestions.slice();
@@ -726,6 +771,7 @@ export function setupWsAnswer(httpServer: Server): void {
             queuedBackendQuestions = backendAnsweredQuestions.slice();
             resolvedWindowHash = enterResolution.windowHash;
             reusedPreviousQuestion = enterResolution.reusedPreviousQuestion;
+            enterIgnoredReason = enterResolution.reason;
           } else {
             queuedBackendQuestions = requestMode === "enter" && submitSource !== "interpreted"
               ? getUnansweredBackendQuestions(sessionId, 3)
@@ -747,10 +793,10 @@ export function setupWsAnswer(httpServer: Server): void {
 
           if (useBackendEnterWindow && !questionForStream.trim()) {
             safeSend(ws, {
-              type: "no_question",
+              type: "request_ignored",
               sessionId,
               requestId: "",
-              reason: "insufficient_context",
+              reason: enterIgnoredReason || "insufficient_context",
             });
             return;
           }
@@ -867,6 +913,23 @@ export function setupWsAnswer(httpServer: Server): void {
                 .replace(/^["[]|["\]]$/g, "")
                 .trim();
             }
+          }
+          const plainDisplayQuestion = displayQuestionForUi
+            .replace(/^Answer these interviewer questions separately in order:\s*/i, "")
+            .replace(/^Interview topic or prompt:\s*/i, "")
+            .replace(/^Continue answering:\s*/i, "")
+            .replace(/^["[]|["\]]$/g, "")
+            .trim()
+            .split(/\n+/)
+            .map((line) => line.replace(/^\d+\.\s*/, "").trim())
+            .filter(Boolean)
+            .slice(-1)[0] || "";
+          if (plainDisplayQuestion && !/^Continue answering:/i.test(questionForStream)) {
+            const activeState = getMeetingState(sessionId);
+            activeState.lastPrompt = plainDisplayQuestion;
+            setActiveQuestion(sessionId, plainDisplayQuestion, Date.now(), {
+              windowHash: resolvedWindowHash || buildQuestionWindowHash(plainDisplayQuestion),
+            });
           }
           const fp = normalizeQuestionForSimilarity(questionForStream) || "continue";
           if (!force && !useBackendEnterWindow && isRecentDuplicate(sessionId, fp, questionText)) {
@@ -1026,6 +1089,10 @@ export function setupWsAnswer(httpServer: Server): void {
             if (event.type === "error") {
               safeSend(ws, { type: "error", sessionId, requestId: event.requestId, message: event.message || "stream failed" });
             }
+          }
+
+          if (!fastCancelled && emittedChunkCount > 0) {
+            getMeetingState(sessionId).lastAnswerAt = Date.now();
           }
 
           if (!fastCancelled && emittedChunkCount > 0 && backendAnsweredQuestions.length > 0) {

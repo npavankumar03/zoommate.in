@@ -26,6 +26,7 @@ export type MeetingState = {
   lastAnsweredFinalIndex: number;
   recentQuestions: Array<{ clean: string; ts: number }>;
   questionQueue: QueuedQuestion[];
+  activeQuestion?: QueuedQuestion;
   recentAnswers: Array<{ key: string; question: string; answer: string; ts: number; responseId?: string }>;
   lastQuestionExtractTs?: number;
   lastTriggerAt?: number;
@@ -236,6 +237,75 @@ export function enqueueQuestion(
   pruneOld(meetingId);
 }
 
+export function setActiveQuestion(
+  meetingId: string,
+  clean: string,
+  ts = Date.now(),
+  meta?: {
+    windowHash?: string;
+    answerability?: QuestionAnswerability;
+    labels?: QuestionPatternLabel[];
+  },
+): void {
+  const value = (clean || "").trim();
+  if (!value) return;
+  const norm = normalizeQuestionKey(value);
+  if (!norm) return;
+  if (meta?.answerability === "fragment" || meta?.answerability === "no_question") return;
+
+  const s = getState(meetingId);
+  const existing = s.activeQuestion;
+  if (!existing) {
+    s.activeQuestion = {
+      clean: value,
+      norm,
+      ts,
+      windowHash: meta?.windowHash,
+      answerability: meta?.answerability,
+      labels: meta?.labels,
+    };
+    return;
+  }
+
+  const suppressIncoming =
+    existing.norm === norm
+    || questionSupersedes(existing.clean, value)
+    || computeWordOverlap(existing.norm, norm) > 0.88
+    || computeWordOverlap(norm, existing.norm) > 0.88;
+
+  if (suppressIncoming && !questionSupersedes(value, existing.clean)) {
+    existing.ts = Math.max(existing.ts, ts);
+    if (meta?.windowHash) existing.windowHash = meta.windowHash;
+    if (meta?.labels?.length) existing.labels = meta.labels;
+    if (meta?.answerability) existing.answerability = meta.answerability;
+    return;
+  }
+
+  s.activeQuestion = {
+    clean: value,
+    norm,
+    ts,
+    windowHash: meta?.windowHash,
+    answerability: meta?.answerability,
+    labels: meta?.labels,
+    answeredTs: questionSupersedes(value, existing.clean) ? undefined : existing.answeredTs,
+  };
+}
+
+export function getActiveQuestion(
+  meetingId: string,
+): { clean: string; norm: string; ts: number; windowHash?: string; labels?: QuestionPatternLabel[] } | null {
+  const active = getState(meetingId).activeQuestion;
+  if (!active?.clean) return null;
+  return {
+    clean: active.clean,
+    norm: active.norm,
+    ts: active.ts,
+    windowHash: active.windowHash,
+    labels: active.labels,
+  };
+}
+
 export function getRecentQuestions(meetingId: string, limit = 10): Array<{ clean: string; ts: number }> {
   const s = getState(meetingId);
   const unanswered = s.questionQueue.filter((q) => !q.answeredTs).sort((a, b) => b.ts - a.ts);
@@ -269,6 +339,13 @@ export function markAnswered(
     if (matched) {
       item.answeredTs = answeredTs;
     }
+  }
+  const active = s.activeQuestion;
+  if (active) {
+    const matched = normSet.has(active.norm)
+      || norms.some((norm) => questionSupersedes(norm, active.clean) || questionSupersedes(active.clean, norm))
+      || norms.some((norm) => computeWordOverlap(active.norm, norm) > 0.82 || computeWordOverlap(norm, active.norm) > 0.82);
+    if (matched) active.answeredTs = answeredTs;
   }
 }
 
@@ -436,6 +513,9 @@ export function pruneOld(meetingId: string): void {
   s.recentActionKeys = s.recentActionKeys.filter((x) => now - x.ts <= 60000);
   s.recentAnswers = s.recentAnswers.filter((x) => now - x.ts <= 60000);
   s.recentAskedFingerprints = s.recentAskedFingerprints.filter((x) => now - x.ts <= 60000);
+  if (s.activeQuestion && now - s.activeQuestion.ts > 30 * 60 * 1000) {
+    s.activeQuestion = undefined;
+  }
 
   // Soft cleanup for stale partial noise
   if (s.partialText && normalizeForDedup(s.partialText).length === 0) {

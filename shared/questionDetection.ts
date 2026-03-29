@@ -1290,6 +1290,69 @@ export function buildQuestionWindowHash(text: string): string {
   return normalized ? `qwin_${simpleStableHash(normalized)}` : "";
 }
 
+function stripSpeakerPrefix(text: string): string {
+  return String(text || "").replace(/^\s*(?:interviewer|candidate)\s*:\s*/i, "").trim();
+}
+
+function lowercaseFirst(text: string): string {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return "";
+  return trimmed.charAt(0).toLowerCase() + trimmed.slice(1);
+}
+
+function isTopicAppendableQuestion(text: string): boolean {
+  const normalized = normalizeForDedup(stripSpeakerPrefix(text));
+  if (!normalized) return false;
+  if (/(tell me about|describe a time|share an experience|conflict|manager|yourself|strength|weakness|background)\b/.test(normalized)) {
+    return false;
+  }
+  return /\b(experience|worked with|worked on|used|use|familiar with|comfortable with|background in|knowledge of|exposure to|skills|stack|technologies|tools)\b/.test(normalized)
+    || /\b(?:do|does|did|have|has|are|is|can|could|would)\s+you\b/.test(normalized);
+}
+
+function isSafeTopicTail(text: string): boolean {
+  const normalized = normalizeForDedup(text);
+  if (!normalized) return false;
+  const words = normalized.split(/\s+/).filter(Boolean);
+  if (words.length < 1 || words.length > 5) return false;
+  if (/^(and|also|plus|or|what about|how about|more|detail|details|it|that|this)$/i.test(normalized)) return false;
+  if (STANDALONE_TECH_RE.test(normalized)) return true;
+  return /\b(api|backend|frontend|cloud|database|sql|nosql|devops|microservices?|system design|project|architecture|testing|security|scalability|performance|storage|bucket|account)\b/i.test(normalized);
+}
+
+export function mergeFollowupQuestion(previousQuestion: string, fragment: string): string {
+  const prev = ensureQuestionMark(stripSpeakerPrefix(previousQuestion));
+  const rawFragment = stripSpeakerPrefix(fragment);
+  const fragmentNorm = normalizeForDedup(rawFragment);
+  if (!prev || !fragmentNorm) return "";
+
+  const prevBase = prev.replace(/[?]+\s*$/, "").trim();
+  if (!prevBase) return "";
+
+  if (/^(explain more|tell me more|go deeper|dig deeper|dive deeper|elaborate|elaborate more|in detail|more detail|clarify|break it down|expand|expand on that|can you elaborate|can you explain more)\??$/i.test(fragmentNorm)) {
+    return ensureQuestionMark(`Explain more about ${lowercaseFirst(prevBase)}`);
+  }
+
+  if (/^(why|how|what happened next|what next|what else|who decided|what was your part|how do you know)\??$/i.test(fragmentNorm)) {
+    return ensureQuestionMark(`${ensureSentenceCase(rawFragment.replace(/[?]+\s*$/, ""))} about ${lowercaseFirst(prevBase)}`);
+  }
+
+  const connectorMatch = /^(and also|and|also|plus|or|what about|how about)\s+/i.exec(rawFragment);
+  const tail = rawFragment.replace(/^(and also|and|also|plus|or|what about|how about)\s+/i, "").replace(/[?]+\s*$/, "").trim();
+  const connector = connectorMatch?.[1]?.toLowerCase() || "";
+  const appendWith = connector === "or" ? "or" : "and";
+
+  if (isTopicAppendableQuestion(prevBase) && isSafeTopicTail(tail)) {
+    return ensureQuestionMark(`${prevBase} ${appendWith} ${tail}`);
+  }
+
+  if (/^(yourself|role|your role|the outcome|outcome|after that)\??$/i.test(fragmentNorm) && /\b(tell me about|and your|what is your)\b/i.test(normalizeForDedup(prevBase))) {
+    return ensureQuestionMark(`${prevBase} ${rawFragment.replace(/[?]+\s*$/, "").trim()}`);
+  }
+
+  return "";
+}
+
 export function frameQuestionWindow(
   text: string,
   options?: { previousQuestion?: string },
@@ -1380,5 +1443,43 @@ export function frameQuestionWindow(
     confidence,
     cleanQuestion: questions[0]?.text || "",
     isQuestion: answerability === "complete" && questions.length > 0,
+  };
+}
+
+export function resolveActiveQuestionWindow(
+  text: string,
+  options?: { previousQuestion?: string },
+): FramedQuestionResult {
+  const base = frameQuestionWindow(text, options);
+  if (base.answerability === "complete" && base.questions.length > 0) {
+    return base;
+  }
+
+  const previousQuestion = String(options?.previousQuestion || "").trim();
+  const mergedQuestion = previousQuestion ? mergeFollowupQuestion(previousQuestion, text) : "";
+  if (!mergedQuestion) {
+    return base;
+  }
+
+  const mergedLabels = Array.from(new Set<QuestionPatternLabel>([
+    ...base.labels,
+    "followup",
+  ]));
+  const mergedConfidence = Math.max(base.confidence, 0.8);
+  return {
+    ...base,
+    labels: mergedLabels,
+    answerability: "complete",
+    anchor: "previous_answer",
+    questions: [{
+      text: mergedQuestion,
+      norm: normalizeForDedup(mergedQuestion),
+      labels: mergedLabels,
+      confidence: mergedConfidence,
+      answerability: "complete",
+    }],
+    confidence: mergedConfidence,
+    cleanQuestion: mergedQuestion,
+    isQuestion: true,
   };
 }

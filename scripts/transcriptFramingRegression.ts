@@ -3,8 +3,9 @@ import {
   buildQuestionWindowHash,
   frameQuestionWindow,
   questionSupersedes,
+  resolveActiveQuestionWindow,
 } from "../shared/questionDetection";
-import { enqueueQuestion, getUnanswered } from "../server/realtime/meetingStore";
+import { enqueueQuestion, getActiveQuestion, getUnanswered, setActiveQuestion } from "../server/realtime/meetingStore";
 import { getRecentQuestionHistory, recordInterviewerQuestion } from "../server/assist/sessionState";
 
 function run(): void {
@@ -24,6 +25,18 @@ function run(): void {
   assert.equal(followup.answerability, "fragment");
   assert.equal(followup.anchor, "previous_answer");
 
+  const mergedTopicTail = resolveActiveQuestionWindow("And AWS.", {
+    previousQuestion: "Do you have experience with Azure?",
+  });
+  assert.equal(mergedTopicTail.answerability, "complete");
+  assert.equal(mergedTopicTail.cleanQuestion, "Do you have experience with Azure and AWS?");
+
+  const mergedDrillDown = resolveActiveQuestionWindow("Explain more.", {
+    previousQuestion: "How does the storage account work?",
+  });
+  assert.equal(mergedDrillDown.answerability, "complete");
+  assert.equal(mergedDrillDown.cleanQuestion, "Explain more about how does the storage account work?");
+
   assert.ok(questionSupersedes("Tell me about yourself?", "Tell me about"));
   assert.equal(
     buildQuestionWindowHash("Tell me about yourself."),
@@ -41,6 +54,10 @@ function run(): void {
   const unanswered = getUnanswered(meetingId, 5);
   assert.equal(unanswered.length, 1);
   assert.equal(unanswered[0]?.clean, "Tell me about yourself?");
+
+  setActiveQuestion(meetingId, "Tell me about yourself?", Date.now() + 2, { answerability: "complete" });
+  const active = getActiveQuestion(meetingId);
+  assert.equal(active?.clean, "Tell me about yourself?");
 
   const sessionId = `regression-session-${Date.now()}`;
   recordInterviewerQuestion(sessionId, "Tell me about");
