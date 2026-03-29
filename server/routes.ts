@@ -25,7 +25,7 @@ import { encryptSettingValue, decryptSettingValue } from "./settingsCrypto";
 import { runDetectionPipeline, extractQuestionsWithLLM, composeQuestionWithLLM, normalizeQuestion, isDuplicateQuestion } from "./assist/questionDetect";
 import { streamAssistantAnswer } from "./assist/answerStream";
 import { orchestrate } from "./assist/orchestrator";
-import { getState as getMeetingState, getRecentFinals, setAnswerStyle, getAnswerStyle, setCodeContext } from "./realtime/meetingStore";
+import { getState as getMeetingState, getRecentFinals, setAnswerStyle, getAnswerStyle, setCodeContext, enqueueQuestion } from "./realtime/meetingStore";
 import { recordInterviewerQuestion, recordSpokenReply, getCodingProblemState } from "./assist/sessionState";
 import { getStructuredInterviewAnswer } from "./assist/structuredAnswer";
 import { indexDocumentForRag, retrieveDocumentContext } from "./rag";
@@ -2799,6 +2799,7 @@ Return ONLY valid JSON. No explanation, no markdown, no code fences. Just the JS
 
       if (isLikelyQuestion) {
         recordInterviewerQuestion(req.params.id, cleanQuestion || text);
+        enqueueQuestion(req.params.id, cleanQuestion || text);
       } else if (speaker === "candidate" && (isSubstantiveSegment(text) || isShortAck || text.split(/\s+/).filter(Boolean).length <= 40)) {
         recordSpokenReply(req.params.id, text);
       }
@@ -2836,10 +2837,12 @@ Return ONLY valid JSON. No explanation, no markdown, no code fences. Just the JS
 
       const shouldRecordQuestion = result.isQuestion && result.confidence >= threshold;
       if (shouldRecordQuestion) {
+        const detectedQuestion = String(result.cleanQuestion || result.questionSpan || text).trim();
         recordInterviewerQuestion(
           req.params.id,
-          String(result.cleanQuestion || result.questionSpan || text).trim(),
+          detectedQuestion,
         );
+        enqueueQuestion(req.params.id, detectedQuestion);
       }
 
       res.json({

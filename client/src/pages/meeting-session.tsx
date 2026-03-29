@@ -28,7 +28,7 @@ import { AzureRecognizer, checkAzureAvailability } from "@/lib/stt/azureRecogniz
 import { getSocket } from "@/realtime/socketClient";
 import {
   Zap, Mic, MicOff, Monitor, Send, Square,
-  MessageSquare, Copy, Check, Sparkles, Loader2,
+  Copy, Check, Sparkles, Loader2,
   Eye, Minimize2, Maximize2, Brain, Radio,
   Download, Trash2, Cloud, ScanSearch, ImagePlus, Database,
   CheckCircle, Star, XCircle, Plus, Images, X
@@ -37,7 +37,7 @@ import { motion, AnimatePresence } from "framer-motion";
 
 type AudioMode = "mic" | "system";
 type DocsMode = "auto" | "always" | "off";
-type SubmitSeedSource = "interpreted" | "transcript" | "memory-followup" | "fallback";
+type SubmitSeedSource = "interpreted" | "transcript" | "memory-followup" | "fallback" | "enter_window";
 type ScreenShareWindow = Window & {
   __zoommateVisionStream?: MediaStream | null;
 };
@@ -3592,13 +3592,6 @@ export default function MeetingSession() {
   }, []);
 
   useEffect(() => {
-    const el = transcriptScrollRef.current;
-    if (!el) return;
-    // Always keep newest transcript at the top.
-    el.scrollTop = 0;
-  }, [transcriptSegments, interimText]);
-
-  useEffect(() => {
     isAwaitingFirstChunkRef.current = isAwaitingFirstChunk;
   }, [isAwaitingFirstChunk]);
 
@@ -4192,7 +4185,7 @@ export default function MeetingSession() {
           activeWsStreamIdRef.current = String(msg.requestId || "");
           if (activeWsStreamIdRef.current) {
             requestQuestionByIdRef.current[activeWsStreamIdRef.current] =
-              pendingQuestionForRequestRef.current || interpretedQuestionRef.current || "";
+              String(msg.question || "").trim() || pendingQuestionForRequestRef.current || interpretedQuestionRef.current || "";
           }
           setIsStreaming(true);
           setIsAwaitingFirstChunk(true);
@@ -4211,7 +4204,7 @@ export default function MeetingSession() {
               streamingStuckWatchdogRef.current = null;
             }
           }, 30_000);
-          setStreamingQuestion(interpretedQuestionRef.current || "Live answer");
+          setStreamingQuestion(String(msg.question || "").trim() || interpretedQuestionRef.current || "Live answer");
           setPendingResponse(null);
           setStreamingAnswer("");
           streamBufferRef.current = "";
@@ -4266,8 +4259,8 @@ export default function MeetingSession() {
           }
           // Subsequent chunks: accumulate full WS text, queue for smooth reveal
           streamingAccumulatorRef.current += chunk;
-          wsTextQueueRef.current += chunk;
-          startStreamAnimation();
+          streamBufferRef.current += chunk;
+          queueStreamFlush();
           return;
         }
 
@@ -4282,12 +4275,9 @@ export default function MeetingSession() {
             window.clearTimeout(flushTimerRef.current);
             flushTimerRef.current = null;
           }
-          // Flush any text still in the animation queue so the full answer shows immediately
-          if (wsTextQueueRef.current) {
-            displayedAccRef.current += wsTextQueueRef.current;
-            wsTextQueueRef.current = "";
-          }
+          // Flush any buffered text so the full answer shows immediately.
           clearFirstChunkWatchdog();
+          clearStreamingRenderTimer();
           const buffered = streamBufferRef.current;
           streamBufferRef.current = "";
           streamingAccumulatorRef.current += buffered;
@@ -7757,6 +7747,65 @@ export default function MeetingSession() {
     const interimSnapshot = interimTextRef.current.trim();
     const latestSegmentSnapshot = segmentsRef.current[0]?.trim() || "";
     flushPendingTranscriptLine();
+    const now = Date.now();
+    const transcriptWindow = segmentsRef.current
+      .slice()
+      .reverse()
+      .join("\n")
+      .trim();
+    const backendWindowHint =
+      recentQuestions[0]?.trim()
+      || pendingSnapshot
+      || draftSnapshot
+      || latestSegmentSnapshot
+      || interimSnapshot
+      || "";
+
+    if (wsAnswerRef.current?.readyState === WebSocket.OPEN && id) {
+      triggerMetricRef.current = { t_trigger_decision: now };
+      triggerMetricRef.current.t_request_sent = now;
+      if (isStreaming || isAwaitingFirstChunk) {
+        try {
+          wsAnswerRef.current.send(JSON.stringify({ type: "cancel", sessionId: id }));
+        } catch {}
+      }
+      setLastSubmitSource("enter_window");
+      lastEnterSeedRef.current = { text: backendWindowHint, ts: now };
+      lastEnterSegmentCountRef.current = segmentsRef.current.length;
+      setInterpretedQuestion(backendWindowHint || INTERPRETED_PLACEHOLDER);
+      setStreamingQuestion(backendWindowHint || "Answering...");
+      showOptimisticAssistantState(backendWindowHint || "Answering...");
+      startFirstChunkWatchdog("enter_window");
+      pendingQuestionForRequestRef.current = backendWindowHint;
+      wsAnswerRef.current.send(JSON.stringify({
+        type: "question",
+        sessionId: id,
+        text: "",
+        force: true,
+        format: responseFormat === "custom" ? "custom" : responseFormat,
+        model: selectedModel,
+        quickMode: quickResponseMode,
+        docsMode,
+        metadata: {
+          mode: "enter",
+          audioMode,
+          submitSource: "enter_window",
+          customFormatPrompt: responseFormat === "custom" ? customPrompt : undefined,
+          docsMode,
+          systemPrompt: customPrompt || undefined,
+          jobDescription: conversationHistory || undefined,
+          liveTranscript: transcriptWindow || undefined,
+        },
+      }));
+      return;
+    }
+
+    clearFirstChunkWatchdog();
+    setIsStreaming(false);
+    setIsAwaitingFirstChunk(false);
+    toast({ title: "WebSocket not connected", description: "Reconnect and try again.", variant: "destructive" });
+    return;
+
     let rawManualText = sourceLabel === "enter_key"
       ? (
         pendingSnapshot
@@ -7859,7 +7908,7 @@ export default function MeetingSession() {
       seedText: safeSeedText,
       displayQuestion: safeDisplayQuestion,
     };
-    const now = Date.now();
+    const legacyNow = Date.now();
     const seedFingerprint = normalizeQuestionForSimilarity(safeSeed.displayQuestion || safeSeed.seedText || "");
     const allowsSameTurnFollowup =
       safeSeed.source === "memory-followup"
@@ -7871,7 +7920,7 @@ export default function MeetingSession() {
       seedFingerprint
       && !safeSeed.multiQuestionMode
       && !allowsSameTurnFollowup
-      && isRecentDuplicateIntent(seedFingerprint, "enter", now)
+      && isRecentDuplicateIntent(seedFingerprint, "enter", legacyNow)
     ) {
       // Silent duplicate suppression: keep current UI/stream state unchanged.
       return;
@@ -7885,7 +7934,7 @@ export default function MeetingSession() {
     }
 
     setLastSubmitSource(safeSeed.source);
-    lastEnterSeedRef.current = { text: safeSeed.displayQuestion || safeSeed.seedText || "", ts: now };
+    lastEnterSeedRef.current = { text: safeSeed.displayQuestion || safeSeed.seedText || "", ts: legacyNow };
     lastEnterSegmentCountRef.current = segmentsRef.current.length;
     // Record the question being answered in conversation history so follow-ups have context
     const questionForHistory = (safeSeed.displayQuestion || safeSeed.seedText || "").trim();
@@ -7896,10 +7945,11 @@ export default function MeetingSession() {
     setStreamingQuestion(safeSeed.displayQuestion || "Answering...");
     showOptimisticAssistantState(safeSeed.displayQuestion || "Answering...");
 
-    const ws = wsAnswerRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN && id) {
-      triggerMetricRef.current = { t_trigger_decision: now };
-      triggerMetricRef.current.t_request_sent = now;
+    const activeWs = wsAnswerRef.current;
+    if (activeWs?.readyState === WebSocket.OPEN && id) {
+      const ws = activeWs as WebSocket;
+      triggerMetricRef.current = { t_trigger_decision: legacyNow };
+      triggerMetricRef.current.t_request_sent = legacyNow;
       if (isStreaming || isAwaitingFirstChunk) {
         try {
           ws.send(JSON.stringify({ type: "cancel", sessionId: id }));
@@ -7933,7 +7983,7 @@ export default function MeetingSession() {
         },
       }));
       if (seedFingerprint) {
-        lastRequestedIntentRef.current = { fp: seedFingerprint, ts: now, mode: "enter" };
+        lastRequestedIntentRef.current = { fp: seedFingerprint, ts: legacyNow, mode: "enter" };
         rememberAskedFingerprint(seedFingerprint);
       }
       return;
@@ -7965,6 +8015,7 @@ export default function MeetingSession() {
     INTERPRETED_PLACEHOLDER,
     isStreaming,
     isAwaitingFirstChunk,
+    recentQuestions,
     isRecentDuplicateIntent,
     rememberAskedFingerprint,
     appendConversationContextLine,
@@ -9247,22 +9298,16 @@ export default function MeetingSession() {
                         return rows.map((seg, i) => {
                           const normalizedSeg = normalizeForDedup(seg);
                           const detection = normalizedSeg ? transcriptQuestionDetections[normalizedSeg] : undefined;
-                          const isQ = !!detection;
-                          const showCleanQuestion = !!detection
-                            && normalizedSeg !== normalizeForDedup(detection.cleanQuestion);
+                          const renderedText = detection?.cleanQuestion
+                            ? (/[?]$/.test(detection.cleanQuestion.trim()) ? detection.cleanQuestion.trim() : `${detection.cleanQuestion.trim()}?`)
+                            : seg;
                           return (
                             <div
                               key={i === 0 && liveText ? "live-current" : (displayTranscriptSegmentKeys[liveText ? i - 1 : i] || `${seg}-${i}`)}
-                              className={`rounded border px-2 py-1.5 ${isQ ? "border-primary/30 bg-primary/5" : "border-transparent text-foreground/80"}`}
+                              className="rounded px-2 py-1.5"
                               data-testid={i === 0 && liveText ? "text-segment-live" : `text-segment-${i}`}
                             >
-                              <p className="text-sm leading-relaxed text-foreground">{seg}</p>
-                              {showCleanQuestion && (
-                                <div className="mt-1 flex items-start gap-1.5 text-[11px] text-primary">
-                                  <MessageSquare className="mt-0.5 h-3 w-3 shrink-0" />
-                                  <span>Question: {detection.cleanQuestion}</span>
-                                </div>
-                              )}
+                              <p className="text-sm leading-relaxed text-foreground">{renderedText}</p>
                             </div>
                           );
                         });

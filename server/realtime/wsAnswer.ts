@@ -4,6 +4,15 @@ import { URL } from "url";
 import { storage } from "../storage";
 import { streamAssistantAnswer, abortSessionStream, hasActiveStream } from "../assist/streamAssistantAnswer";
 import { getLastUnansweredInterviewerQuestion, getLatestSpokenReply, getRecentQuestionHistory, markInterviewerQuestionAnswered, recordUserQuestion, getCodingProblemState, buildInterviewerIntelligenceBlock } from "../assist/sessionState";
+import { orchestrate } from "../assist/orchestrator";
+import {
+  getState as getMeetingState,
+  getRecentFinals,
+  getSnapshotFromCursor,
+  advanceCursor,
+  markAnswered as markAnsweredInStore,
+  normalizeQuestionKey,
+} from "./meetingStore";
 import {
   detectQuestion,
   extractQuestionFromSegment,
@@ -406,6 +415,87 @@ function buildQueuedQuestionPrompt(questions: string[]): string {
   return `Answer these interviewer questions separately in order:\n${questions.map((question, index) => `${index + 1}. ${question}`).join("\n")}`;
 }
 
+type EnterWindowResolution = {
+  prompt: string;
+  displayQuestion: string;
+  answeredQuestions: string[];
+  questionNorms: string[];
+  advanceCursorOnSuccess: boolean;
+};
+
+async function resolveEnterWindowQuestion(
+  sessionId: string,
+  audioMode: "mic" | "system",
+  fallbackText = "",
+): Promise<EnterWindowResolution> {
+  const queuedQuestions = getUnansweredBackendQuestions(sessionId, 3);
+  if (queuedQuestions.length > 0) {
+    return {
+      prompt: buildQueuedQuestionPrompt(queuedQuestions),
+      displayQuestion: queuedQuestions.length === 1
+        ? queuedQuestions[0]
+        : queuedQuestions.map((question, index) => `${index + 1}. ${question}`).join("\n"),
+      answeredQuestions: queuedQuestions,
+      questionNorms: queuedQuestions.map((question) => normalizeQuestionKey(question)).filter(Boolean),
+      advanceCursorOnSuccess: true,
+    };
+  }
+
+  const state = getMeetingState(sessionId);
+  const hasPendingTranscript = state.finals.length > state.lastAnsweredFinalIndex || Boolean((state.partialText || "").trim());
+  if (hasPendingTranscript) {
+    const snapshotText = getSnapshotFromCursor(sessionId, 3000, 0);
+    const recentFinals = getRecentFinals(sessionId, 6);
+    const decision = await orchestrate({
+      meetingId: sessionId,
+      mode: "enter",
+      audioMode,
+      snapshotText,
+      recentFinals,
+      state,
+    });
+
+    if (
+      (decision.action === "answer" || decision.action === "rewrite_brief" || decision.action === "rewrite_deeper")
+      && decision.displayQuestion.trim()
+    ) {
+      const answeredQuestions = decision.questions
+        .map((question) => String(question.clean || question.text || "").trim())
+        .filter(Boolean);
+      return {
+        prompt: decision.llmPrompt || decision.displayQuestion,
+        displayQuestion: decision.displayQuestion,
+        answeredQuestions,
+        questionNorms: decision.questionNorms || [],
+        advanceCursorOnSuccess: true,
+      };
+    }
+  }
+
+  const fallbackQuestion =
+    state.lastPrompt
+    || fallbackText.trim()
+    || "";
+
+  if (fallbackQuestion) {
+    return {
+      prompt: `Continue answering: "${fallbackQuestion}"`,
+      displayQuestion: fallbackQuestion,
+      answeredQuestions: [],
+      questionNorms: [],
+      advanceCursorOnSuccess: false,
+    };
+  }
+
+  return {
+    prompt: "[Continue with latest interviewer context]",
+    displayQuestion: "",
+    answeredQuestions: [],
+    questionNorms: [],
+    advanceCursorOnSuccess: false,
+  };
+}
+
 async function resolveUserId(req: IncomingMessage): Promise<string> {
   try {
     const cookieHeader = req.headers.cookie || "";
@@ -578,22 +668,42 @@ export function setupWsAnswer(httpServer: Server): void {
           const submitSource = typeof metadata.submitSource === "string" ? metadata.submitSource : "unknown";
           const multiQuestionMode = metadata.multiQuestionMode === true;
           const requestMode = typeof metadata.mode === "string" ? metadata.mode : "enter";
-          const queuedBackendQuestions = requestMode === "enter" && submitSource !== "interpreted"
-            ? getUnansweredBackendQuestions(sessionId, 3)
-            : [];
+          const audioMode = metadata.audioMode === "mic" ? "mic" : "system";
+          const useBackendEnterWindow = requestMode === "enter" && submitSource === "enter_window";
           const lastUnanswered = getLastUnansweredInterviewerQuestion(sessionId);
           const latestSpokenReply = getLatestSpokenReply(sessionId);
-          const primarySeed =
-            (multiQuestionMode
-              ? questionText.trim()
-              : (extractStrictInterviewerQuestion(questionText.trim()) || extractLatestMergedSegment(questionText.trim())));
-          let questionForStream = primarySeed
-            ? primarySeed
-            : chooseBestQuestionSeed([lastUnanswered?.text, latestSpokenReply?.text, "[Continue]"]);
-          const backendAnsweredQuestions = queuedBackendQuestions.slice();
+          let questionForStream = "";
+          let displayQuestionForUi = "";
+          let backendAnsweredQuestions: string[] = [];
+          let backendQuestionNorms: string[] = [];
+          let advanceBackendCursorOnSuccess = false;
+          let queuedBackendQuestions: string[] = [];
 
-          if (queuedBackendQuestions.length > 0) {
-            questionForStream = buildQueuedQuestionPrompt(queuedBackendQuestions);
+          if (useBackendEnterWindow) {
+            const enterResolution = await resolveEnterWindowQuestion(sessionId, audioMode, questionText);
+            questionForStream = enterResolution.prompt;
+            displayQuestionForUi = enterResolution.displayQuestion;
+            backendAnsweredQuestions = enterResolution.answeredQuestions.slice();
+            backendQuestionNorms = enterResolution.questionNorms.slice();
+            advanceBackendCursorOnSuccess = enterResolution.advanceCursorOnSuccess;
+            queuedBackendQuestions = backendAnsweredQuestions.slice();
+          } else {
+            queuedBackendQuestions = requestMode === "enter" && submitSource !== "interpreted"
+              ? getUnansweredBackendQuestions(sessionId, 3)
+              : [];
+            const primarySeed =
+              (multiQuestionMode
+                ? questionText.trim()
+                : (extractStrictInterviewerQuestion(questionText.trim()) || extractLatestMergedSegment(questionText.trim())));
+            questionForStream = primarySeed
+              ? primarySeed
+              : chooseBestQuestionSeed([lastUnanswered?.text, latestSpokenReply?.text, "[Continue]"]);
+            backendAnsweredQuestions = queuedBackendQuestions.slice();
+            if (queuedBackendQuestions.length > 0) {
+              questionForStream = buildQueuedQuestionPrompt(queuedBackendQuestions);
+              backendQuestionNorms = queuedBackendQuestions.map((question) => normalizeQuestionKey(question)).filter(Boolean);
+              advanceBackendCursorOnSuccess = true;
+            }
           }
 
           const QUESTION_WORD_RE = /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are|tell|walk|explain)\b/i;
@@ -689,13 +799,27 @@ export function setupWsAnswer(httpServer: Server): void {
               : "[Continue with latest interviewer context]";
             lastQuestionBySession.set(sessionId, questionForStream);
           }
+          if (!displayQuestionForUi.trim()) {
+            if (queuedBackendQuestions.length > 0) {
+              displayQuestionForUi = queuedBackendQuestions.length === 1
+                ? queuedBackendQuestions[0]
+                : queuedBackendQuestions.map((question, index) => `${index + 1}. ${question}`).join("\n");
+            } else {
+              displayQuestionForUi = questionForStream
+                .replace(/^Answer these interviewer questions separately in order:\s*/i, "")
+                .replace(/^Interview topic or prompt:\s*/i, "")
+                .replace(/^Continue answering:\s*/i, "")
+                .replace(/^["[]|["\]]$/g, "")
+                .trim();
+            }
+          }
           const fp = normalizeQuestionForSimilarity(questionForStream) || "continue";
           if (!force && isRecentDuplicate(sessionId, fp, questionText)) {
             console.log(`[ws/answer] duplicate suppressed sessionId=${sessionId} fp="${fp.slice(0, 60)}"`);
             return;
           }
           rememberFingerprint(sessionId, fp, questionText);
-          recordUserQuestion(sessionId, questionForStream);
+          recordUserQuestion(sessionId, displayQuestionForUi || questionForStream);
           console.log(
             `[ws/answer] question sessionId=${sessionId} userId=${userId} chars=${questionForStream.length} force=${force} source=${submitSource} multi=${multiQuestionMode}`,
             {
@@ -727,7 +851,7 @@ export function setupWsAnswer(httpServer: Server): void {
           const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
           socketState.requestId = requestId;
           activeBySession.set(sessionId, { ws, userId, sessionId, requestId });
-          safeSend(ws, { type: "assistant_start", sessionId, requestId });
+          safeSend(ws, { type: "assistant_start", sessionId, requestId, question: displayQuestionForUi || questionForStream });
           console.log(`[ws/answer] assistant_start sessionId=${sessionId} requestId=${requestId}`);
 
           // ── Speculative replay ────────────────────────────────────────────
@@ -848,6 +972,14 @@ export function setupWsAnswer(httpServer: Server): void {
             for (const backendQuestion of backendAnsweredQuestions) {
               markInterviewerQuestionAnswered(sessionId, backendQuestion, answeredAt);
             }
+            if (backendQuestionNorms.length > 0) {
+              markAnsweredInStore(sessionId, backendQuestionNorms, answeredAt);
+            }
+            if (advanceBackendCursorOnSuccess) {
+              advanceCursor(sessionId);
+            }
+          } else if (!fastCancelled && emittedChunkCount > 0 && advanceBackendCursorOnSuccess) {
+            advanceCursor(sessionId);
           }
 
           // --- TYPED REFINEMENT PASS ---
