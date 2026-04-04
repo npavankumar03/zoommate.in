@@ -60,6 +60,11 @@ export class AzureRecognizer {
   private options: AzureRecognizerOptions;
   private running = false;
   private intentionalStop = false;
+  // Fast-commit: track last partial to detect stable sentence-ending partials
+  private lastPartialText = "";
+  private lastPartialTs = 0;
+  private fastCommitTimer: ReturnType<typeof setTimeout> | null = null;
+  private fastCommittedNorms = new Set<string>();
   private audioStream: SpeechSDK.PushAudioInputStream | null = null;
   private processorNode: ScriptProcessorNode | AudioWorkletNode | null = null;
   private audioContext: AudioContext | null = null;
@@ -81,11 +86,11 @@ export class AzureRecognizer {
     this.callbacks = callbacks;
     this.options = {
       language: options.language || "en-US",
-      // Keep Azure phrase segmentation moderate to avoid choppy over-segmentation.
-      silenceTimeoutMs: options.silenceTimeoutMs || 600,
+      // Keep Azure phrase segmentation snappy — matches HuddleMate's default timing.
+      silenceTimeoutMs: options.silenceTimeoutMs || 250,
       phraseHints: (options.phraseHints || []).slice(0, 200),
       vadEnabled: options.vadEnabled ?? true,
-      vadNoiseFloor: options.vadNoiseFloor ?? 0.008,
+      vadNoiseFloor: options.vadNoiseFloor ?? 0.004,
       targetRms: options.targetRms ?? 0.12,
       maxGain: options.maxGain ?? 4,
       clippingThreshold: options.clippingThreshold ?? 0.92,
@@ -141,8 +146,7 @@ export class AzureRecognizer {
     );
     speechConfig.speechRecognitionLanguage = this.options.language!;
     speechConfig.outputFormat = SpeechSDK.OutputFormat.Detailed;
-    speechConfig.setProperty(SpeechSDK.PropertyId.Speech_SegmentationSilenceTimeoutMs, String(this.options.silenceTimeoutMs));
-    speechConfig.setProperty(SpeechSDK.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs, String(this.options.silenceTimeoutMs));
+    // No silence timeout override — let Azure's adaptive endpointing decide (same as HuddleMate).
     this.speechConfig = speechConfig;
     this.lastTokenRegion = tokenData.region;
     this.scheduleTokenRefresh(tokenData.expires_in_seconds);
@@ -227,14 +231,9 @@ export class AzureRecognizer {
   }
 
   private preprocessFloatChunk(inputData: Float32Array): { pcm16: Int16Array; meta: AzureTranscriptMeta } {
-    const vadEnabled = this.options.vadEnabled !== false;
-    const noiseFloor = Math.max(0.002, Math.min(0.08, this.options.vadNoiseFloor ?? 0.015));
     const targetRms = Math.max(0.04, Math.min(0.3, this.options.targetRms ?? 0.12));
     const maxGain = Math.max(1, Math.min(8, this.options.maxGain ?? 4));
     const clippingThreshold = Math.max(0.6, Math.min(0.98, this.options.clippingThreshold ?? 0.92));
-    const minSpeechRms = Math.max(0.003, Math.min(0.1, this.options.minSpeechRms ?? Math.max(noiseFloor * 1.2, 0.01)));
-    const postSpeechHoldMs = Math.max(80, Math.min(1200, this.options.postSpeechHoldMs ?? 260));
-    const chunkMs = Math.max(1, Math.round((inputData.length / this.audioSampleRate) * 1000));
 
     let sumSq = 0;
     let peak = 0;
@@ -246,27 +245,9 @@ export class AzureRecognizer {
     }
     const rms = Math.sqrt(sumSq / Math.max(1, inputData.length));
     const pcm16 = new Int16Array(inputData.length);
-    const isSpeech = rms >= minSpeechRms;
-    const noiseLikely = rms < noiseFloor;
 
-    if (isSpeech) {
-      this.speechActive = true;
-      this.silenceTailMs = 0;
-    } else if (this.speechActive) {
-      this.silenceTailMs += chunkMs;
-      if (this.silenceTailMs > postSpeechHoldMs) {
-        this.speechActive = false;
-      }
-    }
-
-    if (vadEnabled && noiseLikely && !this.speechActive) {
-      pcm16.fill(0);
-      return {
-        pcm16,
-        meta: { rms, isSpeech: false, noiseLikely: true, source: "partial" },
-      };
-    }
-
+    // No noise floor — let Azure's built-in VAD decide what is speech vs silence.
+    // Only apply gain normalization so quiet system audio reaches Azure at usable volume.
     const desiredGain = rms > 0.0001 ? targetRms / rms : maxGain;
     const gain = Math.max(0.9, Math.min(maxGain, desiredGain));
 
@@ -284,7 +265,7 @@ export class AzureRecognizer {
 
     return {
       pcm16,
-      meta: { rms, isSpeech: this.speechActive || isSpeech, noiseLikely, source: "partial" },
+      meta: { rms, isSpeech: true, noiseLikely: false, source: "partial" },
     };
   }
 
@@ -293,6 +274,9 @@ export class AzureRecognizer {
     this.preRollBuffers = [];
     this.speechActive = false;
     this.silenceTailMs = 0;
+    if (this.fastCommitTimer) { clearTimeout(this.fastCommitTimer); this.fastCommitTimer = null; }
+    this.lastPartialText = "";
+    this.fastCommittedNorms.clear();
   }
 
   private primePreRoll(buffer: Int16Array) {
@@ -306,21 +290,7 @@ export class AzureRecognizer {
 
   private writeChunkToAzure(buffer: Int16Array, meta: AzureTranscriptMeta) {
     if (!this.audioStream || !this.running) return;
-    const shouldWriteSpeech = meta.isSpeech || meta.rms === undefined || (meta.rms >= Math.max(this.options.minSpeechRms ?? 0.01, 0.003));
-    if (!shouldWriteSpeech) {
-      this.primePreRoll(buffer);
-      this.lastChunkMeta = meta;
-      return;
-    }
-
-    const previousWasSpeech = !!this.lastChunkMeta.isSpeech;
-    if (!previousWasSpeech && this.preRollBuffers.length > 0) {
-      for (const chunk of this.preRollBuffers) {
-        this.audioStream.write(chunk.buffer.slice(0));
-      }
-      this.preRollBuffers = [];
-    }
-
+    // No noise gate — send all audio to Azure and let its built-in VAD decide.
     this.audioStream.write(buffer.buffer.slice(0));
     this.lastChunkMeta = meta;
   }
@@ -450,20 +420,18 @@ export class AzureRecognizer {
     this.setupRecognizer(speechConfig, audioConfig);
   }
 
-  private setupWorkletOrProcessor(source: MediaStreamAudioSourceNode, noiseFloor: number) {
+  private setupWorkletOrProcessor(source: MediaStreamAudioSourceNode, _noiseFloor: number) {
     if (this.audioContext?.audioWorklet) {
       void this.audioContext.audioWorklet.addModule("/pcm-processor.js").then(() => {
         if (!this.audioContext || !this.running || !this.audioStream) return;
-        const workletFrameMs = Math.max(1, Math.round((64 / this.audioContext.sampleRate) * 1000));
-        const preRollFrames = Math.max(0, Math.min(30, Math.round((this.options.preRollMs ?? 120) / workletFrameMs)));
         const workletNode = new AudioWorkletNode(this.audioContext, "pcm-processor");
         workletNode.port.postMessage({
-          noiseFloor,
+          noiseFloor: 0, // disabled — Azure's built-in VAD handles silence detection
           targetRms: this.options.targetRms ?? 0.12,
           maxGain: this.options.maxGain ?? 4,
           limiter: this.options.clippingThreshold ?? 0.92,
-          silenceHoldFrames: this.options.silenceHoldFrames ?? 8,
-          preRollFrames,
+          silenceHoldFrames: 0, // disabled
+          preRollFrames: 0,     // disabled
         });
         workletNode.port.onmessage = (ev: MessageEvent) => {
           if (!this.audioStream || !this.running) return;
@@ -528,9 +496,38 @@ export class AzureRecognizer {
     this.recognizer.recognizing = (_sender, event) => {
       if (!this.running) return;
       const text = event.result.text;
-      if (text) {
-        // Partial UI updates only. Do not convert partials into finals on client side.
-        this.callbacks.onPartial(text, this.buildAzureMeta(event.result, "partial"));
+      if (!text) return;
+      this.callbacks.onPartial(text, this.buildAzureMeta(event.result, "partial"));
+
+      // Fast-commit: if partial ends with sentence-ending punctuation (. or ?)
+      // and is stable (unchanged for 180ms), emit it as a provisional final so
+      // long utterances appear immediately rather than waiting for Azure's silence timeout.
+      const SENTENCE_END = /[.?!]\s*$/;
+      const MIN_WORDS = 3;
+      const wordCount = text.trim().split(/\s+/).filter(Boolean).length;
+      if (SENTENCE_END.test(text) && wordCount >= MIN_WORDS) {
+        const norm = text.trim().toLowerCase().replace(/[^\w\s]/g, "").replace(/\s+/g, " ");
+        if (text !== this.lastPartialText) {
+          this.lastPartialText = text;
+          this.lastPartialTs = Date.now();
+          if (this.fastCommitTimer) clearTimeout(this.fastCommitTimer);
+          this.fastCommitTimer = setTimeout(() => {
+            this.fastCommitTimer = null;
+            if (!this.running || this.lastPartialText !== text) return;
+            if (this.fastCommittedNorms.has(norm)) return;
+            this.fastCommittedNorms.add(norm);
+            // Clean up old norms to avoid unbounded growth
+            if (this.fastCommittedNorms.size > 30) {
+              const first = this.fastCommittedNorms.values().next().value;
+              if (first) this.fastCommittedNorms.delete(first);
+            }
+            console.log("[AzureRecognizer] fast-commit partial:", text.slice(0, 80));
+            this.callbacks.onFinal(text.trim(), { ...this.buildAzureMeta(event.result, "final"), source: "final" });
+          }, 180);
+        }
+      } else {
+        this.lastPartialText = text;
+        if (this.fastCommitTimer) { clearTimeout(this.fastCommitTimer); this.fastCommitTimer = null; }
       }
     };
 
@@ -538,10 +535,19 @@ export class AzureRecognizer {
       if (!this.running) return;
       if (event.result.reason === SpeechSDK.ResultReason.RecognizedSpeech) {
         const text = event.result.text?.trim();
-        if (text) {
-          // Final transcript commits come only from Azure recognized events.
-          this.callbacks.onFinal(text, this.buildAzureMeta(event.result, "final"));
+        if (!text) return;
+        // Skip if already fast-committed (same or very similar text)
+        const norm = text.toLowerCase().replace(/[^\w\s]/g, "").replace(/\s+/g, " ");
+        const alreadyCommitted = this.fastCommittedNorms.has(norm);
+        this.fastCommittedNorms.delete(norm); // consume the dedup entry
+        if (this.fastCommitTimer) { clearTimeout(this.fastCommitTimer); this.fastCommitTimer = null; }
+        this.lastPartialText = "";
+        if (alreadyCommitted) {
+          // Azure final matches what we already fast-committed — skip duplicate
+          console.log("[AzureRecognizer] final skipped (already fast-committed):", text.slice(0, 60));
+          return;
         }
+        this.callbacks.onFinal(text, this.buildAzureMeta(event.result, "final"));
       }
     };
 

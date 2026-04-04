@@ -26,6 +26,14 @@ const activeSocketStreams = new Map<string, AbortController>();
 const ttftSamplesSocket: number[] = [];
 const memoryContextCache = new Map<string, { value: string; expiresAt: number }>();
 const MEMORY_CACHE_TTL_MS = 90 * 1000;
+
+// Periodically evict expired entries so memoryContextCache doesn't grow unbounded.
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of memoryContextCache) {
+    if (now > entry.expiresAt) memoryContextCache.delete(key);
+  }
+}, 5 * 60 * 1000).unref();
 const TIER0_MIN_TOKENS = 220;
 const TIER0_MAX_TOKENS = 320;
 const TIER0_CUSTOM_INSTRUCTIONS_CHARS = 1200;

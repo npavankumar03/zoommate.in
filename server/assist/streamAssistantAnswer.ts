@@ -11,6 +11,7 @@ import type { Meeting } from "@shared/schema";
 import { shouldRetrieveDocs, type DocsRetrievalMode } from "./retrievalGate";
 import { retrieveDocumentContext } from "../rag";
 import { enqueuePersistRetry } from "./persistRetry";
+import { getHeuristicAnswer } from "./heuristicAnswerCache";
 import { isFollowUp, resolveAnchorTurn, type CodeTransitionType } from "@shared/followup";
 import { detectTechnicalSubtype, type TechnicalSubtype } from "@shared/technicalSubtype";
 import { classifyTechnicalIntent } from "@shared/technicalIntent";
@@ -28,15 +29,15 @@ import {
 const activeStreams = new Map<string, AbortController>();
 const memoryContextCache = new Map<string, { value: string; expiresAt: number }>();
 const ttftSamplesByTransport: Record<"ws" | "sse", number[]> = { ws: [], sse: [] };
-const MEMORY_CACHE_TTL_MS = 90 * 1000;
-const TIER0_MIN_TOKENS = 180;
+const MEMORY_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes — survives long gaps between questions
+const TIER0_MIN_TOKENS = 220;
 const TIER0_MAX_TOKENS = 950; // enough for explanation + full code block without truncation
 const TIER0_CUSTOM_INSTRUCTIONS_CHARS = 24000;
-const MAX_RESUME_CONTEXT_CHARS = 24000;
-const MAX_JOB_DESCRIPTION_CHARS = 12000;
+const MAX_RESUME_CONTEXT_CHARS = 10000; // reduced from 24k — enough for name, skills, 2-3 jobs
+const MAX_JOB_DESCRIPTION_CHARS = 6000;  // reduced from 12k — key requirements fit in 6k
 const FOLLOWUP_MAX_CHARS = 2000;
 const FIRST_TOKEN_TIMEOUT_MS = 3500;
-const MAX_FIRST_TOKEN_RETRIES = 1;
+const MAX_FIRST_TOKEN_RETRIES = 0;
 const STRICT_NO_INVENT_RULE = [
   "CRITICAL NO-INVENTION RULES:",
   "- Do NOT invent employers, companies, project names, years, metrics, or seniority.",
@@ -48,16 +49,24 @@ const RESPONSE_STYLE_RULE = [
   "- Follow the user's custom instructions exactly when they are provided.",
   "- Use job description and resume/profile context as primary personalization sources.",
   "- Strict interview mode: answer only the selected interviewer question for this turn; ignore unrelated transcript fragments.",
+  "- CURRENT BATCH ONLY: Answer ONLY the question(s) passed in this turn's user message. Do NOT answer or re-answer any Interviewer questions you see in the conversation history — those were already handled in prior turns. If you see an Interviewer line in history without a matching Candidate reply, still ignore it — it is outside your current batch.",
   "- MANDATORY OUTPUT: candidate answer must be first-person singular in natural spoken style.",
   "- Default to paragraph format unless the user explicitly asks for bullets, numbered steps, or another structure.",
   "- Use **bold markdown** to emphasize key technical terms, role titles, company names, skills, and important phrases within paragraphs.",
   "- Start with a direct answer sentence, then add concise supporting detail unless the user requests another structure.",
+  "- NEVER begin a response with 'Certainly', 'Sure', 'Of course', 'Great question', 'Absolutely', 'Here is', or 'Here's a'. Start directly with the substance.",
+  "- NEVER re-introduce yourself or repeat your name at the start of an answer unless the interviewer explicitly asked for your name in THIS question. If a previous turn already provided your name or background, do not repeat it — jump straight to answering the current question.",
   "- Never invent facts, companies, years, or metrics.",
   "- Never mention being an AI assistant.",
   "- Answer directly without refusal/meta preambles.",
-  "- Do NOT ask clarification questions in the answer.",
-  "- If the selected interviewer text is fragmentary but still answerable, answer conservatively at the literal surface level.",
-  "- Use recent conversation context only to resolve obvious follow-ups. Do not invent a more specific question than the transcript supports.",
+  "- NEVER refuse to answer. NEVER say 'I can't provide a response', 'I'm sorry', or 'that doesn't relate to my experience'. Always find a way to answer as the candidate.",
+  "- NEVER ask for clarification. If the question is vague, incomplete, or contains a speech-to-text error, infer the most likely interview intent and answer directly.",
+  "- If the transcript contains a garbled word (e.g. 'youth' instead of 'use case'), correct it contextually and answer the most plausible question.",
+  "- If the transcript is ambiguous, bind your answer to the most recent interviewer topic and respond as if that topic was asked.",
+  "- If the question uses pronouns or vague references ('which code', 'that project', 'what you said', 'that thing', 'which one', 'differentiate it', 'explain it', 'compare it'), FIRST check the live transcript for the most recent topic being discussed — that is what 'it/that/this' refers to. Only fall back to the last Q&A answer if the transcript gives no clue. Never answer about an older topic when the transcript shows a newer one.",
+  "- When there is no explicit context, always scan the live transcript and Q&A history and produce the best possible answer from what is available. An imperfect answer is always better than a refusal.",
+  "- SCENARIO QUESTIONS: If the interviewer described a scenario or hypothetical ('if you create X', 'suppose Y', 'imagine Z') and then asks a follow-up ('how would you differentiate it', 'what would happen', 'how do you handle it'), the answer must be about that scenario — not about a previous unrelated topic.",
+  "- MULTI-PART QUESTIONS (MANDATORY): If the question has multiple distinct parts — joined by 'and', 'also', newlines, or otherwise — answer EVERY part in sequence without skipping. This includes mixed-type questions where a coding task and a behavioral/other question are combined (e.g. 'Write a Python calculator and how do you handle stress while coding?' → provide the code FIRST, then in a new paragraph answer the behavioral question). If you completed a code task and the question also asks something else, do NOT stop — continue and answer the remaining part(s). Never skip any part of a compound question.",
 ].join("\n");
 
 function extractPromptProfileContext(raw: string): { resume: string; jobDescription: string } {
@@ -330,6 +339,7 @@ export interface StreamAssistantAnswerOptions {
   sessionSystemPrompt?: string;
   liveTranscript?: string;
   conversationHistory?: Array<{ q: string; a: string }>;
+  sessionContext?: string;  // in-memory "Interviewer: ...\nCandidate: ..." log sent directly from client to bypass DB persist delay
   refineContext?: string;   // typed rubric block injected at end of tier-0 prompt during refinement pass
 }
 
@@ -515,7 +525,14 @@ function buildSubtypeAnswerShape(subtype: TechnicalSubtype): string {
       ].join("\n");
 
     default:
-      return "";
+      // General implementation / fresh-code question (e.g. "write a Python calculator")
+      return [
+        "IMPLEMENTATION ANSWER STRUCTURE (follow this order exactly):",
+        "1. Approach — 1-2 sentences: state what you will build and the key design decision.",
+        "2. Code — complete fenced block in the requested language. Every implementation answer MUST have a fenced code block.",
+        "3. Key points — 2-3 bullets explaining the most important parts of the code.",
+        "RULE: NEVER start with 'Certainly', 'Sure', 'Of course', 'Here is', or 'Here's a'. Start directly with the approach sentence. Answer in first person.",
+      ].join("\n");
   }
 }
 
@@ -674,7 +691,7 @@ function buildCodeTransitionPolicy(
         "- Start by referencing the prior answer in 1 sentence (e.g., \"On the caching point I mentioned...\").",
         "- Then expand naturally based on the user's requested format and style.",
         "- End with one concrete example or next step if technical.",
-        "- If the follow-up is ambiguous, prefer the narrowest literal reading from recent context. Do not invent a new technology, scenario, or experience claim.",
+        "- If the follow-up is ambiguous, infer the most likely intent from recent context and answer directly — never ask for clarification.",
       ].join("\n");
   }
 }
@@ -685,7 +702,7 @@ function buildTier0FormatGuide(format: string, customFormatPrompt?: string, quic
 
   const guideByFormat: Record<string, string> = {
     short: "Short: 2-4 tight sentences total.",
-    concise: "Concise: 2-3 sentences.",
+    concise: "Concise: 2-4 sentences.",
     detailed: "Detailed: Keep concise but structured: 1) Direct answer, 2) Key details, 3) Example, 4) Impact/Wrap-up.",
     star: "STAR: Provide 4 labeled lines only: S: ... T: ... A: ... R: ...",
     bullet: "Bullets: 4-6 clear bullets. Each bullet should be concrete and complete.",
@@ -1111,6 +1128,7 @@ export async function* streamAssistantAnswer(
     sessionSystemPrompt,
     liveTranscript,
     conversationHistory,
+    sessionContext,
     refineContext,
   } = options;
   const effectiveQuestion = sanitizeDisplayQuestion(question);
@@ -1179,6 +1197,37 @@ export async function* streamAssistantAnswer(
       }
       yield { type: "chunk", requestId, text: immediateLead };
     }
+
+    // ── Heuristic fast-path ─────────────────────────────────────────────────────
+    // For common predictable questions (tell me about yourself, strengths, etc.)
+    // serve a pre-generated cached answer — no LLM round-trip needed.
+    const heuristicAnswer = getHeuristicAnswer(meetingId, effectiveQuestion);
+    if (heuristicAnswer) {
+      console.log(`[heuristic] cache_hit meeting=${meetingId} question="${effectiveQuestion.slice(0, 60)}"`);
+      // Stream in small word-groups for natural appearance
+      const words = heuristicAnswer.split(" ");
+      for (let i = 0; i < words.length; i += 4) {
+        if (aborted) break;
+        const chunk = words.slice(i, i + 4).join(" ") + (i + 4 < words.length ? " " : "");
+        totalChunks++;
+        totalChars += chunk.length;
+        if (!tFirstChunkSent) {
+          tFirstChunkSent = Date.now();
+          recordTtft(transport, tFirstChunkSent - tReqReceived);
+        }
+        yield { type: "chunk", requestId, text: chunk };
+      }
+      yield { type: "end", requestId, response: { question: effectiveQuestion, answer: heuristicAnswer, responseType: "automatic" } };
+      void storage.createResponse({
+        meetingId,
+        question: effectiveQuestion,
+        answer: heuristicAnswer,
+        responseType: "automatic",
+        questionHash: computeQuestionHash(meetingId, effectiveQuestion),
+      }).catch((err: any) => console.error("[heuristic] persist failed:", err?.message));
+      return;
+    }
+    // ── End heuristic fast-path ─────────────────────────────────────────────────
 
     const style = getAnswerStyle(meetingId);
     recordUserQuestion(meetingId, effectiveQuestion || question);
@@ -1253,29 +1302,23 @@ export async function* streamAssistantAnswer(
       .filter(Boolean)
       .join("\n\n");
     const enforceNoBulletsFromPrompt = /(?:no|without)\s+bullet|not\s+bullet|paragraph\s+only|no\s+bullet\s+points?/i.test(meetingSettings.customInstructions || "");
-    const simpleSystemPromptOnly = Boolean(sessionSystemPrompt && sessionSystemPrompt.trim());
     const hasCustomPrompt = Boolean(meetingSettings.customInstructions && meetingSettings.customInstructions.trim());
-    const strictCustomPromptMode = Boolean(hasCustomPrompt || simpleSystemPromptOnly);
-    const strictQaFormatRequested = /(?:interviewer\s*\/\s*candidate|question\s*\/\s*answer|question\s+and\s+answer|^interviewer:\s*<question>|^candidate:\s*<answer>|return\s+.*interviewer.*candidate)/im.test(
-      [
-        meetingSettings.customInstructions || "",
-        sessionSystemPrompt || "",
-        customFormatPrompt || "",
-      ].join("\n"),
-    );
 
-    let effectiveInstructions = strictCustomPromptMode
+    // When a custom prompt is active, skip RESPONSE_STYLE_RULE — the custom prompt IS the style rule.
+    // STRICT_NO_INVENT_RULE always stays as a hard guardrail regardless.
+    const hasActiveCustomPrompt = hasCustomPrompt || Boolean(sessionSystemPrompt?.trim());
+    let effectiveInstructions = hasActiveCustomPrompt
       ? STRICT_NO_INVENT_RULE
       : [STRICT_NO_INVENT_RULE, RESPONSE_STYLE_RULE].join("\n\n");
-    if (!simpleSystemPromptOnly && hasCustomPrompt) {
-      effectiveInstructions = `${effectiveInstructions}\n\nUser custom instructions:\n${meetingSettings.customInstructions.trim()}`;
+    if (hasCustomPrompt) {
+      effectiveInstructions = `${effectiveInstructions}\n\n=== CUSTOM INSTRUCTIONS (follow these exactly for format, tone, style, length) ===\n${meetingSettings.customInstructions.trim()}\n===`;
     }
-    if (!simpleSystemPromptOnly && sessionSystemPrompt && sessionSystemPrompt.trim()) {
+    if (sessionSystemPrompt && sessionSystemPrompt.trim()) {
       effectiveInstructions = effectiveInstructions
-        ? `${effectiveInstructions}\n\nSession system prompt:\n${sessionSystemPrompt.trim()}`
-        : `Session system prompt:\n${sessionSystemPrompt.trim()}`;
+        ? `${effectiveInstructions}\n\n=== SESSION INSTRUCTIONS (highest priority — override everything except hard guardrails) ===\n${sessionSystemPrompt.trim()}\n===`
+        : `=== SESSION INSTRUCTIONS (highest priority — override everything except hard guardrails) ===\n${sessionSystemPrompt.trim()}\n===`;
     }
-    if (!simpleSystemPromptOnly && responseFormat === "custom" && customFormatPrompt) {
+    if (responseFormat === "custom" && customFormatPrompt) {
       effectiveInstructions = effectiveInstructions
         ? effectiveInstructions + "\n\nCustom format instructions:\n" + customFormatPrompt
         : "Custom format instructions:\n" + customFormatPrompt;
@@ -1325,7 +1368,7 @@ export async function* streamAssistantAnswer(
     }
     const tier0TurnContext = meetingSettings.conversationContext
       .split("\n")
-      .slice(-6)
+      .slice(-120)
       .join("\n")
       .slice(-1800);
     const prevAnswerHasCode = /```/.test(anchor.lastAssistantAnswer || "");
@@ -1398,21 +1441,26 @@ export async function* streamAssistantAnswer(
       ? buildSubtypeAnswerShape(subtypeResult.subtype)
       : "";
 
-    const tier0SystemPrompt = simpleSystemPromptOnly
-      ? sessionSystemPrompt!.trim()
-      : [
+    const tier0SystemPrompt = [
           tier0BaseTemplate,
           effectiveJobDescription ? `Job description:\n${effectiveJobDescription.slice(0, MAX_JOB_DESCRIPTION_CHARS)}` : "",
           extractedResume ? `Resume/Profile:\n${extractedResume.slice(0, MAX_RESUME_CONTEXT_CHARS)}` : "",
           tier0DocumentContext ? `Documents:\n${tier0DocumentContext.slice(0, 1000)}` : "",
+          // Live transcript placed early so LLM has full session context before answer shaping.
+          // Critical for thin follow-ups ("elaborate", "why") — LLM must see what was said.
+          liveTranscript ? `Live interview transcript (full session so far, oldest first — use this to understand the full question and context before answering):\n${liveTranscript}` : "",
           tier0MemoryContext ? `Key facts (employer, role, stack, achievements — use these when relevant):\n${tier0MemoryContext.slice(0, 1600)}` : "",
           sessionInsights ? sessionInsights : "",
           sessionIntelligenceBlock ? sessionIntelligenceBlock : "",
           spokenRepliesBlock ? `Recent candidate spoken answers (what I already said — stay consistent):\n${spokenRepliesBlock}` : "",
     effectiveInstructions ? `Custom instructions (highest priority, follow strictly unless they conflict with no-invention/safety rules): ${effectiveInstructions.slice(0, TIER0_CUSTOM_INSTRUCTIONS_CHARS)}` : "",
-          tier0TurnContext ? `Recent conversation:\n${tier0TurnContext}` : "",
+          // sessionContext is the in-memory labeled log sent directly from the client,
+          // bypassing the 1.2s DB persist delay. It includes the candidate's most recent
+          // spoken words (e.g. "Candidate: no I don't have direct experience in React")
+          // so the LLM can answer consistently with what the candidate just said.
+          sessionContext ? `Live session log (most recent — includes candidate's own spoken responses, use to stay consistent with what candidate already said):\n${sessionContext.slice(0, 4000)}` : "",
+          tier0TurnContext ? `Recent conversation (from DB):\n${tier0TurnContext}` : "",
           conversationHistory?.length ? `Recent Q&A history (use for follow-up context, do not repeat these answers verbatim):\n${conversationHistory.map((p, i) => `Q${i + 1}: ${p.q}\nA${i + 1}: ${p.a}`).join("\n\n")}` : "",
-          liveTranscript ? `Live interview transcript (everything said in this session, oldest first — use this as full conversation context to answer naturally):\n${liveTranscript}` : "",
           subtypeAnswerShape,
           followUpPolicy,
           codeFollowUpBlock,
@@ -1481,9 +1529,7 @@ export async function* streamAssistantAnswer(
     };
 
     let fullAnswer = "";
-    const baselinePrompt = simpleSystemPromptOnly
-      ? sessionSystemPrompt!.trim()
-      : buildSystemPrompt(
+    const baselinePrompt = buildSystemPrompt(
           formatForAI,
           meetingSettings.type,
           effectiveInstructions || undefined,
@@ -1535,7 +1581,7 @@ export async function* streamAssistantAnswer(
       const extraBlocks = suppressAnchorAnswer
         ? "" // skip old Q&A pairs too when captured code is active
         : extraPairs
-            .map((p, i) => `Earlier Q${i + 1}: ${p.q.slice(0, 300)}\nEarlier A${i + 1}: ${p.a.slice(0, 900)}`)
+            .map((p, i) => `Earlier Q${i + 1}: ${p.q.slice(0, 800)}\nEarlier A${i + 1}: ${p.a.slice(0, 1500)}`)
             .join("\n\n");
       const hasAnchor = Boolean(anchorQ || (!suppressAnchorAnswer && anchorA) || extraPairs.length);
       if (hasAnchor) {
@@ -1556,11 +1602,38 @@ export async function* streamAssistantAnswer(
         ].filter(Boolean).join("\n");
       }
     }
-    const userPromptToUse = simpleSystemPromptOnly
-      ? effectiveQuestion
-      : (useQuickMode
-          ? [followUpPack, tier0StyledQuestion].filter(Boolean).join("\n\n")
-          : [followUpPack, styleAppliedQuestion].filter(Boolean).join("\n\n"));
+    // Extract the full current topic from the in-memory session log.
+    // Only injected for vague/pronoun questions ("differentiate it", "explain that")
+    // so it does NOT suppress multi-question answers where all questions must be addressed.
+    const recentInterviewerTopicBlock = (() => {
+      if (!vagueQuestion || !sessionContext) return "";
+      const lines = sessionContext.split("\n").filter(Boolean);
+      // Find the index of the last Candidate line (last AI answer boundary)
+      let lastCandidateIdx = -1;
+      for (let i = lines.length - 1; i >= 0; i--) {
+        if (/^Candidate:/i.test(lines[i])) { lastCandidateIdx = i; break; }
+      }
+      // Take everything after the last Candidate line — this is the current topic
+      const topicLines = lines.slice(lastCandidateIdx + 1).filter(Boolean);
+      if (!topicLines.length) {
+        // No new lines after last answer — fall back to last 10 lines of full log
+        const fallback = lines.slice(-10);
+        if (!fallback.length) return "";
+        return [
+          "=== CURRENT INTERVIEW CONTEXT (most recent session log — use to resolve what 'it/that/this' refers to) ===",
+          fallback.join("\n"),
+        ].join("\n");
+      }
+      return [
+        "=== CURRENT INTERVIEW TOPIC (everything since the last answer — use this to resolve what 'it/that/this/that scenario' refers to) ===",
+        topicLines.join("\n"),
+        "If the question uses a pronoun ('it', 'that', 'this'), it refers to the above context. Answer all parts of the question.",
+      ].join("\n");
+    })();
+
+    const userPromptToUse = useQuickMode
+      ? [recentInterviewerTopicBlock, followUpPack, tier0StyledQuestion].filter(Boolean).join("\n\n")
+      : [recentInterviewerTopicBlock, followUpPack, styleAppliedQuestion].filter(Boolean).join("\n\n");
 
     const explicitListQuestions = extractExplicitNumberedQuestions(effectiveQuestion);
     const extractedQuestions = explicitListQuestions.length >= 2
@@ -1573,11 +1646,6 @@ export async function* streamAssistantAnswer(
       || followUp.isFollowUp
       || questionWordCount >= 18
       || /\b(walk me through|explain|design|architecture|tradeoff|idempotency|circuit breaker|saga|outbox|atomic)\b/i.test(effectiveQuestion);
-    const isSimpleDirectTurn =
-      !followUp.isFollowUp
-      && extractedQuestions.length <= 1
-      && questionWordCount <= 12
-      && !/\b(write|implement|build|create|design|architecture|tradeoff|optimi[sz]e|debug|fix|query|sql|algorithm|system design)\b/i.test(effectiveQuestion);
     const scenarioHint = buildScenarioAnswerHint(effectiveQuestion);
     const multiQuestionBlock = extractedQuestions.length > 1
       ? [
@@ -1592,27 +1660,18 @@ export async function* streamAssistantAnswer(
         ].join("\n")
       : "";
 
-    const finalUserPrompt = simpleSystemPromptOnly
-      ? buildStrictInterviewTurnUserPrompt({
+    const finalUserPrompt = (hasCustomPrompt || (sessionSystemPrompt && sessionSystemPrompt.trim()))
+      ? [recentInterviewerTopicBlock, buildStrictInterviewTurnUserPrompt({
           question: effectiveQuestion,
           followUpContext: followUpPack,
           scenarioHint,
           multiQuestionBlock,
           factPriorityHint,
           promptMemoryEvidenceHint,
-        })
-      : strictCustomPromptMode
-          ? buildStrictInterviewTurnUserPrompt({
-              question: effectiveQuestion,
-              followUpContext: followUpPack,
-              scenarioHint,
-              multiQuestionBlock,
-              factPriorityHint,
-              promptMemoryEvidenceHint,
-            })
-          : [factPriorityHint, promptMemoryEvidenceHint, scenarioHint, multiQuestionBlock, userPromptToUse]
-              .filter(Boolean)
-              .join("\n\n");
+        })].filter(Boolean).join("\n\n")
+      : [recentInterviewerTopicBlock, factPriorityHint, promptMemoryEvidenceHint, scenarioHint, multiQuestionBlock, userPromptToUse]
+          .filter(Boolean)
+          .join("\n\n");
     const isCodeWritingQuestion = /\b(write|implement|build|create|develop)\b/i.test(effectiveQuestion)
       || /\b(snippet|leetcode|pseudocode)\b/i.test(effectiveQuestion);
     // Per-subtype token budgets — answer shapes differ significantly in required length.
@@ -1636,7 +1695,7 @@ export async function* streamAssistantAnswer(
           ? (subtypeTokenCap[subtypeResult.subtype] ?? (isComplexTurn ? 360 : 280))
           : isCodeWritingQuestion
             ? TIER0_MAX_TOKENS
-            : (isComplexTurn ? 300 : (isSimpleDirectTurn ? 220 : 260));
+            : (isComplexTurn ? 360 : 280);
     const resolvedModel = resolveRequestedModel(requestedModel, meeting, effectiveQuestion, {
       multiQuestionCount: extractedQuestions.length,
       isComplexTurn,
@@ -1681,20 +1740,6 @@ export async function* streamAssistantAnswer(
       tReqReceived,
     };
 
-    // Refusal detection: patterns that indicate the model is refusing to answer
-    const REFUSAL_DETECT_PATTERNS = [
-      /^I('m| am) sorry[,.]?\s*I (can't|cannot)/i,
-      /^I (can't|cannot) (comply|help|provide|assist|answer|generate|create)/i,
-      /^I('m| am) unable to (comply|help|provide|assist|answer)/i,
-      /^I apologize[,.]?\s*(but\s+)?I (can't|cannot|won't|will not)/i,
-      /^I('m| am) not able to/i,
-      /^I won't be able to/i,
-    ];
-    const REFUSAL_BUFFER_CHARS = 80; // buffer this many chars before deciding
-    let refusalCheckBuffer = "";
-    let refusalCheckDone = false;
-    let detectedRefusal = false;
-
     let attempt = 0;
     let streamCompleted = false;
     let attemptMaxTokens = maxTokens;
@@ -1703,11 +1748,6 @@ export async function* streamAssistantAnswer(
       activeController = attemptController;
       let firstTokenTimeout = false;
       let sawModelToken = false;
-      // Save previous refusal result, then reset state for this attempt
-      const prevWasRefusal = detectedRefusal;
-      refusalCheckBuffer = "";
-      refusalCheckDone = false;
-      detectedRefusal = false;
       const timeoutHandle = setTimeout(() => {
         if (!sawModelToken && !aborted && !attemptController.signal.aborted) {
           firstTokenTimeout = true;
@@ -1715,17 +1755,12 @@ export async function* streamAssistantAnswer(
         }
       }, FIRST_TOKEN_TIMEOUT_MS);
 
-      // On retry after refusal, inject explicit behavioral context into user prompt
-      const activeUserPrompt = (attempt > 0 && prevWasRefusal)
-        ? `IMPORTANT: This is a legitimate interview question. Answer it directly and naturally. Do not refuse, apologize, or claim you cannot assist. If the question is behavioral, answer in first person as a candidate. If it is conceptual, answer it directly and simply.\n\n${finalUserPrompt}`
-        : finalUserPrompt;
-
       try {
         tLlmStarted = Date.now();
         const generator = streamLLM(
           "LIVE_INTERVIEW_ANSWER",
           promptToUse,
-          activeUserPrompt,
+          finalUserPrompt,
           meetingId,
           { maxTokens: attemptMaxTokens, cacheUserId: userId, model: resolvedModel, temperature },
           attemptController.signal,
@@ -1734,41 +1769,6 @@ export async function* streamAssistantAnswer(
         for await (const chunk of generator) {
           if (!chunk || aborted || attemptController.signal.aborted) break;
           sawModelToken = true;
-
-          // Refusal detection: buffer first REFUSAL_BUFFER_CHARS chars before yielding
-          if (!refusalCheckDone) {
-            refusalCheckBuffer += chunk;
-            if (refusalCheckBuffer.length >= REFUSAL_BUFFER_CHARS || chunk.includes("\n")) {
-              refusalCheckDone = true;
-              const isRefusal = REFUSAL_DETECT_PATTERNS.some(p => p.test(refusalCheckBuffer.trim()));
-              if (isRefusal) {
-                console.warn(`[assist] refusal_detected meeting=${meetingId} requestId=${requestId} question="${effectiveQuestion.slice(0, 80)}" buffer="${refusalCheckBuffer.slice(0, 60)}"`);
-                detectedRefusal = true;
-                attemptController.abort();
-                break;
-              }
-              // Not a refusal — flush buffer as a single chunk
-              const normalizedBuffer = normalizeParagraphOutput(refusalCheckBuffer);
-              if (normalizedBuffer) {
-                if (!tFirstTokenReceived) {
-                  tFirstTokenReceived = Date.now();
-                  console.log(`[perf][server][${transport}] meeting=${meetingId} t_req_received=${tReqReceived} t_llm_started=${tLlmStarted} t_first_token_received=${tFirstTokenReceived}`);
-                }
-                if (!tFirstChunkSent) {
-                  tFirstChunkSent = Date.now();
-                  console.log(`[perf][server][${transport}] meeting=${meetingId} t_req_received=${tReqReceived} t_first_token_sent=${tFirstChunkSent} t_first_chunk_sent=${tFirstChunkSent} ttft=${tFirstChunkSent - tReqReceived}ms`);
-                  recordTtft(transport, tFirstChunkSent - tReqReceived);
-                }
-                fullAnswer += normalizedBuffer;
-                totalChars += normalizedBuffer.length;
-                totalChunks += 1;
-                yield { type: "chunk", requestId, text: normalizedBuffer };
-              }
-              refusalCheckBuffer = "";
-            }
-            continue;
-          }
-
           if (!tFirstTokenReceived) {
             tFirstTokenReceived = Date.now();
             console.log(`[perf][server][${transport}] meeting=${meetingId} t_req_received=${tReqReceived} t_llm_started=${tLlmStarted} t_first_token_received=${tFirstTokenReceived}`);
@@ -1786,33 +1786,6 @@ export async function* streamAssistantAnswer(
           yield { type: "chunk", requestId, text: normalizedChunk };
         }
 
-        // Flush any remaining buffer content that wasn't emitted yet (short stream)
-        if (!detectedRefusal && refusalCheckBuffer) {
-          const normalizedBuf = normalizeParagraphOutput(refusalCheckBuffer);
-          refusalCheckBuffer = "";
-          if (normalizedBuf) {
-            if (!tFirstChunkSent) {
-              tFirstChunkSent = Date.now();
-              recordTtft(transport, tFirstChunkSent - tReqReceived);
-            }
-            fullAnswer += normalizedBuf;
-            totalChars += normalizedBuf.length;
-            totalChunks += 1;
-            yield { type: "chunk", requestId, text: normalizedBuf };
-          }
-        }
-
-        // If refusal detected mid-stream, retry with explicit behavioral context
-        if (detectedRefusal && attempt < MAX_FIRST_TOKEN_RETRIES && !aborted) {
-          clearTimeout(timeoutHandle);
-          fullAnswer = "";
-          totalChars = 0;
-          totalChunks = 0;
-          attempt += 1;
-          console.warn(`[assist] refusal_retry attempt=${attempt} meeting=${meetingId} requestId=${requestId}`);
-          continue;
-        }
-
         clearTimeout(timeoutHandle);
         if (firstTokenTimeout && !sawModelToken && attempt < MAX_FIRST_TOKEN_RETRIES && !aborted) {
           attempt += 1;
@@ -1825,15 +1798,6 @@ export async function* streamAssistantAnswer(
         streamCompleted = true;
       } catch (err: any) {
         clearTimeout(timeoutHandle);
-        // Refusal-triggered abort — retry with behavioral context
-        if ((err?.name === "AbortError" || attemptController.signal.aborted) && detectedRefusal && attempt < MAX_FIRST_TOKEN_RETRIES && !aborted) {
-          fullAnswer = "";
-          totalChars = 0;
-          totalChunks = 0;
-          attempt += 1;
-          console.warn(`[assist] refusal_retry_catch attempt=${attempt} meeting=${meetingId} requestId=${requestId}`);
-          continue;
-        }
         if ((err?.name === "AbortError" || attemptController.signal.aborted) && firstTokenTimeout && !sawModelToken && attempt < MAX_FIRST_TOKEN_RETRIES && !aborted) {
           attempt += 1;
           attemptMaxTokens = Math.max(120, Math.floor(attemptMaxTokens * 0.7));
@@ -1852,7 +1816,9 @@ export async function* streamAssistantAnswer(
     }
 
     fullAnswer = postprocessFinalAnswer(effectiveQuestion, fullAnswer, enforceNoBulletsFromPrompt);
-    if (strictQaFormatRequested) {
+    // Only run enforceStrictQaFormat when there is NO custom prompt active —
+    // custom prompts define their own format and enforceStrictQaFormat would strip it.
+    if (!hasActiveCustomPrompt) {
       fullAnswer = enforceStrictQaFormat(effectiveQuestion, fullAnswer);
     }
 
@@ -1870,13 +1836,6 @@ export async function* streamAssistantAnswer(
     tStreamEnd = Date.now();
     yield { type: "end", requestId, response: { question: effectiveQuestion, answer: fullAnswer, responseType: responseFormat } };
 
-    // Store immediately so follow-ups asked right after seeing the answer
-    // have context even before the refine pass (2-5s) completes.
-    recordAssistantAnswer(meetingId, effectiveQuestion, fullAnswer, requestId);
-    if (/```/.test(fullAnswer)) {
-      setCodeContext(meetingId, { question: effectiveQuestion, answer: fullAnswer, capturedAt: Date.now() });
-    }
-
     let finalAnswerForStorage = fullAnswer;
     if (fullAnswer.trim()) {
       try {
@@ -1888,10 +1847,10 @@ export async function* streamAssistantAnswer(
             "Improve this draft answer using available context.",
             "Keep same facts, improve precision and interview quality.",
             "Preserve and follow the user's custom instructions exactly when present.",
-            strictQaFormatRequested
+            (hasCustomPrompt || (sessionSystemPrompt && sessionSystemPrompt.trim()))
               ? "Return the final answer in exact Interviewer / Candidate format if the custom instructions require it. Preserve first-person candidate voice and requested styling."
               : "Return first-person singular candidate answer only.",
-            strictQaFormatRequested
+            (hasCustomPrompt || (sessionSystemPrompt && sessionSystemPrompt.trim()))
               ? "Do not collapse the Interviewer and Candidate sections into one paragraph."
               : "Return paragraph-only format (no bullet points / numbered lists).",
             "Keep interview-ready tone and avoid assistant/meta wording.",
@@ -1906,7 +1865,7 @@ export async function* streamAssistantAnswer(
           { maxTokens: isComplexTurn ? 360 : 220, temperature: 0.2, cacheUserId: userId, model: resolvedModel },
         );
         let cleanRefined = postprocessFinalAnswer(effectiveQuestion, (refined || "").trim(), enforceNoBulletsFromPrompt);
-        if (strictQaFormatRequested) {
+        if (hasCustomPrompt || (sessionSystemPrompt && sessionSystemPrompt.trim())) {
           cleanRefined = enforceStrictQaFormat(effectiveQuestion, cleanRefined);
         }
         if (

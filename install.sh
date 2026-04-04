@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 ##############################################################################
 # Zoom Mate - AI Interview Assistant
@@ -38,6 +38,10 @@ fi
 APP_NAME="zoommate"
 APP_DIR="/opt/zoommate"
 APP_USER="zoommate"
+APP_GROUP="zoommate"
+APP_ENV_FILE="$APP_DIR/.env"
+APP_ENV_LOADER="$APP_DIR/bin/zoommate-env.sh"
+SOURCE_DIR="$(cd "$(dirname "$0")" && pwd)"
 DB_NAME="zoommate_db"
 DB_USER="zoommate_user"
 DB_PASS=$(openssl rand -hex 16)
@@ -74,7 +78,7 @@ apt-get update -qq
 apt-get upgrade -y -qq
 
 log_info "Installing essential packages..."
-apt-get install -y -qq curl wget git build-essential software-properties-common \
+apt-get install -y -qq curl wget git rsync build-essential software-properties-common \
   apt-transport-https ca-certificates gnupg lsb-release ufw
 
 ##############################################################################
@@ -115,6 +119,29 @@ else
 fi
 
 ##############################################################################
+# 4.5 Reuse existing configuration on re-runs
+##############################################################################
+if [ -f "$APP_ENV_FILE" ]; then
+  log_info "Existing environment found at $APP_ENV_FILE, reusing persisted secrets/config when possible..."
+  # shellcheck disable=SC1090
+  set -a
+  source "$APP_ENV_FILE"
+  set +a
+  DB_PASS="${DATABASE_URL#*://}"
+  DB_PASS="${DB_PASS#*:}"
+  DB_PASS="${DB_PASS%@*}"
+  DB_NAME="${DATABASE_URL##*/}"
+  DB_USER="${DATABASE_URL#*://}"
+  DB_USER="${DB_USER%%:*}"
+  SESSION_SECRET="${SESSION_SECRET:-$SESSION_SECRET}"
+  OPENAI_KEY="${OPENAI_KEY:-${OPENAI_API_KEY:-}}"
+  STRIPE_SECRET="${STRIPE_SECRET:-${STRIPE_SECRET_KEY:-}}"
+  STRIPE_PUBLISHABLE="${STRIPE_PUBLISHABLE:-${STRIPE_PUBLISHABLE_KEY:-}}"
+  PORT="${PORT:-5000}"
+  log_success "Reused existing application secrets and settings"
+fi
+
+##############################################################################
 # 5. Set up PostgreSQL database
 ##############################################################################
 log_info "Setting up database..."
@@ -135,10 +162,11 @@ DATABASE_URL="postgresql://$DB_USER:$DB_PASS@localhost:5432/$DB_NAME"
 ##############################################################################
 log_info "Setting up application directory..."
 mkdir -p "$APP_DIR"
+mkdir -p "$APP_DIR/bin"
 
-if [ -d ".git" ] && [ -f "package.json" ]; then
-  log_info "Copying application files from current directory..."
-  rsync -a --exclude='node_modules' --exclude='.git' --exclude='.env' . "$APP_DIR/"
+if [ -f "$SOURCE_DIR/package.json" ] && [ -d "$SOURCE_DIR/client" ] && [ -d "$SOURCE_DIR/server" ]; then
+  log_info "Copying application files from $SOURCE_DIR..."
+  rsync -a --exclude='node_modules' --exclude='.git' --exclude='.env' "$SOURCE_DIR/" "$APP_DIR/"
 else
   log_error "No application files found. Please run this script from the project root directory."
   log_error "Example: cd /path/to/zoommate && sudo ./install.sh"
@@ -165,42 +193,64 @@ write_env_var() {
   fi
 }
 
-: > "$APP_DIR/.env"
-echo "# Zoom Mate Environment Configuration" >> "$APP_DIR/.env"
-echo "# Generated on $(date)" >> "$APP_DIR/.env"
-echo "" >> "$APP_DIR/.env"
+: > "$APP_ENV_FILE"
+echo "# Zoom Mate Environment Configuration" >> "$APP_ENV_FILE"
+echo "# Generated on $(date)" >> "$APP_ENV_FILE"
+echo "" >> "$APP_ENV_FILE"
 write_env_var "NODE_ENV" "production"
 write_env_var "PORT" "$PORT"
 write_env_var "DATABASE_URL" "$DATABASE_URL"
 write_env_var "SESSION_SECRET" "$SESSION_SECRET"
-echo "" >> "$APP_DIR/.env"
-echo "# AI API Keys" >> "$APP_DIR/.env"
+echo "" >> "$APP_ENV_FILE"
+echo "# AI API Keys" >> "$APP_ENV_FILE"
 [ -n "$OPENAI_KEY" ] && write_env_var "OPENAI_API_KEY" "$OPENAI_KEY"
-echo "" >> "$APP_DIR/.env"
-echo "# Stripe Configuration (optional)" >> "$APP_DIR/.env"
+echo "" >> "$APP_ENV_FILE"
+echo "# Stripe Configuration (optional)" >> "$APP_ENV_FILE"
 [ -n "$STRIPE_SECRET" ] && write_env_var "STRIPE_SECRET_KEY" "$STRIPE_SECRET"
 [ -n "$STRIPE_PUBLISHABLE" ] && write_env_var "STRIPE_PUBLISHABLE_KEY" "$STRIPE_PUBLISHABLE"
-echo "" >> "$APP_DIR/.env"
+echo "" >> "$APP_ENV_FILE"
 write_env_var "APP_DOMAIN" "${DOMAIN:-localhost}"
 
-chmod 600 "$APP_DIR/.env"
-chown "$APP_USER:$APP_USER" "$APP_DIR/.env"
-log_success "Environment file created at $APP_DIR/.env"
+cat > "$APP_ENV_LOADER" << 'EOF'
+#!/bin/bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+if [ -f ".env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  source ".env"
+  set +a
+fi
+exec "$@"
+EOF
+
+chmod 600 "$APP_ENV_FILE"
+chmod 755 "$APP_ENV_LOADER"
+chown "$APP_USER:$APP_GROUP" "$APP_ENV_FILE" "$APP_ENV_LOADER"
+log_success "Environment file created at $APP_ENV_FILE"
+log_success "Environment loader created at $APP_ENV_LOADER"
 
 ##############################################################################
 # 8. Install dependencies and build
 ##############################################################################
 log_info "Installing Node.js dependencies..."
 cd "$APP_DIR"
-sudo -u "$APP_USER" npm install --production=false 2>&1 | tail -3
+rm -rf "$APP_DIR/node_modules"
+if [ -f "$APP_DIR/package-lock.json" ]; then
+  sudo -u "$APP_USER" env -u NODE_ENV npm ci --include=dev
+else
+  sudo -u "$APP_USER" env -u NODE_ENV npm install --include=dev
+fi
+sudo -u "$APP_USER" npx tsx --version >/dev/null
 log_success "Dependencies installed"
 
 log_info "Building application..."
-sudo -u "$APP_USER" npm run build 2>&1 | tail -5
+sudo -u "$APP_USER" env -u NODE_ENV "$APP_ENV_LOADER" npm run build
+[ -f "$APP_DIR/dist/index.cjs" ] || { log_error "Build finished without dist/index.cjs"; exit 1; }
 log_success "Application built successfully"
 
 log_info "Pushing database schema..."
-sudo -u "$APP_USER" bash -c "cd $APP_DIR && DATABASE_URL='$DATABASE_URL' npx drizzle-kit push --force" 2>&1 | tail -5
+sudo -u "$APP_USER" bash -lc "cd '$APP_DIR' && set -a && source '$APP_ENV_FILE' && set +a && npx drizzle-kit push --force"
 log_success "Database schema applied"
 
 ##############################################################################
@@ -216,10 +266,9 @@ Requires=postgresql.service
 [Service]
 Type=simple
 User=$APP_USER
-Group=$APP_USER
+Group=$APP_GROUP
 WorkingDirectory=$APP_DIR
-EnvironmentFile=$APP_DIR/.env
-ExecStart=/usr/bin/node dist/index.cjs
+ExecStart=/bin/bash -lc 'cd "$APP_DIR" && set -a && source "$APP_ENV_FILE" && set +a && exec /usr/bin/node dist/index.cjs'
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -244,6 +293,19 @@ systemctl daemon-reload
 systemctl enable zoommate
 systemctl start zoommate
 log_success "Systemd service created and started"
+
+log_info "Waiting for service health..."
+sleep 5
+if ! systemctl is-active --quiet zoommate; then
+  log_error "zoommate service failed to become healthy"
+  journalctl -u zoommate -n 50 --no-pager || true
+  exit 1
+fi
+if ! curl -fsS "http://127.0.0.1:$PORT" >/dev/null 2>&1; then
+  log_warn "Service is running but HTTP health probe on port $PORT did not return 200 yet"
+else
+  log_success "Application is responding on port $PORT"
+fi
 
 ##############################################################################
 # 10. Nginx reverse proxy
@@ -369,7 +431,8 @@ log_success "Zoom Mate has been installed successfully!"
 echo ""
 echo "  Application URL:  ${DOMAIN:+https://$DOMAIN}${DOMAIN:-http://$(hostname -I | awk '{print $1}')}"
 echo "  App Directory:    $APP_DIR"
-echo "  Config File:      $APP_DIR/.env"
+echo "  Config File:      $APP_ENV_FILE"
+echo "  Env Loader:       $APP_ENV_LOADER"
 echo "  Service Name:     zoommate"
 echo ""
 echo "  Default Admin Account:"
@@ -387,7 +450,7 @@ echo "    sudo systemctl status zoommate     - Check service status"
 echo "    sudo systemctl restart zoommate    - Restart the app"
 echo "    sudo systemctl stop zoommate       - Stop the app"
 echo "    sudo journalctl -u zoommate -f     - View live logs"
-echo "    sudo nano $APP_DIR/.env            - Edit configuration"
+echo "    sudo nano $APP_ENV_FILE            - Edit configuration"
 echo ""
 echo "  After editing .env, restart with:"
 echo "    sudo systemctl restart zoommate"

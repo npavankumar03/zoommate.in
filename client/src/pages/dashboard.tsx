@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Link, useLocation } from "wouter";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -27,7 +27,7 @@ import {
   Users, Gamepad2, Trash2, Upload, ArrowRight, LogOut,
   FolderOpen, Settings, Code, MessageSquare, Shield, CreditCard, ExternalLink, Loader2,
   Monitor, ScreenShare, Search, Filter, Pencil, UserRound, KeyRound, ChevronDown, CheckCircle2,
-  Phone, Timer, Flame, Download
+  Phone, Timer, Flame, Download, Check
 } from "lucide-react";
 import { motion } from "framer-motion";
 
@@ -555,6 +555,206 @@ function formatPromptPreview(text?: string | null) {
   return lines.join("\n");
 }
 
+function InlineDocumentSection({
+  documents,
+  selectedDocs,
+  toggleDoc,
+  onUploaded,
+}: {
+  documents: Document[];
+  selectedDocs: string[];
+  toggleDoc: (id: string) => void;
+  onUploaded: (id: string) => void;
+}) {
+  const { toast } = useToast();
+  const [showUpload, setShowUpload] = useState(false);
+  const [uploadName, setUploadName] = useState("");
+  const [uploadContent, setUploadContent] = useState("");
+  const uploadType = "general";
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const resetUpload = () => {
+    setUploadName("");
+    setUploadContent("");
+    setSelectedFile(null);
+    setShowUpload(false);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (file.size > 20 * 1024 * 1024) {
+      toast({ title: "File too large", description: "Max 20MB", variant: "destructive" });
+      return;
+    }
+    setSelectedFile(file);
+    setUploadName(file.name.replace(/\.[^.]+$/, ""));
+    setUploadContent("");
+  };
+
+  const handleUpload = async () => {
+    if (selectedFile) {
+      setIsUploading(true);
+      try {
+        const formData = new FormData();
+        formData.append("file", selectedFile);
+        formData.append("name", uploadName || selectedFile.name.replace(/\.[^.]+$/, ""));
+        formData.append("type", uploadType);
+        const res = await fetch("/api/documents/upload", { method: "POST", body: formData, credentials: "include" });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ message: "Upload failed" }));
+          throw new Error(err.message || "Upload failed");
+        }
+        const doc = await res.json();
+        queryClient.invalidateQueries({ queryKey: ["/api/documents"] });
+        onUploaded(doc.id);
+        toast({ title: "Document uploaded" });
+        resetUpload();
+      } catch (err: any) {
+        toast({ title: "Upload failed", description: err.message, variant: "destructive" });
+      } finally {
+        setIsUploading(false);
+      }
+      return;
+    }
+    if (!uploadName.trim() || !uploadContent.trim()) {
+      toast({ title: "Name and content are required", variant: "destructive" });
+      return;
+    }
+    setIsUploading(true);
+    try {
+      const res = await fetch("/api/documents", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ name: uploadName, content: uploadContent, type: uploadType }),
+      });
+      if (!res.ok) throw new Error("Failed to save");
+      const doc = await res.json();
+      queryClient.invalidateQueries({ queryKey: ["/api/documents"] });
+      onUploaded(doc.id);
+      toast({ title: "Document saved" });
+      resetUpload();
+    } catch (err: any) {
+      toast({ title: "Failed to save document", description: err.message, variant: "destructive" });
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center justify-between">
+        <Label>Documents</Label>
+        <button
+          type="button"
+          onClick={() => setShowUpload((v) => !v)}
+          className="flex items-center gap-1 text-xs text-primary hover:underline"
+        >
+          <Upload className="w-3 h-3" />
+          {showUpload ? "Cancel" : "Upload new"}
+        </button>
+      </div>
+      <p className="text-xs text-muted-foreground">Select documents this assistant can reference during sessions.</p>
+
+      {/* Existing docs list */}
+      {documents.length > 0 && (
+        <div className="space-y-1.5 max-h-40 overflow-y-auto">
+          {documents.map((doc) => (
+            <div
+              key={doc.id}
+              onClick={() => toggleDoc(doc.id)}
+              className={`flex items-center gap-2 p-2 rounded-md cursor-pointer border text-sm transition-colors ${
+                selectedDocs.includes(doc.id) ? "border-primary bg-primary/5" : "border-transparent hover:bg-muted/50"
+              }`}
+              data-testid={`button-assistant-doc-${doc.id}`}
+            >
+              <FileText className="w-4 h-4 text-muted-foreground shrink-0" />
+              <span className="truncate flex-1">{doc.name}</span>
+              <Badge variant="secondary" className="ml-auto text-xs shrink-0">{doc.type}</Badge>
+              {selectedDocs.includes(doc.id) && <Check className="w-4 h-4 text-primary shrink-0" />}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {documents.length === 0 && !showUpload && (
+        <p className="text-xs text-muted-foreground italic">No documents yet. Upload one to get started.</p>
+      )}
+
+      {/* Inline upload form */}
+      {showUpload && (
+        <div className="rounded-md border p-3 space-y-3 bg-muted/10">
+          <div className="space-y-1.5">
+            <Label className="text-xs">Name</Label>
+            <Input
+              value={uploadName}
+              onChange={(e) => setUploadName(e.target.value)}
+              placeholder="e.g. My Resume"
+              className="h-8 text-sm"
+            />
+          </div>
+
+          {/* File pick or paste */}
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".pdf,.doc,.docx,.txt"
+                className="hidden"
+                onChange={handleFileSelect}
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-8 text-xs"
+                onClick={() => fileInputRef.current?.click()}
+              >
+                <Upload className="w-3 h-3 mr-1" />
+                {selectedFile ? selectedFile.name : "Choose file"}
+              </Button>
+              {selectedFile && (
+                <button
+                  type="button"
+                  className="text-xs text-muted-foreground hover:text-foreground"
+                  onClick={() => { setSelectedFile(null); if (fileInputRef.current) fileInputRef.current.value = ""; }}
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+            {!selectedFile && (
+              <Textarea
+                value={uploadContent}
+                onChange={(e) => setUploadContent(e.target.value)}
+                placeholder="Or paste text content here..."
+                className="resize-y min-h-[80px] text-sm"
+                rows={3}
+              />
+            )}
+          </div>
+
+          <Button
+            type="button"
+            size="sm"
+            className="w-full h-8 text-xs"
+            onClick={handleUpload}
+            disabled={isUploading}
+          >
+            {isUploading ? <Loader2 className="w-3 h-3 animate-spin mr-1" /> : <Upload className="w-3 h-3 mr-1" />}
+            {isUploading ? "Uploading..." : "Upload & Select"}
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function AssistantEditorDialog({
   assistant,
   trigger,
@@ -570,6 +770,7 @@ function AssistantEditorDialog({
   const [model, setModel] = useState(assistant?.model || "automatic");
   const [instructions, setInstructions] = useState(assistant?.customInstructions || "");
   const [responseFormat, setResponseFormat] = useState(assistant?.responseFormat || "concise");
+  const [selectedDocs, setSelectedDocs] = useState<string[]>((assistant?.documentIds as string[]) || []);
   const [quickInterviewMode, setQuickInterviewMode] = useState(Boolean((assistant?.interviewStyle as any)?.quickInterview));
   const [targetRole, setTargetRole] = useState(String((assistant?.interviewStyle as any)?.targetRole || ""));
   const [experienceYears, setExperienceYears] = useState(
@@ -583,6 +784,7 @@ function AssistantEditorDialog({
     copilotType,
     model,
     customInstructions: instructions || undefined,
+    documentIds: selectedDocs,
     responseFormat,
     sessionMode: "interview",
     interviewStyle: quickInterviewMode
@@ -597,6 +799,13 @@ function AssistantEditorDialog({
   const { data: availableModels } = useQuery<{ openai: string[]; gemini: string[] }>({
     queryKey: ["/api/models"],
   });
+
+  const { data: documents = [] } = useQuery<Document[]>({
+    queryKey: ["/api/documents"],
+  });
+
+  const toggleDoc = (id: string) =>
+    setSelectedDocs((prev) => prev.includes(id) ? prev.filter((d) => d !== id) : [...prev, id]);
 
   const saveMutation = useMutation({
     mutationFn: async () => {
@@ -643,6 +852,7 @@ function AssistantEditorDialog({
         responseFormat,
         model,
         customInstructions: instructions || undefined,
+        documentIds: selectedDocs,
         sessionMode: "interview",
         interviewStyle: quickInterviewMode
           ? {
@@ -817,6 +1027,13 @@ function AssistantEditorDialog({
                   data-testid="input-assistant-system-prompt"
                 />
               </div>
+
+              <InlineDocumentSection
+                documents={documents}
+                selectedDocs={selectedDocs}
+                toggleDoc={toggleDoc}
+                onUploaded={(id) => setSelectedDocs((prev) => [...prev, id])}
+              />
             </div>
           </div>
 

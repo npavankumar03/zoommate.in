@@ -65,47 +65,15 @@ function getOrCreate(meetingId: string): SessionState {
   return created;
 }
 
-function localComputeWordOverlap(textA: string, textB: string): number {
-  const wordsA = String(textA || "").toLowerCase().split(/\s+/).filter((word) => word.length > 3);
-  const wordsB = new Set(String(textB || "").toLowerCase().split(/\s+/).filter((word) => word.length > 3));
-  if (!wordsA.length) return 0;
-  let matches = 0;
-  for (const word of wordsA) {
-    if (wordsB.has(word)) matches += 1;
-  }
-  return matches / wordsA.length;
-}
-
-function localQuestionSupersedes(candidate: string, existing: string): boolean {
-  const next = normalizeForDedup(candidate || "");
-  const prev = normalizeForDedup(existing || "");
-  if (!next || !prev || next === prev) return false;
-
-  const nextWords = next.split(/\s+/).filter(Boolean);
-  const prevWords = prev.split(/\s+/).filter(Boolean);
-  if (nextWords.length < prevWords.length) return false;
-
-  const prevLooksFragment =
-    prevWords.length <= 4
-    || /^(and|also|plus|or|so|hmm|okay|ok|right|wait|hold on|then|next|backend|frontend|database|project|team|testing|scale|yourself|role|outcome|after that)\??$/.test(prev)
-    || /\b(in|with|at|for|on|about|of|from|to|by|and|or|the|a|an|any|some|your|our|their|its|this|that|these|those)\s*$/.test(prev);
-
-  const overlap = Math.max(localComputeWordOverlap(next, prev), localComputeWordOverlap(prev, next));
-  if (prevLooksFragment && (next.includes(prev) || overlap >= 0.66)) return true;
-  return next.startsWith(prevWords.join(" ")) && next.length > prev.length + 4;
-}
-
 function markQuestionAnsweredByText(s: SessionState, question: string, ts = Date.now()): void {
   const norm = normalizeForDedup(question || "");
   if (!norm) return;
   for (let i = s.interviewerQuestions.length - 1; i >= 0; i--) {
     const q = s.interviewerQuestions[i];
     if (q.answeredTs) continue;
-    const same = q.norm === norm;
-    const superseded = localQuestionSupersedes(question, q.text) || localQuestionSupersedes(q.text, question);
-    const similar = localComputeWordOverlap(q.norm, norm) > 0.82 || localComputeWordOverlap(norm, q.norm) > 0.82;
-    if (same || superseded || similar) {
+    if (q.norm === norm) {
       q.answeredTs = ts;
+      return;
     }
   }
 }
@@ -154,19 +122,10 @@ export function recordInterviewerQuestion(meetingId: string, question: string, t
   const clean = String(question || "").trim();
   const norm = normalizeForDedup(clean);
   if (!clean || !norm) return;
-  const recent = s.interviewerQuestions.find((q) => {
-    if ((ts - q.ts) > 120000) return false;
-    if (q.norm === norm) return true;
-    if (localQuestionSupersedes(clean, q.text) || localQuestionSupersedes(q.text, clean)) return true;
-    return localComputeWordOverlap(q.norm, norm) > 0.82 || localComputeWordOverlap(norm, q.norm) > 0.82;
-  });
+  const recent = s.interviewerQuestions.find((q) => (ts - q.ts) <= 120000 && q.norm === norm);
   if (recent) {
     recent.ts = ts;
-    if (!recent.text || recent.text.length < clean.length || localQuestionSupersedes(clean, recent.text)) {
-      recent.text = clean;
-      recent.norm = norm;
-      recent.answeredTs = undefined;
-    }
+    if (!recent.text || recent.text.length < clean.length) recent.text = clean;
     return;
   }
   s.interviewerQuestions.push({ text: clean, norm, ts });
@@ -282,7 +241,10 @@ export function selectRelevantQAPairs(
  */
 export function isVagueQuestion(text: string): boolean {
   const q = String(text || "").toLowerCase();
-  return /\b(that thing|you mentioned|you said|earlier|going back|what about that|elaborate on that|tell me more about that|expand on that|what did you mean|refer(red)? to|as you (said|mentioned)|like you (said|mentioned)|the (thing|point|example|part) you|what was that|can you (clarify|explain) (that|what you)|what you (said|mentioned|talked about))\b/.test(q);
+  // Pronoun at end of sentence — "differentiate it", "explain it", "compare them", "describe that"
+  const pronounAtEnd = /\b(differentiate|compare|explain|describe|elaborate|expand|clarify|contrast|evaluate|assess|discuss|summarize|outline|detail|justify|analyse|analyze|use|implement|apply|improve|optimize|fix|change|update|modify|refactor|extend|convert|rewrite)\s+(it|that|this|them|those|these)\b/.test(q)
+    || /\b(it|that|this|them|those|these)\s*\??\s*$/.test(q.trim());
+  return pronounAtEnd || /\b(that thing|you mentioned|you said|earlier|going back|what about that|elaborate on that|tell me more about that|expand on that|what did you mean|refer(red)? to|as you (said|mentioned)|like you (said|mentioned)|the (thing|point|example|part) you|what was that|can you (clarify|explain) (that|what you)|what you (said|mentioned|talked about)|which code|that code|the code|what code|which (one|project|example|approach|method|function|solution)|that (project|example|approach|method|function|solution)|why (that|this|did you use)|how (that|this|it) work|what does (that|this|it)|why (are you|were you|did you) using|which (database|library|framework|tool|language)|the one you|that one)\b/.test(q);
 }
 
 function classifyQuestionIntent(text: string): string {

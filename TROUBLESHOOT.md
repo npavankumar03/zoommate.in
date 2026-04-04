@@ -115,6 +115,37 @@ cd /opt/zoommate
 sudo -u zoommate npm install
 ```
 
+### Build Fails: `tsx: not found`
+**Cause:** Dev dependencies were skipped, usually because `NODE_ENV=production` was set before `npm install`.
+
+**Solution:**
+```bash
+cd /opt/zoommate
+sudo -u zoommate env -u NODE_ENV npm install --include=dev
+sudo -u zoommate npx tsx --version
+sudo -u zoommate env -u NODE_ENV npm run build
+```
+
+**Do not** build this repo with production-only dependencies. `tsx` is required for `npm run build`.
+
+### Build Fails: `Failed to resolve entry for package "framer-motion"`
+**Cause:** The install on the server is inconsistent or partially reused. This is usually fixed by a clean lockfile-based reinstall.
+
+**Solution:**
+```bash
+cd /opt/zoommate
+rm -rf node_modules
+unset NODE_ENV
+npm ci --include=dev
+npx tsx --version
+npm run build
+```
+
+If `package-lock.json` is missing, use:
+```bash
+npm install --include=dev
+```
+
 ### Build Fails: "Out of memory"
 **Cause:** Not enough RAM for the build process.
 **Solution:** Add swap space:
@@ -348,6 +379,28 @@ sudo -u postgres psql -d zoommate_db -c "UPDATE users SET password='$NEW_HASH' W
 
 echo "Admin password reset to: newpassword123"
 ```
+
+### Error: `DATABASE_URL must be set`
+**Cause:** The service started without exporting `.env` into the runtime shell.
+
+**Check the configured file:**
+```bash
+sudo cat /opt/zoommate/.env | grep DATABASE_URL
+```
+
+**Check the systemd service:**
+```bash
+sudo systemctl cat zoommate
+```
+
+**Restart after reloading `.env`:**
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart zoommate
+sudo journalctl -u zoommate -n 50 --no-pager
+```
+
+The current installer creates `/opt/zoommate/bin/zoommate-env.sh` and starts the service through a shell that explicitly sources `/opt/zoommate/.env` before running `node dist/index.cjs`.
 
 ### Create a New Admin User
 ```bash

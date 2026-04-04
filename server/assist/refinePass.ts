@@ -43,13 +43,6 @@ const REFINE_CONFIGS: Record<TechnicalSubtype, { maxTokens: number; temperature:
 export function getRefineConfig(question: string, hasCodingContext: boolean): RefineConfig | null {
   const result = detectTechnicalSubtype(question, hasCodingContext);
   if (!result) return null;
-  const normalized = String(question || "").toLowerCase();
-  const explicitDeepTechnical =
-    hasCodingContext
-    || /\b(write|implement|build|create|code|query|sql|debug|fix|optimi[sz]e|complexity|algorithm|design|architecture|scale|trade-?off|system design)\b/.test(normalized);
-  if ((result.subtype === "backend" || result.subtype === "frontend") && !explicitDeepTechnical) {
-    return null;
-  }
   const cfg = REFINE_CONFIGS[result.subtype];
   return { subtype: result.subtype, ...cfg };
 }

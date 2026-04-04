@@ -62,11 +62,11 @@ export function resolveAutomaticInterviewModel(
   const tier = chooseAnswerRoutingTier(question, options);
   // All tiers prefer gpt-4o-mini; fall back to Gemini only if OpenAI key is absent.
   if (tier === "large") {
-    // Coding, system design, deep reasoning — use the most capable available model
-    return pickAvailableModel(["gpt-4o", "gpt-4.1", "gemini-2.5-pro", "gpt-4o-mini", "gemini-2.0-flash"]);
+    // Coding, system design — use fast models; gpt-4o-mini is 3x faster than gpt-4o with equivalent interview quality
+    return pickAvailableModel(["gpt-4o-mini", "gemini-2.0-flash", "gpt-4o", "gpt-4.1"]);
   }
   if (tier === "medium") {
-    return pickAvailableModel(["gpt-4o-mini", "gemini-2.5-flash", "gemini-2.0-flash"]);
+    return pickAvailableModel(["gpt-4o-mini", "gemini-2.0-flash"]);
   }
   return pickAvailableModel(["gpt-4o-mini", "gemini-2.0-flash"]);
 }
@@ -346,6 +346,51 @@ export async function* streamLLM(
 
       if (!response.ok) {
         const errText = await response.text();
+        // On 429 rate-limit: parse retry delay and attempt one retry before giving up.
+        if (response.status === 429 && !abortSignal?.aborted) {
+          const retryAfterHeader = response.headers.get("retry-after");
+          const bodyMatch = errText.match(/try again in (\d+)/i);
+          const delaySec = retryAfterHeader
+            ? Math.min(parseInt(retryAfterHeader, 10) || 3, 10)
+            : bodyMatch ? Math.min(parseInt(bodyMatch[1], 10) || 3, 10) : 3;
+          console.warn(`[llm][stream] 429 rate limit — retrying in ${delaySec}s (${useCase})`);
+          await new Promise((r) => setTimeout(r, delaySec * 1000));
+          if (!abortSignal?.aborted) {
+            const retryRes = await fetch("https://api.openai.com/v1/chat/completions", {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "Authorization": `Bearer ${config.apiKey}` },
+              body: JSON.stringify(body),
+              signal: abortSignal,
+            });
+            if (retryRes.ok && retryRes.body) {
+              // re-assign to the retry response and fall through to the streaming loop
+              Object.assign(response, retryRes);
+              // Re-read body from retryRes — note: we have to re-enter the loop manually
+              const retryDecoder = new TextDecoder();
+              let retryBuffer = "";
+              for await (const rawChunk of retryRes.body as any) {
+                if (abortSignal?.aborted) break;
+                const text = typeof rawChunk === "string" ? rawChunk : retryDecoder.decode(rawChunk, { stream: true });
+                retryBuffer += text;
+                const parts = retryBuffer.split("\n");
+                retryBuffer = parts.pop() || "";
+                for (const line of parts) {
+                  const trimmed = line.trim();
+                  if (!trimmed || !trimmed.startsWith("data: ")) continue;
+                  const data = trimmed.slice(6);
+                  if (data === "[DONE]") continue;
+                  try {
+                    const parsed = JSON.parse(data);
+                    const delta = parsed.choices?.[0]?.delta || {};
+                    const content: string = (typeof delta?.content === "string" ? delta.content : "") || "";
+                    if (content) { if (!ttft) ttft = Date.now() - t0; totalChars += content.length; yieldedAny = true; yield content; }
+                  } catch {}
+                }
+              }
+              return; // done via retry path
+            }
+          }
+        }
         throw new Error(`LLM API error (${response.status}): ${errText.slice(0, 200)}`);
       }
 
@@ -443,6 +488,30 @@ export async function* streamLLM(
       success: false,
       errorCode: err.message?.slice(0, 100),
     }).catch(() => {});
+    // On OpenAI error (rate limit, quota, etc.) fall back to Gemini streaming.
+    if (config.provider === "openai" && !abortSignal?.aborted) {
+      try {
+        const geminiKey = await getGeminiKey();
+        if (geminiKey) {
+          console.warn(`[llm][stream] OpenAI error — falling back to Gemini (${useCase}): ${err.message?.slice(0, 80)}`);
+          const client = new GoogleGenerativeAI(geminiKey);
+          const genModel = client.getGenerativeModel({
+            model: "gemini-2.0-flash",
+            systemInstruction: systemPrompt,
+            generationConfig: { maxOutputTokens: maxTokens, temperature },
+          });
+          const result = await genModel.generateContentStream(userMessage);
+          for await (const chunk of result.stream) {
+            if (abortSignal?.aborted) break;
+            const text = chunk.text();
+            if (text) { totalChars += text.length; yieldedAny = true; yield text; }
+          }
+          return;
+        }
+      } catch (fbErr: any) {
+        console.error(`[llm][stream] Gemini fallback also failed:`, fbErr.message?.slice(0, 80));
+      }
+    }
     throw err;
   }
 }

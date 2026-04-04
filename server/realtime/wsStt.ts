@@ -19,12 +19,11 @@ interface SttSession {
   finalized: boolean;
   googleStream: any | null;
   useGoogleStt: boolean;
-  turnBuffer: Array<{ text: string; startMs?: number; endMs?: number; speakerTag?: number }>;
+  turnBuffer: string[];
   lastFinalAt: number;
   turnBoundaryTimer: ReturnType<typeof setTimeout> | null;
   currentSpeaker: number; // diarization speaker tag (1 = first speaker, 2 = second, etc.)
-  speakerHistory: Array<{ tag: number; count: number }>;
-  interviewerSpeakerTag: number;
+  speakerHistory: Array<{ tag: number; count: number }>; // track which tag is interviewer
   isEarlyFire: boolean;   // true while handleFinal is being called from a high-stability interim
   earlyFiredAt: number;   // timestamp of last early fire (0 = none)
 }
@@ -75,12 +74,11 @@ function wordTimeToMs(wt: any): number {
   return secs * 1000 + Math.floor(nanos / 1_000_000);
 }
 
-function splitByPauses(words: any[], pauseThresholdMs = 500): Array<{ text: string; speakerTag: number; startMs?: number; endMs?: number }> {
+function splitByPauses(words: any[], pauseThresholdMs = 500): Array<{ text: string; speakerTag: number }> {
   if (!words || words.length === 0) return [];
-  const segments: Array<{ text: string; speakerTag: number; startMs?: number; endMs?: number }> = [];
+  const segments: Array<{ text: string; speakerTag: number }> = [];
   let current: string[] = [];
   let currentSpeaker = words[0]?.speakerTag || 0;
-  let segmentStartMs = wordTimeToMs(words[0]?.startTime);
   let prevEndMs = 0;
 
   for (const word of words) {
@@ -90,42 +88,18 @@ function splitByPauses(words: any[], pauseThresholdMs = 500): Array<{ text: stri
     const speakerChanged = word.speakerTag && word.speakerTag !== currentSpeaker && currentSpeaker !== 0;
 
     if ((pause > pauseThresholdMs || speakerChanged) && current.length > 0) {
-      segments.push({ text: current.join(" "), speakerTag: currentSpeaker, startMs: segmentStartMs || undefined, endMs: prevEndMs || undefined });
+      segments.push({ text: current.join(" "), speakerTag: currentSpeaker });
       current = [];
       currentSpeaker = word.speakerTag || currentSpeaker;
-      segmentStartMs = startMs;
     }
     current.push(String(word.word || ""));
     prevEndMs = endMs;
   }
 
   if (current.length > 0) {
-    segments.push({ text: current.join(" "), speakerTag: currentSpeaker, startMs: segmentStartMs || undefined, endMs: prevEndMs || undefined });
+    segments.push({ text: current.join(" "), speakerTag: currentSpeaker });
   }
   return segments.filter((s) => s.text.trim().length > 0);
-}
-
-function rememberSpeakerTag(session: SttSession, speakerTag?: number) {
-  if (!speakerTag || speakerTag <= 0) return;
-  const existing = session.speakerHistory.find((entry) => entry.tag === speakerTag);
-  if (existing) {
-    existing.count += 1;
-    return;
-  }
-  session.speakerHistory.push({ tag: speakerTag, count: 1 });
-}
-
-function resolveSpeakerLabel(
-  session: SttSession,
-  speakerTag?: number,
-  isQuestion = false,
-): "interviewer" | "candidate" | "unknown" {
-  if (isQuestion) return "interviewer";
-  if (!speakerTag || speakerTag <= 0) return "unknown";
-  if (session.interviewerSpeakerTag > 0) {
-    return session.interviewerSpeakerTag === speakerTag ? "interviewer" : "candidate";
-  }
-  return "unknown";
 }
 
 const activeSessions = new Map<string, SttSession>();
@@ -229,7 +203,6 @@ export function setupWsStt(httpServer: Server): void {
       turnBoundaryTimer: null,
       currentSpeaker: 0,
       speakerHistory: [],
-      interviewerSpeakerTag: 0,
       isEarlyFire: false,
       earlyFiredAt: 0,
     };
@@ -352,14 +325,14 @@ async function startGoogleStream(session: SttSession, language: string): Promise
           const segments = splitByPauses(words, 500);
           for (const seg of segments) {
             if (!seg.text.trim()) continue;
+            // Track speaker — tag 1 is typically the interviewer (first/dominant speaker)
             if (seg.speakerTag && seg.speakerTag !== session.currentSpeaker) {
               session.currentSpeaker = seg.speakerTag;
             }
-            rememberSpeakerTag(session, seg.speakerTag);
-            void handleFinal(session, seg.text.trim(), confidence, seg.startMs, seg.endMs, seg.speakerTag);
+            void handleFinal(session, seg.text.trim(), confidence);
           }
         } else {
-          void handleFinal(session, transcript.trim(), confidence, undefined, undefined, session.currentSpeaker || undefined);
+          void handleFinal(session, transcript.trim(), confidence);
         }
       } else {
         const stability = result.stability || 0;
@@ -422,19 +395,12 @@ function handlePartial(session: SttSession, text: string, confidence?: number) {
   if (session.silenceTimer) clearTimeout(session.silenceTimer);
   session.silenceTimer = setTimeout(() => {
     if (session.currentPartial && session.currentPartial.trim().length > 2) {
-      void handleFinal(session, session.currentPartial, undefined, undefined, undefined, session.currentSpeaker || undefined);
+      void handleFinal(session, session.currentPartial, undefined, undefined, undefined);
     }
   }, session.silenceMs);
 }
 
-async function handleFinal(
-  session: SttSession,
-  text: string,
-  confidence?: number,
-  startMs?: number,
-  endMs?: number,
-  speakerTag?: number,
-) {
+async function handleFinal(session: SttSession, text: string, confidence?: number, startMs?: number, endMs?: number) {
   if (!text || text.trim().length < 2) return;
 
   // Capture and immediately clear the early-fire flag
@@ -447,7 +413,7 @@ async function handleFinal(
   if (!isEarlyFire && session.earlyFiredAt > 0 && Date.now() - session.earlyFiredAt < 800) {
     if (session.turnBoundaryTimer) {
       // Timer still pending — replace early text in buffer with the final transcript
-      session.turnBuffer = [{ text: text.trim(), startMs, endMs, speakerTag }];
+      session.turnBuffer = [text.trim()];
     }
     // Either way, let the already-scheduled timer handle it; don't push again
     return;
@@ -458,7 +424,7 @@ async function handleFinal(
     session.silenceTimer = null;
   }
 
-  session.turnBuffer.push({ text: text.trim(), startMs, endMs, speakerTag });
+  session.turnBuffer.push(text.trim());
   session.lastFinalAt = Date.now();
   session.currentPartial = "";
 
@@ -467,23 +433,15 @@ async function handleFinal(
   session.turnBoundaryTimer = setTimeout(async () => { // was 800ms
     if (session.turnBuffer.length === 0) return;
 
-    const bufferedChunks = session.turnBuffer.slice();
-    const fullTurn = bufferedChunks.map((chunk) => chunk.text).join(" ");
+    const fullTurn = session.turnBuffer.join(" ");
     session.turnBuffer = [];
     const turnIndex = session.turnIndex++;
-    const firstTimedChunk = bufferedChunks.find((chunk) => typeof chunk.startMs === "number");
-    const lastTimedChunk = [...bufferedChunks].reverse().find((chunk) => typeof chunk.endMs === "number");
-    const speakerCounts = new Map<number, number>();
-    for (const chunk of bufferedChunks) {
-      if (!chunk.speakerTag || chunk.speakerTag <= 0) continue;
-      speakerCounts.set(chunk.speakerTag, (speakerCounts.get(chunk.speakerTag) || 0) + 1);
-    }
-    const dominantSpeakerTag = [...speakerCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0]
-      || bufferedChunks[bufferedChunks.length - 1]?.speakerTag
-      || session.currentSpeaker
-      || 0;
-    rememberSpeakerTag(session, dominantSpeakerTag);
-    const provisionalSpeaker = resolveSpeakerLabel(session, dominantSpeakerTag, false);
+
+    // Determine speaker label from diarization tag
+    // Tag 1 = first/dominant speaker (usually interviewer in 2-speaker setup)
+    const speakerLabel = session.currentSpeaker === 1 ? "interviewer"
+      : session.currentSpeaker === 2 ? "candidate"
+      : "unknown";
 
     if (session.ws.readyState === WebSocket.OPEN) {
       session.ws.send(JSON.stringify({
@@ -491,16 +449,26 @@ async function handleFinal(
         text: fullTurn,
         turnIndex,
         confidence: confidence || 0.8,
-        speakerTag: dominantSpeakerTag || 0,
-        speaker: provisionalSpeaker,
+        speakerTag: session.currentSpeaker || 0,
+        speaker: speakerLabel,
       }));
     }
 
     const meeting = await storage.getMeeting(session.meetingId);
-    let isQuestion = false;
-    let questionType: string | null = null;
-    let cleanQuestion: string | null = null;
-    let storedConfidence: number | null = confidence || null;
+    if (meeting && meeting.saveTranscript) {
+      storage.createTranscriptTurn({
+        meetingId: session.meetingId,
+        turnIndex,
+        speaker: speakerLabel,
+        text: fullTurn,
+        startMs: startMs || null,
+        endMs: endMs || null,
+        confidence: confidence || null,
+        isQuestion: false,
+        questionType: null,
+        cleanQuestion: null,
+      }).catch((err: any) => console.error("[ws/stt] Failed to persist turn:", err.message));
+    }
 
     try {
       const recentTurns = await storage.getRecentTranscriptTurns(session.meetingId, 4);
@@ -515,14 +483,9 @@ async function handleFinal(
         0.5,
       );
 
-      if (result.isQuestion && result.confidence >= 0.5) {
-        isQuestion = true;
-        questionType = result.type;
-        cleanQuestion = result.cleanQuestion;
-        storedConfidence = result.confidence;
-        if (dominantSpeakerTag > 0) {
-          session.interviewerSpeakerTag = dominantSpeakerTag;
-        }
+      const hasConfidence = result.confidence >= 0.5;
+
+      if (result.isQuestion && hasConfidence) {
         if (session.ws.readyState === WebSocket.OPEN) {
           session.ws.send(JSON.stringify({
             type: "question_detected",
@@ -533,24 +496,24 @@ async function handleFinal(
             turnIndex,
           }));
         }
+
+        if (meeting && meeting.saveTranscript) {
+          storage.createTranscriptTurn({
+            meetingId: session.meetingId,
+            turnIndex,
+            speaker: "interviewer",
+            text: fullTurn,
+            startMs: startMs || null,
+            endMs: endMs || null,
+            confidence: result.confidence,
+            isQuestion: true,
+            questionType: result.type,
+            cleanQuestion: result.cleanQuestion,
+          }).catch(() => {});
+        }
       }
     } catch (err: any) {
       console.error("[ws/stt] Detection pipeline error:", err.message);
-    }
-    if (meeting && meeting.saveTranscript) {
-      const finalSpeaker = resolveSpeakerLabel(session, dominantSpeakerTag, isQuestion);
-      storage.createTranscriptTurn({
-        meetingId: session.meetingId,
-        turnIndex,
-        speaker: finalSpeaker,
-        text: fullTurn,
-        startMs: typeof firstTimedChunk?.startMs === "number" ? firstTimedChunk.startMs : null,
-        endMs: typeof lastTimedChunk?.endMs === "number" ? lastTimedChunk.endMs : null,
-        confidence: storedConfidence,
-        isQuestion,
-        questionType,
-        cleanQuestion,
-      }).catch((err: any) => console.error("[ws/stt] Failed to persist turn:", err.message));
     }
   }, 300);
 }

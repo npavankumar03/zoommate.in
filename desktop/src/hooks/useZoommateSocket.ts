@@ -379,7 +379,7 @@ function isLikelyIncompleteFragment(raw: string): boolean {
   const words = normalized.split(" ").filter(Boolean);
   if (words.length <= 3) return true;
   if (/\?$/.test(text)) return false;
-  if (words.length <= 6 && /\b(on|for|with|to|from|or|also)\s*$/.test(normalized)) return true;
+  if (words.length <= 6 && /\b(in|on|for|with|about|to|from|and|or|also)\s*$/.test(normalized)) return true;
   return false;
 }
 
@@ -933,8 +933,8 @@ export function useZoommateSocket(meetingId: string) {
         const speechConfig = SpeechSDK.SpeechConfig.fromAuthorizationToken(token, region);
         speechConfig.speechRecognitionLanguage = "en-US";
         speechConfig.outputFormat = SpeechSDK.OutputFormat.Detailed;
-        speechConfig.setProperty(SpeechSDK.PropertyId.Speech_SegmentationSilenceTimeoutMs, "600");
-        speechConfig.setProperty(SpeechSDK.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs, "600");
+        speechConfig.setProperty(SpeechSDK.PropertyId.Speech_SegmentationSilenceTimeoutMs, "300");
+        speechConfig.setProperty(SpeechSDK.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs, "300");
 
         // Push stream
         const fmt = SpeechSDK.AudioStreamFormat.getWaveFormatPCM(16000, 16, 1);
@@ -961,7 +961,7 @@ export function useZoommateSocket(meetingId: string) {
           await audioCtx.audioWorklet.addModule("/pcm-processor.js");
           const workletNode = new AudioWorkletNode(audioCtx, "pcm-processor");
           workletNode.port.postMessage({
-            noiseFloor: 0.008, targetRms: 0.12, maxGain: 4, limiter: 0.92, silenceHoldFrames: 2,
+            noiseFloor: 0.004, targetRms: 0.12, maxGain: 4, limiter: 0.92, silenceHoldFrames: 2,
           });
           workletNode.port.onmessage = (ev) => {
             if (pushStream && !sttDestroyed) pushStream.write(ev.data as ArrayBuffer);
@@ -979,7 +979,7 @@ export function useZoommateSocket(meetingId: string) {
               const a = Math.abs(f32[i]); if (a > peak) peak = a; sumSq += f32[i] * f32[i];
             }
             const rms = Math.sqrt(sumSq / Math.max(1, f32.length));
-            if (rms < 0.008) { pcm.fill(0); pushStream.write(pcm.buffer); return; }
+            if (rms < 0.004) { pcm.fill(0); pushStream.write(pcm.buffer); return; }
             const gain = Math.max(0.9, Math.min(4, rms > 0.0001 ? 0.12 / rms : 4));
             for (let i = 0; i < f32.length; i++) {
               let p = f32[i] * gain;
@@ -1137,7 +1137,7 @@ export function useZoommateSocket(meetingId: string) {
       try {
         await ivCtx.audioWorklet.addModule("/pcm-processor.js");
         const wn = new AudioWorkletNode(ivCtx, "pcm-processor");
-        wn.port.postMessage({ noiseFloor: 0.008, targetRms: 0.12, maxGain: 4, limiter: 0.92, silenceHoldFrames: 2 });
+        wn.port.postMessage({ noiseFloor: 0.004, targetRms: 0.12, maxGain: 4, limiter: 0.92, silenceHoldFrames: 2 });
         wn.port.onmessage = (ev) => { if (!sysStreamRef.current) return; ivPush.write(ev.data as ArrayBuffer); };
         ivMerged.connect(wn);
         wn.connect(ivCtx.destination);
@@ -1150,7 +1150,7 @@ export function useZoommateSocket(meetingId: string) {
           let sumSq = 0;
           for (let i = 0; i < f32.length; i++) sumSq += f32[i] * f32[i];
           const rms = Math.sqrt(sumSq / Math.max(1, f32.length));
-          if (rms < 0.008) { pcm.fill(0); ivPush.write(pcm.buffer); return; }
+          if (rms < 0.004) { pcm.fill(0); ivPush.write(pcm.buffer); return; }
           const gain = Math.max(0.9, Math.min(4, rms > 0.0001 ? 0.12 / rms : 4));
           for (let i = 0; i < f32.length; i++) {
             let p = f32[i] * gain;
@@ -1167,8 +1167,8 @@ export function useZoommateSocket(meetingId: string) {
       const ivSpeechCfg = SpeechSDK.SpeechConfig.fromAuthorizationToken(token, region);
       ivSpeechCfg.speechRecognitionLanguage = "en-US";
       ivSpeechCfg.outputFormat = SpeechSDK.OutputFormat.Detailed;
-      ivSpeechCfg.setProperty(SpeechSDK.PropertyId.Speech_SegmentationSilenceTimeoutMs, "600");
-      ivSpeechCfg.setProperty(SpeechSDK.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs, "600");
+      ivSpeechCfg.setProperty(SpeechSDK.PropertyId.Speech_SegmentationSilenceTimeoutMs, "300");
+      ivSpeechCfg.setProperty(SpeechSDK.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs, "300");
 
       const ivAudioCfg   = SpeechSDK.AudioConfig.fromStreamInput(ivPush);
       const ivRecognizer = new SpeechSDK.SpeechRecognizer(ivSpeechCfg, ivAudioCfg);
@@ -1219,16 +1219,14 @@ export function useZoommateSocket(meetingId: string) {
           if (prevIsQlike && isContinuationTail) {
             const prevNoQ = prevNorm.replace(/\?\s*$/, "").trim();
             const stitched = `${prevNoQ} ${text}`.replace(/\s+/g, " ").trim();
-            const stitchedAdv1 = detectQuestionAdvanced(stitched);
-            if (stitchedAdv1.isQuestion && stitchedAdv1.confidence >= 0.5)
+            if (detectQuestion(stitched) || detectQuestionAdvanced(stitched).confidence >= 0.5)
               text = stitched.endsWith("?") ? stitched : `${stitched}?`;
           }
           if (text === applyAsrCorrections(raw) && prevIsQlike && curWc <= 4 && STANDALONE_TECH_RE.test(text)) {
             const prevNoQ = prevNorm.replace(/\?\s*$/, "").trim();
             const joiner  = /\b(in|with|on|for|and)\s*$/i.test(prevNoQ) ? "" : " and";
             const stitched = `${prevNoQ}${joiner} ${text}`.replace(/\s+/g, " ").trim();
-            const stitchedAdv2 = detectQuestionAdvanced(stitched);
-            if (stitchedAdv2.isQuestion && stitchedAdv2.confidence >= 0.5)
+            if (detectQuestion(stitched) || detectQuestionAdvanced(stitched).confidence >= 0.5)
               text = stitched.endsWith("?") ? stitched : `${stitched}?`;
           }
         }

@@ -4,7 +4,7 @@ import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { Copy, Check } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { useState, useMemo, memo } from "react";
+import { useState } from "react";
 
 // Closes any unclosed markdown markers so ReactMarkdown doesn't show raw
 // asterisks/underscores/backticks mid-stream while the next chunk is in flight.
@@ -45,7 +45,7 @@ function normalizeQaSpacing(raw: string): string {
   return normalized;
 }
 
-const CodeBlock = memo(function CodeBlock({ language, children }: { language: string; children: string }) {
+function CodeBlock({ language, children }: { language: string; children: string }) {
   const [copied, setCopied] = useState(false);
   const code = String(children).replace(/\n$/, "");
 
@@ -70,8 +70,8 @@ const CodeBlock = memo(function CodeBlock({ language, children }: { language: st
       <div
         style={{
           width: "100%",
-          overflowX: "auto",
-          overflowY: "hidden",
+          overflowX: "hidden",
+          overflowY: "visible",
           background: "#1f2430",
           borderBottomLeftRadius: "0.75rem",
           borderBottomRightRadius: "0.75rem",
@@ -87,73 +87,124 @@ const CodeBlock = memo(function CodeBlock({ language, children }: { language: st
             fontSize: "0.82rem",
             padding: "1rem 1.1rem",
             background: "#1f2430",
-            whiteSpace: "pre",
-            overflowX: "visible",
+            whiteSpace: "pre-wrap",
+            overflowX: "hidden",
+            overflowWrap: "anywhere",
+            wordBreak: "break-word",
             display: "block",
             width: "100%",
           }}
+          wrapLongLines
         >
           {code}
         </SyntaxHighlighter>
       </div>
     </div>
   );
-});
+}
 
-// Streaming renderer — plain text only, zero ReactMarkdown overhead.
-// No AST parsing = no DOM thrashing = no flicker. Markdown renders fully
-// on the committed ResponseCard after the stream ends.
+// Streaming renderer — uses the same ReactMarkdown pipeline as the final render
+// so bullets, bold, code blocks all format correctly from the first token.
 function StreamingMarkdown({ content, className }: { content: string; className?: string }) {
-  const text = content.replace(/^[\u2026.]{1,3}\s*/, "");
-  // Split on newlines so paragraphs / line-breaks are preserved
-  const lines = text.split("\n");
+  const stripped = content.replace(/^[\u2026.]{1,3}\s*/, "");
+  const completed = completePartialMarkdown(stripped);
   return (
-    <div className={`streaming-prose${className ? ` ${className}` : ""}`} style={{ minWidth: 0, width: "100%" }}>
-      {lines.map((line, i) =>
-        line === "" ? <br key={i} /> : <span key={i} className="streaming-line">{line}{i < lines.length - 1 ? null : null}</span>
-      )}
+    <div className={className} style={{ minWidth: 0, width: "100%" }}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          code({ node, className: codeClassName, children, ...props }) {
+            const match = /language-(\w+)/.exec(codeClassName || "");
+            const lang = match?.[1] || "";
+            const isInline = !match && !String(children).includes("\n");
+            if (/^(text|plain|plaintext)$/i.test(lang)) {
+              return <p className="mb-3 last:mb-0 whitespace-pre-wrap">{children}</p>;
+            }
+            if (isInline) {
+              return <code className="px-1 py-0.5 bg-muted rounded text-xs font-mono" {...props}>{children}</code>;
+            }
+            return <CodeBlock language={lang} children={String(children)} />;
+          },
+          p({ children }) { return <p className="mb-3 last:mb-0">{children}</p>; },
+          strong({ children }) { return <strong className="font-semibold">{children}</strong>; },
+          ul({ children }) { return <ul className="list-disc pl-4 mb-1.5 space-y-0.5">{children}</ul>; },
+          ol({ children }) { return <ol className="list-decimal pl-4 mb-1.5 space-y-0.5">{children}</ol>; },
+          li({ children }) { return <li className="leading-relaxed">{children}</li>; },
+          h1({ children }) { return <h1 className="text-base font-bold mb-1">{children}</h1>; },
+          h2({ children }) { return <h2 className="text-sm font-bold mb-1">{children}</h2>; },
+          h3({ children }) { return <h3 className="text-sm font-semibold mb-1">{children}</h3>; },
+        }}
+      >
+        {completed}
+      </ReactMarkdown>
     </div>
   );
 }
 
-const FINAL_COMPONENTS = {
-  code({ node, className: codeClassName, children, ...props }: any) {
-    const match = /language-(\w+)/.exec(codeClassName || "");
-    const lang = match?.[1] || "";
-    const isInline = !match && !String(children).includes("\n");
-    if (/^(text|plain|plaintext)$/i.test(lang)) {
-      return <p className="mb-3 last:mb-0 whitespace-pre-wrap">{children}</p>;
-    }
-    if (isInline) {
-      return <code className="px-1 py-0.5 bg-muted rounded text-xs font-mono" {...props}>{children}</code>;
-    }
-    return <CodeBlock language={lang} children={String(children)} />;
-  },
-  p({ children }: any) { return <p className="mb-3 last:mb-0">{children}</p>; },
-  strong({ children }: any) { return <strong className="font-semibold">{children}</strong>; },
-  ul({ children }: any) { return <ul className="list-disc pl-4 mb-1.5 space-y-0.5">{children}</ul>; },
-  ol({ children }: any) { return <ol className="list-decimal pl-4 mb-1.5 space-y-0.5">{children}</ol>; },
-  li({ children }: any) { return <li className="leading-relaxed">{children}</li>; },
-  h1({ children }: any) { return <h1 className="text-base font-bold mb-1">{children}</h1>; },
-  h2({ children }: any) { return <h2 className="text-sm font-bold mb-1">{children}</h2>; },
-  h3({ children }: any) { return <h3 className="text-sm font-semibold mb-1">{children}</h3>; },
-  blockquote({ children }: any) {
-    return <blockquote className="border-l-2 border-primary/30 pl-3 italic text-muted-foreground my-1.5">{children}</blockquote>;
-  },
-};
-
-export const MarkdownRenderer = memo(function MarkdownRenderer({ content, className, streaming }: { content: string; className?: string; streaming?: boolean }) {
+export function MarkdownRenderer({ content, className, streaming }: { content: string; className?: string; streaming?: boolean }) {
   // During streaming use the fast inline renderer to avoid ReactMarkdown DOM thrashing
   if (streaming) {
     return <StreamingMarkdown content={content} className={className} />;
   }
+  // Strip leading ellipsis artifacts ("..." or "…") the AI emits mid-stream
   const stripped = content.replace(/^[\u2026.]{1,3}\s*/, "");
   const normalizedContent = completePartialMarkdown(normalizeQaSpacing(stripped));
   return (
     <div className={className} style={{ minWidth: 0, width: "100%" }}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={FINAL_COMPONENTS}>
-        {normalizedContent}
-      </ReactMarkdown>
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      components={{
+        code({ node, className: codeClassName, children, ...props }) {
+          const match = /language-(\w+)/.exec(codeClassName || "");
+          const lang = match?.[1] || "";
+          const isInline = !match && !String(children).includes("\n");
+
+          // text/plain/plaintext fences — AI wrapping prose in a code box. Render as normal paragraph.
+          if (/^(text|plain|plaintext)$/i.test(lang)) {
+            return <p className="mb-3 last:mb-0 whitespace-pre-wrap">{children}</p>;
+          }
+
+          if (isInline) {
+            return (
+              <code className="px-1 py-0.5 bg-muted rounded text-xs font-mono" {...props}>
+                {children}
+              </code>
+            );
+          }
+
+          return <CodeBlock language={lang} children={String(children)} />;
+        },
+        p({ children }) {
+          return <p className="mb-3 last:mb-0">{children}</p>;
+        },
+        strong({ children }) {
+          return <strong className="font-semibold">{children}</strong>;
+        },
+        ul({ children }) {
+          return <ul className="list-disc pl-4 mb-1.5 space-y-0.5">{children}</ul>;
+        },
+        ol({ children }) {
+          return <ol className="list-decimal pl-4 mb-1.5 space-y-0.5">{children}</ol>;
+        },
+        li({ children }) {
+          return <li className="leading-relaxed">{children}</li>;
+        },
+        h1({ children }) {
+          return <h1 className="text-base font-bold mb-1">{children}</h1>;
+        },
+        h2({ children }) {
+          return <h2 className="text-sm font-bold mb-1">{children}</h2>;
+        },
+        h3({ children }) {
+          return <h3 className="text-sm font-semibold mb-1">{children}</h3>;
+        },
+        blockquote({ children }) {
+          return <blockquote className="border-l-2 border-primary/30 pl-3 italic text-muted-foreground my-1.5">{children}</blockquote>;
+        },
+      }}
+    >
+      {normalizedContent}
+    </ReactMarkdown>
     </div>
   );
-});
+}

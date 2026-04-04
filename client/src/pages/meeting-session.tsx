@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, memo } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { Link, useLocation, useParams } from "wouter";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -15,21 +15,17 @@ import { LiveCodeEditor } from "@/components/live-code-editor";
 import {
   detectQuestion,
   detectQuestionAdvanced,
-  extractQuestionFromSegment,
-  likelyContainsQuestion,
   normalizeForDedup,
   normalizeQuestionForSimilarity,
-  normalizeText,
   levenshteinSimilarity,
   isSubstantiveSegment,
-  questionSupersedes,
 } from "@shared/questionDetection";
 import { isFollowUp } from "@shared/followup";
 import { AzureRecognizer, checkAzureAvailability } from "@/lib/stt/azureRecognizer";
 import { getSocket } from "@/realtime/socketClient";
 import {
   Zap, Mic, MicOff, Monitor, Send, Square,
-  Copy, Check, Sparkles, Loader2,
+  MessageSquare, Copy, Check, Sparkles, Loader2,
   Eye, Minimize2, Maximize2, Brain, Radio,
   Download, Trash2, Cloud, ScanSearch, ImagePlus, Database,
   CheckCircle, Star, XCircle, Plus, Images, X
@@ -38,7 +34,7 @@ import { motion, AnimatePresence } from "framer-motion";
 
 type AudioMode = "mic" | "system";
 type DocsMode = "auto" | "always" | "off";
-type SubmitSeedSource = "interpreted" | "transcript" | "memory-followup" | "fallback" | "enter_window";
+type SubmitSeedSource = "interpreted" | "transcript" | "memory-followup" | "fallback";
 type ScreenShareWindow = Window & {
   __zoommateVisionStream?: MediaStream | null;
 };
@@ -57,47 +53,14 @@ type LatestScreenContext = {
   answer: string;
   capturedAt: number;
 };
-type TranscriptQuestionDetection = {
-  segmentKey: string;
-  rawText: string;
-  cleanQuestion: string;
-  confidence: number;
-  labels?: string[];
+
+type TranscriptQuestionRow = {
+  id: string;
+  text: string;
   ts: number;
+  used: boolean;
+  inFlight: boolean;
 };
-
-function countExplicitQuestionPrompts(raw: string): number {
-  const text = String(raw || "").trim();
-  if (!text) return 0;
-
-  if (/^interviewer asked a main question with short follow-ups/i.test(text)) {
-    const lines = text
-      .split(/\n+/)
-      .map((line) => line.trim())
-      .filter(Boolean);
-    const questionIndex = lines.findIndex((line) => /^questions:\s*$/i.test(line));
-    if (questionIndex >= 0) {
-      return lines.slice(questionIndex + 1).filter(Boolean).length;
-    }
-    return 2;
-  }
-
-  const qmarkCount = (text.match(/\?/g) || []).length;
-  if (qmarkCount >= 2) return qmarkCount;
-
-  const starterMatches = text.match(/\b(?:what|why|how|when|where|who|which|do you|does|did|can you|could you|would you|have you|has|is|are|tell me|walk me|explain|give me|describe|share|suppose|assume)\b/gi) || [];
-  return starterMatches.length;
-}
-
-function extractSharedQuestionCandidate(text: string): string {
-  return extractQuestionFromSegment(String(text || "")) || "";
-}
-
-function hasSharedQuestionSignal(text: string): boolean {
-  const raw = String(text || "").trim();
-  if (!raw) return false;
-  return detectQuestion(raw) || likelyContainsQuestion(raw) || Boolean(extractSharedQuestionCandidate(raw));
-}
 
 type VideoFrameCallbackVideo = HTMLVideoElement & {
   requestVideoFrameCallback?: (callback: () => void) => number;
@@ -271,6 +234,51 @@ function cleanDetectedInterviewQuestion(raw: string): string {
   return `${anchor} ${topics.join(" and ")}?`;
 }
 
+function stripTranscriptRolePrefix(raw: string): string {
+  return String(raw || "")
+    .replace(/^(interviewer|candidate|assistant|system|you)\s*:\s*/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function stripInterviewerLeadIn(raw: string): string {
+  let text = stripTranscriptRolePrefix(raw);
+  if (!text) return "";
+
+  const firstQuestionStarter = /\b(what(?:'s| is)?|why|how(?: do you)?|when|where|who|which|do you|does|did|can you|could you|would you|have you|has|is|are|tell me about|tell me|walk me through|walk me|explain|describe|share|give me|name a few)\b/i;
+  const starterIdx = text.search(firstQuestionStarter);
+  if (starterIdx <= 0) return text;
+
+  const prefix = text
+    .slice(0, starterIdx)
+    .toLowerCase()
+    .replace(/[^\w\s']/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (/\b(take your time|once you re ready|once you're ready|got it|here we go|i ll start|i'll start|let me challenge|that s a solid start|that's a solid start|that's the solid start|i ll ask you|i'll ask you|just let me know when you re ready|just let me know when you're ready|keep it direct|step by step|we ll proceed|we'll proceed|typical opening|moving on)\b/.test(prefix)) {
+    text = text.slice(starterIdx).trim();
+  }
+
+  return text;
+}
+
+function isPureTranscriptMetaLine(raw: string): boolean {
+  const text = stripTranscriptRolePrefix(raw)
+    .toLowerCase()
+    .replace(/[^\w\s']/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text) return true;
+
+  const hasQuestionCue =
+    /\?/.test(text)
+    || /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are|tell|walk|explain|describe|share|give)\b/.test(text);
+  if (hasQuestionCue) return false;
+
+  return /\b(i ll ask you a question and wait for your response|i'll ask you a question and wait for your response|just let me know when you re ready|just let me know when you're ready|we ll proceed step by step|we'll proceed step by step|keep it direct and technical|covering back end front end and integration|got it i ll start|got it i'll start|here we go|take your time|once you re ready|once you're ready|typical opening|moving on)\b/.test(text);
+}
+
 function rewriteMixedTopicQuestion(raw: string): string {
   const text = String(raw || "").replace(/\s+/g, " ").trim();
   if (!text) return "";
@@ -308,35 +316,27 @@ function rewriteMixedTopicQuestion(raw: string): string {
   return text;
 }
 
-interface ResponseCardProps {
-  resp: Response;
-  isHighlighted: boolean;
-  content: string;
-  onMount: (id: string, el: HTMLDivElement | null) => void;
+/**
+ * Build conversationHistory for the LLM.
+ * Only include prior Q&A pairs when the new question is a follow-up.
+ * Fresh/independent questions get an empty history so the LLM doesn't
+ * re-answer or blend in previously answered content.
+ */
+function buildConvHistory(
+  responses: Response[],
+  question: string,
+): Array<{ q: string; a: string }> {
+  if (!isFollowUp(question).isFollowUp) return [];
+  // Cap at 4 most recent turns — beyond that adds prompt bloat without improving accuracy
+  return responses
+    .slice(0, 4)
+    .reverse()
+    .map((r) => ({
+      q: (r.question || "").slice(0, 600),
+      a: (r.answer || "").replace(/```[\s\S]*?```/g, "[code]").slice(0, 1000),
+    }))
+    .filter((p) => p.q && p.a);
 }
-
-const ResponseCard = memo(function ResponseCard({ resp, isHighlighted, content, onMount }: ResponseCardProps) {
-  const cardRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    onMount(resp.id, cardRef.current);
-    return () => { onMount(resp.id, null); };
-  }, [resp.id, onMount]);
-
-  return (
-    <div
-      ref={cardRef}
-      className={`py-2 ${isHighlighted ? "bg-primary/5 rounded px-2" : ""}`}
-      data-testid={`card-response-${resp.id}`}
-    >
-      <div className="text-sm leading-relaxed">
-        <MarkdownRenderer content={content} />
-      </div>
-      <div className="mt-1 text-[10px] text-muted-foreground/50">
-        {resp.createdAt ? new Date(resp.createdAt).toLocaleTimeString() : ""}
-      </div>
-    </div>
-  );
-});
 
 export default function MeetingSession() {
   const { id } = useParams<{ id: string }>();
@@ -349,7 +349,6 @@ export default function MeetingSession() {
   const [, setTranscriptSegmentKeys] = useState<string[]>([]);
   const [displayTranscriptSegments, setDisplayTranscriptSegments] = useState<string[]>([]);
   const [displayTranscriptSegmentKeys, setDisplayTranscriptSegmentKeys] = useState<string[]>([]);
-  const [transcriptQuestionDetections, setTranscriptQuestionDetections] = useState<Record<string, TranscriptQuestionDetection>>({});
   const [interimText, setInterimText] = useState("");
   const [stagedTranscriptText, setStagedTranscriptText] = useState("");
   const [manualTypeText, setManualTypeText] = useState("");
@@ -399,6 +398,7 @@ export default function MeetingSession() {
   const [showDebugPanel, setShowDebugPanel] = useState(false);
   const [debugMeta, setDebugMeta] = useState<Partial<DebugPanelData>>({});
   const [showReadingPane, setShowReadingPane] = useState(false);
+  const [mobileTab, setMobileTab] = useState<"transcript" | "ai">("ai");
   const [isDetectionPaused, setIsDetectionPaused] = useState(false);
   const [docsMode, setDocsMode] = useState<DocsMode>(() => {
     const stored = localStorage.getItem("zoommate-docs-mode");
@@ -406,6 +406,7 @@ export default function MeetingSession() {
   });
   const [socketConnected, setSocketConnected] = useState(false);
   const [responsesLocal, setResponsesLocal] = useState<Response[]>([]);
+  const [showResponseHistory, setShowResponseHistory] = useState(false);
   const [highlightResponseId, setHighlightResponseId] = useState<string | null>(null);
   const [selectedQuestionFilter, setSelectedQuestionFilter] = useState<string>("");
   const [recentQuestions, setRecentQuestions] = useState<string[]>([]);
@@ -434,15 +435,15 @@ export default function MeetingSession() {
   });
   const streamBufferRef = useRef<string>("");
   const flushTimerRef = useRef<number | null>(null);
-  const rafPendingRef = useRef<number | null>(null);
   const autoScrollEnabledRef = useRef(true);
   const autoScrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastAssistantAnswerRef = useRef<string>("");
   const lastAnswerWasCodeRef = useRef<boolean>(false);
   const lastAppendedFpRef = useRef<string>("");
+  const processedRequestIdsRef = useRef<Set<string>>(new Set()); // prevents duplicate assistant_end processing
+  const requestBatchRowIdsRef = useRef<Record<string, string[]>>({});
+  const requestBatchNormsRef = useRef<Record<string, string[]>>({}); // requestId → batchNorms so stale streams use correct norms
   const streamingAnswerRef = useRef<string>("");
-  const wsTextQueueRef = useRef<string>("");   // WS text waiting to be smoothly revealed
-  const displayedAccRef = useRef<string>("");  // text actually revealed to UI so far
   const streamingAccumulatorRef = useRef<string>("");
   const interpretedQuestionRef = useRef<string>("");
   const streamingQuestionRef = useRef<string>("");
@@ -458,6 +459,9 @@ export default function MeetingSession() {
   // Used to detect which segments are NEW since the last Enter (for second-Enter combine).
   const lastEnterSegmentCountRef = useRef<number>(0);
   const pendingEnterRef = useRef<{ text: string; ts: number; timer: ReturnType<typeof setTimeout> } | null>(null);
+  // Norms of segments sent in the last Enter batch — used to mark all of them answered on reply.
+  const lastSubmittedBatchNormsRef = useRef<string[]>([]);
+  const lastSubmittedBatchRowIdsRef = useRef<string[]>([]);
   const screenshotInputRef = useRef<HTMLInputElement | null>(null);
   const responseCardRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const responsesLocalRef = useRef<Response[]>([]);
@@ -473,6 +477,7 @@ export default function MeetingSession() {
   const azureLastCallRef = useRef<{ mode: "mic" | "system"; stream?: MediaStream; speaker: "interviewer" | "candidate" | "unknown" } | null>(null);
   const azureReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const azureStartFnRef = useRef<((mode: "mic" | "system", stream?: MediaStream, speaker?: "interviewer" | "candidate" | "unknown") => Promise<void>) | null>(null); // Dual-stream: candidate mic recognizer
+  const warmSpeculativeAnswerPathRef = useRef<((question: string) => Promise<void>) | null>(null);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
   const segmentsRef = useRef<string[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -491,7 +496,7 @@ export default function MeetingSession() {
   const animFrameRef = useRef<number>(0);
   const systemTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const askedQuestionsRef = useRef<string[]>([]);
-  const recentAskedFingerprintsRef = useRef<Array<{ fp: string; ts: number }>>([]);
+  const recentAskedFingerprintsRef = useRef<string[]>([]);
   const lastProcessedSegmentRef = useRef("");
   const lastSentSegmentIndexRef = useRef(-1);
   const displaySegmentsRef = useRef<string[]>([]);
@@ -525,6 +530,8 @@ export default function MeetingSession() {
   const interimHasUnsavedContentRef = useRef<boolean>(false);
   // Tracks the current interimText value synchronously so commit path can read it.
   const interimTextRef = useRef<string>("");
+  // Suppress partials for 300ms after a final commits — catches Azure's late echo partial.
+  const suppressPartialUntilRef = useRef<number>(0);
   // Timestamp of the last segment committed to segmentsRef ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â used for the 10s combine window.
   const lastSegmentCommittedAtRef = useRef<number>(0);
   const lastExtractedTsRef = useRef<number>(0);
@@ -552,14 +559,15 @@ export default function MeetingSession() {
     t_first_token_rendered?: number;
     t_stream_done_rendered?: number;
   }>({});
-  const transcriptPersistQueueRef = useRef<Array<{ text: string; startMs?: number; endMs?: number; speaker?: "interviewer" | "candidate" | "unknown" }>>([]);
+  const transcriptPersistQueueRef = useRef<Array<{ text: string; startMs?: number; endMs?: number }>>([]);
   const transcriptPersistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const transcriptPersistInFlightRef = useRef<boolean>(false);
   const firstChunkWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const streamingStuckWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const lastStreamingChunkAtRef = useRef<number>(0);
   const refineBufferRef = useRef<string>("");
-  const interviewerQuestionMemoryRef = useRef<Array<{ text: string; answered: boolean; ts: number }>>([]);
+  const interviewerQuestionMemoryRef = useRef<Array<{ text: string; ts: number }>>([]);
+  const transcriptQuestionRowsRef = useRef<TranscriptQuestionRow[]>([]);
+  // Timestamp of the last time a question was submitted (Enter press or auto-answer).
+  // Segments older than this are "already handled" — not included in the next batch.
+  const lastEnterPressTimestampRef = useRef<number>(0);
   const spokenReplyMemoryRef = useRef<Array<{ text: string; ts: number }>>([]);
   // Rolling buffer of last 2 non-candidate transcript segments for multi-segment speculative
   const recentInterviewerSegmentsRef = useRef<string[]>([]);
@@ -570,18 +578,11 @@ export default function MeetingSession() {
   const interimKeywordMemoryRef = useRef<Array<{ token: string; ts: number }>>([]);
   const latestPartialQuestionCandidateRef = useRef<string>("");
   const latestPartialQuestionCandidateTsRef = useRef<number>(0);
-  // ASR gap merge buffer: holds a question-start fragment ("Tell me about", "Can you explain")
-  // while waiting up to 3s for the rest of the sentence to arrive as the next ASR final.
-  const pendingGapQuestionRef = useRef<{ text: string; ts: number } | null>(null);
-  const pendingGapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // State machine: prevents duplicate triggers, noisy post-answer triggers, and races
   type InterviewState = "listening" | "partial_detected" | "answering" | "cooldown";
   const interviewStateRef = useRef<InterviewState>("listening");
   const cooldownTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Debounce ref for auto-trigger: prevents firing on the first question alone when
-  // the interviewer is asking multiple questions in rapid succession.
-  const autoTriggerDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const getLiveVisionStream = useCallback((): MediaStream | null => {
     const candidates = [
@@ -735,18 +736,13 @@ export default function MeetingSession() {
   const STABLE_MS = 350;
   const CONTINUATION_MS = 10_000;
   const INTERIM_KEYWORD_TTL_MS = 3000;
+  const ENABLE_PARTIAL_AUTO_TRIGGER = false;
   const DUPLICATE_INTENT_WINDOW_MS = 15_000;
   const ENTER_AFTER_AUTO_SUPPRESS_MS = 5_000;
-  const enterOnlyAnswerModeRef = useRef(true); // true = answers only fire on Enter key press
-  const ENTER_ONLY_ANSWER_MODE = enterOnlyAnswerModeRef.current;
-  const SPECULATIVE_WINDOW_MS = 10_000;
-  // Named similarity threshold constants for consistency across detection logic
-  const SIM_SPECULATIVE_REUSE = 0.82;
-  const SIM_DEDUP_BLOCK = 0.90;
-  const SIM_REFINEMENT_MAX = 0.80;
+  const ENTER_ONLY_ANSWER_MODE = true;
   const INTERPRETED_PLACEHOLDER = "Listening for a clear speaker question. Press Enter to answer from transcript context.";
   const liveMode = isListening && socketConnected;
-  const MAX_CONVERSATION_CONTEXT_LINES = 60;
+  const MAX_CONVERSATION_CONTEXT_LINES = 200;
   const HYBRID_FOLLOWUP_WINDOW_MS = 30_000;
   const HYBRID_FOLLOWUP_MAX_WORDS = 8;
 
@@ -780,105 +776,28 @@ export default function MeetingSession() {
     return nextIsMoreComplete;
   }, [wordOverlap]);
 
-  const isShortTailFragment = useCallback((fragment: string, fullText: string): boolean => {
-    const fragNorm = normalizeForDedup(fragment);
-    const fullNorm = normalizeForDedup(fullText);
-    if (!fragNorm || !fullNorm || fragNorm === fullNorm) return false;
-
-    const fragWords = fragNorm.split(/\s+/).filter(Boolean);
-    const fullWords = fullNorm.split(/\s+/).filter(Boolean);
-    if (fragWords.length < 1 || fragWords.length > 2) return false;
-    if (fullWords.length <= fragWords.length) return false;
-
-    return fullWords.slice(-fragWords.length).join(" ") === fragWords.join(" ");
-  }, []);
-
-  const hasLongerTailOwner = useCallback((fragment: string, texts: string[]): boolean => {
-    return texts.some((text) => isShortTailFragment(fragment, text));
-  }, [isShortTailFragment]);
-
-  const evictShortTailTexts = useCallback((incoming: string, texts: string[]): string[] => {
-    return texts.filter((text) => !isShortTailFragment(text, incoming));
-  }, [isShortTailFragment]);
-
   const upsertTranscriptSegment = useCallback((text: string) => {
     const next = String(text || "").trim();
     if (!next) return;
 
-    if (hasLongerTailOwner(next, segmentsRef.current)) return;
-
-    const pruned = evictShortTailTexts(next, segmentsRef.current);
-    const latest = String(pruned[0] || "").trim();
-
+    const latest = String(segmentsRef.current[0] || "").trim();
+    // Canonical transcript is detection-oriented: keep strict dedup only.
     if (latest && wordOverlap(latest, next) > 0.92 && wordOverlap(next, latest) > 0.92) return;
 
-    if (latest && shouldReplaceLatestTranscriptLine(latest, next)) {
-      segmentsRef.current = [next, ...pruned.slice(1)];
-    } else {
-      segmentsRef.current = [next, ...pruned];
-    }
-
+    segmentsRef.current = [next, ...segmentsRef.current];
     setTranscriptSegments([...segmentsRef.current]);
-    setTranscriptSegmentKeys(segmentsRef.current.map(() => `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`));
-  }, [evictShortTailTexts, hasLongerTailOwner, shouldReplaceLatestTranscriptLine, wordOverlap]);
+    setTranscriptSegmentKeys((prev) => [`${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, ...prev]);
+  }, [wordOverlap]);
 
-  const upsertDisplayTranscriptSegment = useCallback((text: string, skipDedup = false) => {
+  const upsertDisplayTranscriptSegment = useCallback((text: string) => {
     const next = String(text || "").trim();
     if (!next) return;
-    // Defer display updates for 300ms after an AI answer ends to prevent
+    // Suppress display updates for 300ms after an AI answer ends to prevent
     // late finals and echo bleed from visibly mutating the transcript.
-    // Instead of dropping, schedule a retry with skipDedup=true so real questions
-    // that arrive right after an answer are never lost to the dedup check.
-    if (!skipDedup && lastAnswerDoneTimestampRef.current && (Date.now() - lastAnswerDoneTimestampRef.current) < 300) {
-      const remaining = 300 - (Date.now() - lastAnswerDoneTimestampRef.current);
-      setTimeout(() => upsertDisplayTranscriptSegment(next, true), remaining + 10);
-      return;
-    }
+    if (lastAnswerDoneTimestampRef.current && (Date.now() - lastAnswerDoneTimestampRef.current) < 300) return;
     const nextNorm = normalizeForDedup(next);
     if (!nextNorm) return;
-    const latestDisplay = String(displaySegmentsRef.current[0] || "").trim();
-    const latestNorm = normalizeForDedup(latestDisplay);
-    if (!skipDedup && latestNorm) {
-      if (latestNorm.startsWith(nextNorm) && nextNorm.length >= 8 && nextNorm.split(/\s+/).length <= latestNorm.split(/\s+/).length) {
-        return;
-      }
-      if (nextNorm.startsWith(latestNorm) && latestNorm.length >= 8 && latestNorm.split(/\s+/).length < nextNorm.split(/\s+/).length) {
-        displaySegmentsRef.current = [next, ...displaySegmentsRef.current.slice(1)];
-        displaySegmentKeysRef.current = [displaySegmentKeysRef.current[0] || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, ...displaySegmentKeysRef.current.slice(1)];
-        setDisplayTranscriptSegments([...displaySegmentsRef.current]);
-        setDisplayTranscriptSegmentKeys([...displaySegmentKeysRef.current]);
-        return;
-      }
-    }
-    if (!skipDedup && displaySegmentsRef.current.some((seg) => normalizeForDedup(seg) === nextNorm)) return;
-    const nextWords = nextNorm.split(/\s+/).filter(Boolean);
-    // Drop short incoming segments (≤2 words) that are a suffix of an existing longer segment.
-    // e.g. "yourself" arriving after "Tell me about yourself." is already in display → drop it.
-    if (nextWords.length <= 2) {
-      const isStrayOfExisting = displaySegmentsRef.current.some((seg) => {
-        const eNorm = normalizeForDedup(seg || "");
-        const eWords = eNorm.split(/\s+/).filter(Boolean);
-        if (eWords.length <= nextWords.length) return false;
-        return eWords.slice(-nextWords.length).join(" ") === nextWords.join(" ");
-      });
-      if (isStrayOfExisting) return;
-    }
-    // Evict any existing short stray fragment (≤2 words) whose words all appear
-    // at the tail of the incoming segment — e.g. evict "yourself" when
-    // "Tell me about yourself." arrives so it doesn't wall off earlier questions.
-    const strayIndices: number[] = [];
-    displaySegmentsRef.current.forEach((seg, i) => {
-      const eNorm = normalizeForDedup(seg || "");
-      const eWords = eNorm.split(/\s+/).filter(Boolean);
-      if (eWords.length >= 1 && eWords.length <= 2) {
-        const tail = nextWords.slice(-eWords.length);
-        if (tail.join(" ") === eWords.join(" ")) strayIndices.push(i);
-      }
-    });
-    if (strayIndices.length > 0) {
-      displaySegmentsRef.current = displaySegmentsRef.current.filter((_, i) => !strayIndices.includes(i));
-      displaySegmentKeysRef.current = displaySegmentKeysRef.current.filter((_, i) => !strayIndices.includes(i));
-    }
+    if (displaySegmentsRef.current.some((seg) => normalizeForDedup(seg) === nextNorm)) return;
     displaySegmentsRef.current = [next, ...displaySegmentsRef.current];
     displaySegmentKeysRef.current = [`${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, ...displaySegmentKeysRef.current];
     setDisplayTranscriptSegments([...displaySegmentsRef.current]);
@@ -889,96 +808,9 @@ export default function MeetingSession() {
     upsertDisplayTranscriptSegment(text);
   }, [upsertDisplayTranscriptSegment]);
 
-  const rememberRealtimeInterviewerQuestion = useCallback((question: string) => {
-    const clean = String(question || "").trim();
-    const norm = normalizeForDedup(clean);
-    if (!clean || !norm) return;
-    const now = Date.now();
-    const existing = interviewerQuestionMemoryRef.current.find((item) =>
-      normalizeForDedup(item.text) === norm
-      || questionSupersedes(clean, item.text)
-      || questionSupersedes(item.text, clean),
-    );
-    if (existing) {
-      existing.ts = now;
-      existing.answered = false;
-      if (!existing.text || existing.text.length < clean.length || questionSupersedes(clean, existing.text)) {
-        existing.text = clean;
-      }
-    } else {
-      interviewerQuestionMemoryRef.current = [
-        { text: clean, answered: false, ts: now },
-        ...interviewerQuestionMemoryRef.current.filter((item) =>
-          normalizeForDedup(item.text) !== norm
-          && !questionSupersedes(clean, item.text)
-          && !questionSupersedes(item.text, clean),
-        ),
-      ].slice(0, 30);
-    }
-    setRecentQuestions((prev) => {
-      const next = [clean, ...prev.filter((item) =>
-        normalizeForDedup(item) !== norm
-        && !questionSupersedes(clean, item)
-        && !questionSupersedes(item, clean),
-      )];
-      return next.slice(0, 10);
-    });
-  }, []);
-
-  const rememberTranscriptQuestionDetection = useCallback((segmentKey: string, rawText: string, cleanQuestion: string, confidence: number, labels?: string[]) => {
-    const key = String(segmentKey || "").trim();
-    const raw = String(rawText || "").trim();
-    const clean = String(cleanQuestion || "").trim();
-    if (!key || !raw || !clean) return;
-    setTranscriptQuestionDetections((prev) => ({
-      ...prev,
-      [key]: {
-        segmentKey: key,
-        rawText: raw,
-        cleanQuestion: clean,
-        confidence,
-        labels,
-        ts: Date.now(),
-      },
-    }));
-    rememberRealtimeInterviewerQuestion(clean);
-  }, [rememberRealtimeInterviewerQuestion]);
-
-  const detectTranscriptQuestionRealtime = useCallback(async (text: string, segmentKey: string) => {
-    const clean = String(text || "").trim();
-    const key = String(segmentKey || "").trim();
-    if (!id || !clean || !key) return;
-    try {
-      const res = await fetch(`/api/meetings/${id}/detect-turn`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({
-          text: clean,
-          segmentKey: key,
-          audioMode,
-        }),
-      });
-      if (!res.ok) return;
-      const data = await res.json();
-      const framedQuestion = typeof data?.framed?.clean_question === "string" ? data.framed.clean_question.trim() : "";
-      const cleanQuestion = typeof data?.clean_question === "string" ? data.clean_question.trim() : "";
-      const chosenQuestion = framedQuestion || cleanQuestion;
-      if (data?.recorded && chosenQuestion) {
-        const labels = Array.isArray(data?.framed?.labels)
-          ? data.framed.labels.filter((label: unknown) => typeof label === "string")
-          : undefined;
-        rememberTranscriptQuestionDetection(key, clean, chosenQuestion, Number(data.confidence || 0), labels);
-      }
-    } catch (error) {
-      console.warn("[meeting] realtime detect-turn failed", error);
-    }
-  }, [audioMode, id, rememberTranscriptQuestionDetection]);
-
   const rememberAskedFingerprint = useCallback((fingerprint: string) => {
     if (!fingerprint) return;
-    const now = Date.now();
-    const next = [{ fp: fingerprint, ts: now }, ...recentAskedFingerprintsRef.current.filter((x) => x.fp !== fingerprint)];
+    const next = [fingerprint, ...recentAskedFingerprintsRef.current.filter((x) => x !== fingerprint)];
     recentAskedFingerprintsRef.current = next.slice(0, 20);
   }, []);
 
@@ -1028,7 +860,7 @@ export default function MeetingSession() {
     if (!fingerprint) return false;
     for (const prev of recentAutoTriggerFingerprintsRef.current) {
       if ((now - prev.ts) > 12000) continue;
-      if (levenshteinSimilarity(fingerprint, prev.fp) >= SIM_DEDUP_BLOCK) {
+      if (levenshteinSimilarity(fingerprint, prev.fp) >= 0.85) {
         return true;
       }
     }
@@ -1038,12 +870,9 @@ export default function MeetingSession() {
   const isNearDuplicateAskedQuestion = useCallback((text: string): boolean => {
     const fingerprint = normalizeQuestionForSimilarity(text);
     if (!fingerprint) return false;
-    const now = Date.now();
     for (const prev of recentAskedFingerprintsRef.current) {
-      // Allow re-asking after 60 seconds — questions decay out of dedup
-      if ((now - prev.ts) > 60_000) continue;
-      const sim = levenshteinSimilarity(fingerprint, prev.fp);
-      if (sim >= SIM_DEDUP_BLOCK) return true;
+      const sim = levenshteinSimilarity(fingerprint, prev);
+      if (sim >= 0.85) return true;
     }
     return false;
   }, []);
@@ -2922,7 +2751,7 @@ export default function MeetingSession() {
     if (!last) return false;
     if ((now - last.ts) > DUPLICATE_INTENT_WINDOW_MS) return false;
     const sim = levenshteinSimilarity(fingerprint, last.fp);
-    if (sim < 0.92) return false; // raised from 0.88 — rephrased questions at ~85-91% similarity now pass through
+    if (sim < 0.88) return false;
     if (mode === "enter" && last.mode !== "enter" && (now - last.ts) <= ENTER_AFTER_AUTO_SUPPRESS_MS) {
       return true;
     }
@@ -3016,8 +2845,6 @@ export default function MeetingSession() {
     const buildQuestionFromMeaningfulFragment = useCallback((raw: string): string => {
       const fragment = String(raw || "")
         .replace(/^(and also|and|also|plus|as well as|along with|including|in addition)\b\s*/i, "")
-        // Strip leading pause fillers: "So…", "Hmm…", "Okay…", "Right…", "Well…"
-        .replace(/^(so|hmm|hm|okay|ok|right|well|uh|um|ah|now)\b[\s\u2026,.]+/i, "")
         .replace(/[?.,;:!]+$/g, "")
         .replace(/\b(and also)(?:\s+\1)+\b/gi, "and also")
         .replace(/\b(and)(?:\s+and)+\b/gi, "and")
@@ -3029,12 +2856,7 @@ export default function MeetingSession() {
       // Do not synthesize experience questions from pure numbers (e.g., ports like 443).
       if (/^\d{2,5}$/.test(fragment)) return "";
 
-      const sharedCandidate = extractSharedQuestionCandidate(fragment);
-      if (sharedCandidate) {
-        return sharedCandidate.endsWith("?") ? sharedCandidate : `${sharedCandidate}?`;
-      }
-
-      if (hasSharedQuestionSignal(fragment)) {
+      if (detectQuestion(fragment)) {
         return fragment.endsWith("?") ? fragment : `${fragment}?`;
       }
 
@@ -3044,7 +2866,7 @@ export default function MeetingSession() {
     const stop = new Set(["and", "also", "or", "yes", "no", "ok", "okay", "hmm", "uh", "um", "the", "a", "an", "in", "on", "with", "for", "to", "of", "experience"]);
     if (words.every((w) => stop.has(w.toLowerCase()))) return "";
 
-    const v = normalizeText(fragment);
+    const v = fragment.toLowerCase().replace(/\s+/g, " ").trim();
     // Implicit question rewrites for rough STT fragments.
     if (/\bexperience in\b/i.test(v)) {
       const topic = fragment.replace(/^.*?\bexperience in\b/i, "").trim();
@@ -3076,51 +2898,24 @@ export default function MeetingSession() {
       return fragment.endsWith("?") ? fragment : `${fragment}?`;
     }
 
-    // Resume-pointer: "I see Node.js here", "You mentioned microservices", "Looking at your X"
-    const resumeMatch = v.match(/^(i see|you mentioned|looking at your|looking at|i noticed|i notice|i see that|you said)\s+(.+)/i);
-    if (resumeMatch) {
-      const topic = (resumeMatch[2] || "")
-        .replace(/\b(here|there|on your resume|in your profile|on the resume)\s*\.?\s*$/i, "")
-        .trim();
-      if (topic) {
-        const aliasedTopic = normalizeInterviewTopicLabel(topic);
-        if (isLikelyInterviewTopic(aliasedTopic)) return `Can you tell me more about your experience with ${aliasedTopic}?`;
-        return `Can you elaborate on ${topic}?`;
-      }
-    }
+    const aliased = normalizeInterviewTopicLabel(fragment);
 
-    // Declarative pushback: "That sounds expensive", "But that seems risky", "That's a lot"
-    if (/^(that|this|but that|but this)\b.{0,40}\b(sounds|seems|looks|appears|feels|is|was)\b/i.test(v) && !fragment.includes("?")) {
-      const concern = fragment.replace(/^but\s+/i, "").trim();
-      return `${concern} — how would you address or justify that?`;
-    }
-
-    // Broad-to-narrow instruction: "Focus on X", "Just talk about X", "Only discuss X"
-    const narrowMatch = v.match(/^(?:focus on|just (?:talk about|focus on|discuss|explain)|only (?:talk about|discuss|explain)|concentrate on|stick to|narrow down to)\s+(.+)/i);
-    if (narrowMatch) {
-      const topic = (narrowMatch[1] || "").trim();
-      if (topic) return `Focus specifically on ${topic} — explain that part in detail.`;
-    }
-
-      return "";
+      if (words.length <= 3 && isLikelyInterviewTopic(aliased)) return `Do you have experience in ${aliased}?`;
+      if (words.length <= 3) return "";
+      return `Can you explain ${aliased}?`;
     }, []);
 
   const buildLiveQuestionCandidateFromPartial = useCallback((rawPartial: string): string => {
     const raw = String(rawPartial || "").replace(/\s+/g, " ").trim();
     if (!raw) return "";
-    const normalized = normalizeText(raw);
+    const normalized = raw.toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
     if (!normalized) return "";
 
     const questionStart = /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are|tell|walk|explain)\b/i;
     const joinerStart = /^(and also|and|also|plus|as well as|along with|including|in addition)\b/i;
     const wordCount = normalized.split(/\s+/).filter(Boolean).length;
 
-    const sharedCandidate = extractSharedQuestionCandidate(raw);
-    if (sharedCandidate) {
-      return sharedCandidate.endsWith("?") ? sharedCandidate : `${sharedCandidate}?`;
-    }
-
-    if (hasSharedQuestionSignal(raw) || (questionStart.test(normalized) && wordCount >= 2)) {
+    if (detectQuestion(raw) || (questionStart.test(normalized) && wordCount >= 2)) {
       return raw.endsWith("?") ? raw : `${raw}?`;
     }
 
@@ -3145,8 +2940,7 @@ export default function MeetingSession() {
   const isLikelyNoiseSegment = useCallback((raw: string): boolean => {
     const text = String(raw || "").trim();
     if (!text) return true;
-    const normalized = normalizeText(text);
-    if (hasSharedQuestionSignal(text)) return false;
+    const normalized = text.toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
     const words = normalized.split(" ").filter(Boolean);
     const hasQuestionCue =
       /\?/.test(text) ||
@@ -3203,6 +2997,172 @@ export default function MeetingSession() {
     return (detectQuestion(text) || (advanced.isQuestion && advanced.confidence >= 0.5)) && hasQuestionCue;
   }, [isLikelyNoiseSegment]);
 
+  // Strips leading filler words so the real question starts at word 1.
+  // "Alright so tell me about Redis" → "tell me about Redis"
+  const stripFillerPrefix = (text: string): string => {
+    return text
+      .replace(/^(alright\s+so\s+now\s+|alright\s+so\s+|alright\s+now\s+|alright\s+|okay\s+so\s+|okay\s+now\s+|okay\s+|ok\s+so\s+|ok\s+now\s+|ok\s+|so\s+now\s+|right\s+so\s+|right\s+now\s+|right\s+|well\s+so\s+|well\s+now\s+|well\s+|now\s+tell\s+me\s+|and\s+also\s+|and\s+so\s+)/i, "")
+      .replace(/^(alright\s+tell\s+me|okay\s+tell\s+me|ok\s+tell\s+me|now\s+tell\s+me)/i, "tell me")
+      .trim();
+  };
+
+  const getPendingTranscriptQuestionRows = useCallback((includeInFlight = false): TranscriptQuestionRow[] => {
+    return transcriptQuestionRowsRef.current.filter((row) => !row.used && (includeInFlight || !row.inFlight));
+  }, []);
+
+  const updateTranscriptQuestionRows = useCallback((
+    rowIds: string[],
+    updater: (row: TranscriptQuestionRow) => TranscriptQuestionRow,
+  ) => {
+    if (!rowIds.length) return;
+    const idSet = new Set(rowIds);
+    transcriptQuestionRowsRef.current = transcriptQuestionRowsRef.current.map((row) => (
+      idSet.has(row.id) ? updater(row) : row
+    ));
+  }, []);
+
+  const setTranscriptQuestionRowsInFlight = useCallback((rowIds: string[], inFlight: boolean) => {
+    updateTranscriptQuestionRows(rowIds, (row) => ({ ...row, inFlight }));
+  }, [updateTranscriptQuestionRows]);
+
+  const markTranscriptQuestionRowsUsed = useCallback((rowIds: string[]) => {
+    updateTranscriptQuestionRows(rowIds, (row) => ({ ...row, used: true, inFlight: false }));
+  }, [updateTranscriptQuestionRows]);
+
+  const releaseTranscriptQuestionRows = useCallback((rowIds: string[]) => {
+    updateTranscriptQuestionRows(rowIds, (row) => ({ ...row, inFlight: false }));
+  }, [updateTranscriptQuestionRows]);
+
+  const settleRequestTranscriptQuestionRows = useCallback((requestId: string, markUsed: boolean) => {
+    if (!requestId) return;
+    const rowIds = requestBatchRowIdsRef.current[requestId] || [];
+    if (markUsed) {
+      markTranscriptQuestionRowsUsed(rowIds);
+    } else {
+      releaseTranscriptQuestionRows(rowIds);
+    }
+    delete requestBatchRowIdsRef.current[requestId];
+  }, [markTranscriptQuestionRowsUsed, releaseTranscriptQuestionRows]);
+
+  const upsertTranscriptQuestionRow = useCallback((
+    rawText: string,
+    options?: { isExplicitQuestion?: boolean; allowShortTopicAppend?: boolean },
+  ): TranscriptQuestionRow | null => {
+    const cleaned = String(rawText || "").replace(/\s+/g, " ").trim();
+    if (!cleaned || isLikelyNoiseSegment(cleaned)) return null;
+
+    const now = Date.now();
+    const wordCount = cleaned.split(/\s+/).filter(Boolean).length;
+    const deduped = cleaned.replace(/(.{10,}?)(\s+\1)+/gi, "$1").trim() || cleaned;
+    const norm = normalizeForDedup(deduped);
+    const sim = normalizeQuestionForSimilarity(deduped);
+    if (!norm) return null;
+
+    const pendingRows = transcriptQuestionRowsRef.current.filter((row) => !row.used);
+
+    if (options?.allowShortTopicAppend && wordCount >= 1 && wordCount <= 3) {
+      const recentPending = pendingRows.find((row) => !row.inFlight && (now - row.ts) <= 8_000);
+      if (recentPending) {
+        const base = recentPending.text.replace(/\?\s*$/, "").trim();
+        const merged = `${base} and ${deduped}`.replace(/\s+/g, " ").trim();
+        const nextText = merged.endsWith("?") ? merged : `${merged}?`;
+        transcriptQuestionRowsRef.current = transcriptQuestionRowsRef.current.map((row) => (
+          row.id === recentPending.id ? { ...row, text: nextText, ts: now } : row
+        ));
+        return transcriptQuestionRowsRef.current.find((row) => row.id === recentPending.id) || null;
+      }
+    }
+
+    const existing = pendingRows.find((row) => {
+      const rowNorm = normalizeForDedup(row.text);
+      if (!rowNorm) return false;
+      if (rowNorm === norm) return true;
+      if (norm.startsWith(rowNorm) || rowNorm.startsWith(norm)) return true;
+      return levenshteinSimilarity(normalizeQuestionForSimilarity(row.text), sim) >= 0.60;
+    });
+
+    if (existing) {
+      const existingWords = existing.text.split(/\s+/).filter(Boolean).length;
+      const nextText = wordCount >= existingWords ? deduped : existing.text;
+      transcriptQuestionRowsRef.current = transcriptQuestionRowsRef.current.map((row) => (
+        row.id === existing.id ? { ...row, text: nextText, ts: now } : row
+      ));
+      return transcriptQuestionRowsRef.current.find((row) => row.id === existing.id) || null;
+    }
+
+    if (!options?.isExplicitQuestion && wordCount < 4) return null;
+
+    const newRow: TranscriptQuestionRow = {
+      id: `${now}-${Math.random().toString(36).slice(2, 8)}`,
+      text: deduped,
+      ts: now,
+      used: false,
+      inFlight: false,
+    };
+    transcriptQuestionRowsRef.current = [newRow, ...transcriptQuestionRowsRef.current].slice(0, 80);
+    return newRow;
+  }, [isLikelyNoiseSegment]);
+
+  // Collect all pending finalized interviewer rows that have not been consumed by AI yet,
+  // filter out candidate/noise leakage, and join oldest→newest for a stable multi-question batch.
+  const buildFullTranscriptQuestion = useCallback((): {
+    combined: string;
+    batchNorms: string[];
+    batchRowIds: string[];
+    isMulti: boolean;
+  } | null => {
+    const now = Date.now();
+    const candidates = getPendingTranscriptQuestionRows()
+      .slice()
+      .sort((a, b) => a.ts - b.ts);
+
+    console.log("[multiQ] buildFullTranscriptQuestion called", {
+      totalInMemory: transcriptQuestionRowsRef.current.length,
+      sinceLast: lastEnterPressTimestampRef.current ? `${Math.round((now - lastEnterPressTimestampRef.current) / 1000)}s ago` : "never",
+      pending: candidates.length,
+      candidates: candidates.map((q) => ({ text: q.text.slice(0, 60), ageMs: now - q.ts })),
+    });
+
+    if (!candidates.length) return null;
+
+    const isCandidateSpeech = (text: string): boolean => {
+      const t = text.trim();
+      // Never filter if there's a question mark — always an interviewer question
+      if (t.includes("?")) return false;
+      // Never filter interviewer lead-ins that start with "I" but signal a question
+      if (/\b(wondering|curious|want to (know|ask|understand)|like to (know|ask|understand)|trying to understand|wanted to (ask|know)|meant to ask)\b/i.test(t)) return false;
+      // Never filter if it ends with a question-style open phrase
+      if (/\b(tell me|walk me through|explain|describe|can you|could you|would you)\b/i.test(t)) return false;
+      if (/^(I |I'm |I've |I have |I am |I was |I do |I don't |I didn't |I've |We |My |Our )/i.test(t)) return true;
+      const iCount = (t.match(/\bI\b/g) || []).length;
+      const wc = t.split(/\s+/).filter(Boolean).length;
+      return iCount > 3 || (wc > 0 && iCount / wc > 0.25);
+    };
+
+    const seen = new Set<string>();
+    const kept: string[] = [];
+    const keptNorms: string[] = [];
+    const keptRowIds: string[] = [];
+
+    for (const q of candidates) {
+      const text = q.text.trim();
+      if (!text) continue;
+      if (isCandidateSpeech(text)) continue;
+      if (isLikelyNoiseSegment(text)) continue;
+      const norm = normalizeForDedup(text);
+      if (!norm || seen.has(norm)) continue;
+      seen.add(norm);
+      kept.push(stripFillerPrefix(text));
+      keptNorms.push(norm);
+      keptRowIds.push(q.id);
+    }
+
+    if (!kept.length) return null;
+
+    const combined = kept.join("\n");
+    return { combined, batchNorms: keptNorms, batchRowIds: keptRowIds, isMulti: kept.length > 1 };
+  }, [getPendingTranscriptQuestionRows, isLikelyNoiseSegment]);
+
   const looksLikeLikelyInterimQuestion = useCallback((raw: string): boolean => {
     const text = String(raw || "").trim();
     if (!text) return false;
@@ -3231,9 +3191,7 @@ export default function MeetingSession() {
         .replace(/\s+\b(and also|and|also)\b\s*$/i, "")
         .replace(/\s+/g, " ")
         .trim();
-      const sharedCandidate = extractSharedQuestionCandidate(p);
-      if (sharedCandidate) return sharedCandidate;
-      if (hasSharedQuestionSignal(p)) {
+      if (/\?/.test(p) || /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|tell|walk|explain)\b/i.test(p)) {
         return p;
       }
     }
@@ -3250,22 +3208,20 @@ export default function MeetingSession() {
     let bestScore = -1e9;
     for (const { text, idx } of items) {
       if (isLikelyNoiseSegment(text)) continue;
-      const sharedCandidate = extractSharedQuestionCandidate(text);
-      const candidate = sharedCandidate || text;
-      const normalized = normalizeText(candidate);
+      const normalized = text.toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
       const words = normalized.split(" ").filter(Boolean);
-      const hasQMark = candidate.includes("?");
-      const sharedSignal = hasSharedQuestionSignal(candidate);
+      const hasQMark = text.includes("?");
+      const startsLikeQuestion = /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|tell|walk|explain)\b/.test(normalized);
       const hasInterviewCue = /\b(experience|react|python|fastapi|fast api|fast apis|apis|flask|django|java|javascript|typescript|nodejs|angular|vue|nextjs|spring|aws|azure|gcp|kubernetes|docker|terraform|mongodb|postgres|mysql|redis|kafka|graphql|microservice|serverless|backend|frontend|fullstack|devops|agile|scrum|machine learning|deep learning|llm|openai|pandas|pytorch|tensorflow|spark|snowflake|databricks|bigquery|selenium|jest|pytest|architecture|wipro|anthem|start date|end date|month|year|worked|resume|project|role|challenge|design|deploy|build|scalability|performance|system|database|api|sql|nosql|linux|bash|ci cd|github|gitlab|jenkins|datadog|grafana|prometheus)\b/.test(normalized);
       const partialStub = /^(when did you|do you have|what was your|have you worked with|tell me about)\s*$/.test(normalized);
       const dateSpecific = /\b(start date|end date|from|to|month|year|wipro)\b/.test(normalized);
-      const questionLike = sharedSignal || hasQMark || (hasInterviewCue && words.length >= 4);
+      const questionLike = hasQMark || startsLikeQuestion || (hasInterviewCue && words.length >= 4);
       if (!questionLike) continue;
 
       let score = 0;
       score += (100 - idx * 3); // recency bias (index 0 is newest)
       score += hasQMark ? 60 : 0;
-      score += sharedSignal ? 45 : 0;
+      score += startsLikeQuestion ? 35 : 0;
       score += hasInterviewCue ? 30 : 0;
       score += dateSpecific ? 70 : 0;
       score += Math.min(words.length, 22);
@@ -3273,7 +3229,7 @@ export default function MeetingSession() {
       score -= words.length <= 2 ? 70 : 0;
       if (score > bestScore) {
         bestScore = score;
-        best = candidate;
+        best = text;
       }
     }
     return best;
@@ -3301,7 +3257,7 @@ export default function MeetingSession() {
     if (words.length <= 3) return true;
     if (/\?$/.test(text)) return false;
     // Only mark as incomplete if it's a short fragment ending mid-sentence (preposition/conjunction tail)
-    if (words.length <= 6 && /\b(on|for|with|to|from|or|also)\s*$/.test(normalized)) return true;
+    if (words.length <= 6 && /\b(in|on|for|with|about|to|from|and|or|also)\s*$/.test(normalized)) return true;
     return false;
   }, []);
 
@@ -3318,14 +3274,15 @@ export default function MeetingSession() {
 
   const extractAnyQuestionCandidates = useCallback((segments: string[]): string[] => {
     const starters = /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are|tell|explain|walk)\b/i;
-    const starterSplit = /(?=\b(?:what|why|how|when|where|who|which|do you|have you|can you|could you|would you|are you|is there|tell me about|walk me through|explain)\b)/gi;
+    const starterSplit = /(?=\b(?:what(?:'s| is)?|why|how(?: do you)?|when|where|who|which|do you|have you|can you|could you|would you|are you|is there|tell me about|walk me through|explain|describe|share|give me|name a few)\b)/gi;
     const ordered = [...(segments || [])].reverse(); // oldest -> newest
     const out: string[] = [];
     const seen = new Set<string>();
 
     for (const raw of ordered) {
-      const line = String(raw || "").trim();
+      const line = stripInterviewerLeadIn(String(raw || "").trim());
       if (!line) continue;
+      if (isPureTranscriptMetaLine(line)) continue;
       const parts = line.includes("?")
         ? line.split("?").map((p) => p.trim()).filter(Boolean).map((p) => `${p}?`)
         : line
@@ -3334,19 +3291,18 @@ export default function MeetingSession() {
             .filter(Boolean);
 
       for (const part of parts) {
-        const clean = part.replace(/^interviewer\s*:\s*/i, "").trim();
+        const clean = stripInterviewerLeadIn(stripTranscriptRolePrefix(part));
         if (!clean) continue;
-        const sharedCandidate = extractSharedQuestionCandidate(clean);
-        const candidate = sharedCandidate || clean;
-        if (isLikelyNoiseSegment(candidate)) continue;
-        const normalized = normalizeText(candidate);
+        if (isPureTranscriptMetaLine(clean)) continue;
+        if (isLikelyNoiseSegment(clean)) continue;
+        const normalized = clean.toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
         const words = normalized.split(" ").filter(Boolean);
         const firstPersonHeavy =
           /\b(i|my|we|our)\b/.test(normalized)
           && /\b(have|worked|built|developed|implemented|focus|focused)\b/.test(normalized);
-        const overLongMonologue = words.length > 30 && !candidate.includes("?");
-        const looksQuestion = Boolean(sharedCandidate) || candidate.includes("?") || starters.test(normalized);
-        const advanced = detectQuestionAdvanced(candidate);
+        const overLongMonologue = words.length > 45 && !clean.includes("?");
+        const looksQuestion = clean.includes("?") || starters.test(normalized);
+        const advanced = detectQuestionAdvanced(clean);
         const hasInterviewCue =
           /\b(interview|experience|react|python|fastapi|fast api|fast apis|apis|flask|django|java|javascript|typescript|nodejs|angular|vue|nextjs|spring|aws|azure|gcp|kubernetes|docker|terraform|mongodb|postgres|mysql|redis|kafka|graphql|microservice|serverless|backend|frontend|fullstack|devops|agile|scrum|machine learning|deep learning|llm|openai|pandas|pytorch|tensorflow|spark|snowflake|databricks|bigquery|selenium|jest|pytest|architecture|api|sql|nosql|linux|bash|ci cd|github|gitlab|jenkins|datadog|grafana|prometheus|wipro|anthem|resume|project|role|challenge|design|deploy|build|scalability|performance|system|database|start date|end date|month|year|worked)\b/i.test(normalized);
         const partialStub = /^(when did you|do you have|what was your|have you worked with|tell me about|experience in)\s*$/i.test(normalized);
@@ -3355,12 +3311,12 @@ export default function MeetingSession() {
         const highQuality =
           looksQuestion &&
           words.length >= 1 &&
-          (advanced.confidence >= 0.5 || advanced.isQuestion || hasInterviewCue || Boolean(sharedCandidate) || /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are)\b/i.test(normalized));
+          (advanced.confidence >= 0.5 || hasInterviewCue || /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are)\b/i.test(normalized));
         if (!highQuality || partialStub || repeatedWordNoise || fillerOnly || firstPersonHeavy || overLongMonologue) continue;
-        const key = normalizeForDedup(candidate);
+        const key = normalizeForDedup(clean);
         if (!key || seen.has(key)) continue;
         seen.add(key);
-        out.push(candidate);
+        out.push(clean);
       }
     }
 
@@ -3414,13 +3370,20 @@ export default function MeetingSession() {
     },
   });
 
+  // Reset per-meeting state when navigating to a different session
+  useEffect(() => {
+    setInitializedFromMeeting(false);
+    setCustomPrompt("");
+    conversationContextLinesRef.current = [];
+    setConversationHistory("");
+  }, [id]);
+
   useEffect(() => {
     if (meeting && !initializedFromMeeting) {
       setResponseFormat(meeting.responseFormat || "concise");
       setSelectedModel(meeting.model || "gpt-4o-mini");
-      if (meeting.customInstructions) {
-        setCustomPrompt(meeting.customInstructions);
-      }
+      // Always set (even empty) so stale prompt from previous session is cleared
+      setCustomPrompt(meeting.customInstructions || "");
       if (meeting.conversationContext) {
         const lines = String(meeting.conversationContext || "")
           .split(/\r?\n/)
@@ -3616,6 +3579,13 @@ export default function MeetingSession() {
   }, []);
 
   useEffect(() => {
+    const el = transcriptScrollRef.current;
+    if (!el) return;
+    // Always keep newest transcript at the top.
+    el.scrollTop = 0;
+  }, [transcriptSegments, interimText]);
+
+  useEffect(() => {
     isAwaitingFirstChunkRef.current = isAwaitingFirstChunk;
   }, [isAwaitingFirstChunk]);
 
@@ -3672,25 +3642,14 @@ export default function MeetingSession() {
     }, 180);
   }, [isNearBottom]);
 
-  const handleResponseCardMount = useCallback((id: string, el: HTMLDivElement | null) => {
-    responseCardRefs.current[id] = el;
-  }, []);
-
-  const highlightAndScrollResponse = useCallback((responseId: string) => {
-    if (!responseId) return;
-    setHighlightResponseId(responseId);
-    const el = responseCardRefs.current[responseId];
-    if (el) {
-      el.scrollIntoView({ behavior: "smooth", block: "center" });
-    }
-    setTimeout(() => {
-      setHighlightResponseId((current) => (current === responseId ? null : current));
-    }, 1800);
+  const highlightAndScrollResponse = useCallback((_responseId: string) => {
+    // Highlight removed — box flash caused visible layout shift on answer arrival
   }, []);
 
   const isApologyResponse = useCallback((text: string): boolean => {
-    const t = text.trim().toLowerCase();
-    return /^(i['']?m sorry|i am sorry|sorry,|i apologize|my apologies|there seems to be (some )?confusion|i don['']?t (quite )?understand|could you (please )?(clarify|restate|rephrase|elaborate|specify)|it seems (there (is|was) a misunderstanding|like there might be)|i('m| am) not sure (what|which|about)|please (clarify|rephrase|restate|specify)|can you (clarify|rephrase|specify)|i need more (context|clarification)|i('m| am) unable to (understand|determine)|it (looks|seems) like (your|the) question (got cut off|was cut off|is incomplete|wasn't complete|seems cut off)|it seems like (your|the) question|(your|the) question (got|was|seems to have) cut off|i('m| am) not quite sure what (you('re| are)|the question)|could you please specify)/.test(t);
+    // Strip immediateLead "…" so "… I'm sorry…" still matches the anchor.
+    const t = text.trim().replace(/^…\s*/, "").toLowerCase();
+    return /^(i['']?m sorry|i am sorry|sorry,|i apologize|my apologies|i can['']?t (provide|answer|give|help with)|i cannot (provide|answer|give|help with)|there seems to be (some )?confusion|i don['']?t (quite )?understand|could you (please )?(clarify|restate|rephrase|elaborate|specify)|it seems (there (is|was) a misunderstanding|like there might be)|i('m| am) not sure (what|which|about)|please (clarify|rephrase|restate|specify)|can you (clarify|rephrase|specify)|i need more (context|clarification)|i('m| am) unable to (understand|determine|provide|answer)|it (looks|seems) like (your|the) question (got cut off|was cut off|is incomplete|wasn't complete|seems cut off)|it seems like (your|the) question|(your|the) question (got|was|seems to have) cut off|i('m| am) not quite sure what (you('re| are)|the question)|could you please specify)/.test(t);
   }, []);
 
   const appendLocalResponse = useCallback((question: string, answer: string, responseType = "concise") => {
@@ -3852,14 +3811,16 @@ export default function MeetingSession() {
     // Enter key in PiP → trigger answer in main tab
     if (!(pipWin as any).__keyListenerAttached) {
       (pipWin as any).__keyListenerAttached = true;
-      pipWin.document.addEventListener("keydown", (e: KeyboardEvent) => {
+      const onPipKeyDown = (e: KeyboardEvent) => {
         if (e.key === "Enter") {
           e.preventDefault();
           const ch = new BroadcastChannel("acemate-overlay");
           ch.postMessage({ type: "command", action: "enter" });
           ch.close();
         }
-      });
+      };
+      pipWin.document.addEventListener("keydown", onPipKeyDown);
+      pipWin.addEventListener("pagehide", () => pipWin.document.removeEventListener("keydown", onPipKeyDown), { once: true });
     }
   }, []);
 
@@ -3947,6 +3908,9 @@ export default function MeetingSession() {
   }, []);
 
   const updateDraftFromPartial = useCallback((rawPartial: string) => {
+    // Suppress partials immediately after a final — catches Azure's late echo partial
+    // (e.g. "yourself" arriving after final "Tell me about yourself").
+    if (Date.now() < suppressPartialUntilRef.current) return;
     const rawLive = String(rawPartial || "").replace(/\s+/g, " ").trim();
     // Skip heavy normalization for partials — rawLive is always non-empty when a partial
     // arrives, so the cleaned result was always discarded. Use rawLive directly.
@@ -3975,28 +3939,18 @@ export default function MeetingSession() {
     if (timeSinceFinal < 400 && lastFinalizedTextRef.current) {
       const finalNorm = lastFinalizedTextRef.current.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
       const partialNorm = fastDraft.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
-      // Only a stale echo if the partial is fully contained within the final (late arrival).
-      // Handle both prefix echoes ("tell me about") and tail echoes ("yourself").
-      if (
-        partialNorm.length > 0
-        && (finalNorm.startsWith(partialNorm) || isShortTailFragment(fastDraft, lastFinalizedTextRef.current))
-      ) return;
+      // Stale echo if the partial is contained anywhere in the final (prefix, suffix, or substring)
+      // e.g. partial "yourself" after final "tell me about yourself" — endsWith catches this
+      if (partialNorm.length > 0 && (finalNorm.startsWith(partialNorm) || finalNorm.endsWith(partialNorm) || finalNorm.includes(partialNorm))) return;
     }
     // Broader stale echo guard: suppress interimText that is identical to (or a prefix of)
     // the most recently committed segment regardless of timing. Azure sometimes replays the
     // full final text as the first partial of the next utterance, causing the same text to
     // appear twice ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â once in the live pulsing row and once in the committed segments list.
     if (segmentsRef.current.length > 0 && timeSinceFinal < 2000) {
-      const latestSegNorm = (segmentsRef.current[0] || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+      const latestSegNorm = segmentsRef.current[0].toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
       const draftNorm = fastDraft.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
-      if (
-        draftNorm.length > 0
-        && (
-          latestSegNorm === draftNorm
-          || latestSegNorm.startsWith(draftNorm)
-          || isShortTailFragment(fastDraft, segmentsRef.current[0] || "")
-        )
-      ) return;
+      if (draftNorm.length > 0 && (latestSegNorm === draftNorm || latestSegNorm.startsWith(draftNorm) || latestSegNorm.endsWith(draftNorm) || latestSegNorm.includes(draftNorm))) return;
     }
 
     // Guard: if we're about to overwrite substantial unsaved interim content with
@@ -4026,16 +3980,6 @@ export default function MeetingSession() {
     // "Tell me about yourself" in interim instead of just "yourself".
     const tailPrefix = pendingQuestionTailRef.current.join(" ").replace(/\?\s*$/, "").trim();
     const displayDraft = tailPrefix ? `${tailPrefix} ${fastDraft}`.replace(/\s+/g, " ").trim() : fastDraft;
-    const liveCandidate = buildLiveQuestionCandidateFromPartial(fastDraft);
-    const partialLooksLikeNoise =
-      isLikelyNoiseSegment(displayDraft)
-      && !hasSharedQuestionSignal(displayDraft)
-      && !liveCandidate;
-    if (partialLooksLikeNoise) {
-      latestPartialQuestionCandidateRef.current = "";
-      latestPartialQuestionCandidateTsRef.current = 0;
-      return;
-    }
     setInterimText(displayDraft);
     interimTextRef.current = displayDraft;
     setStagedTranscriptText(displayDraft);
@@ -4048,6 +3992,7 @@ export default function MeetingSession() {
     // Keep light memory updates; heavy detection/merge runs on final text path.
     rememberContinuationTopics(rawLive, now);
     rememberInterimKeywords(fastDraft, now);
+    const liveCandidate = buildLiveQuestionCandidateFromPartial(fastDraft);
     if (liveCandidate) {
       latestPartialQuestionCandidateRef.current = liveCandidate;
       latestPartialQuestionCandidateTsRef.current = now;
@@ -4072,9 +4017,7 @@ export default function MeetingSession() {
     id,
     audioMode,
     isStreaming,
-    isLikelyNoiseSegment,
     upsertDisplayTranscriptSegment,
-    isShortTailFragment,
   ]);
 
   const flushStreamBuffer = useCallback(() => {
@@ -4100,27 +4043,6 @@ export default function MeetingSession() {
     flushStreamBuffer();
   }, [flushStreamBuffer]);
 
-  // Smooth streaming animation: drains wsTextQueueRef character-by-character at 60fps.
-  // Adaptive speed: slow typewriter feel when the buffer is small (queue nearly caught up),
-  // faster catch-up when the LLM is sending faster than 60fps can reveal.
-  const startStreamAnimation = useCallback(() => {
-    if (rafPendingRef.current) return; // animation loop already running
-    const step = () => {
-      rafPendingRef.current = null;
-      const queue = wsTextQueueRef.current;
-      if (!queue) return;
-      // Snappy default (5 chars/frame = ~300 char/s at 60fps), ramp up fast when behind.
-      const speed = queue.length > 150 ? 35 : queue.length > 40 ? 15 : 5;
-      displayedAccRef.current += queue.slice(0, speed);
-      wsTextQueueRef.current = queue.slice(speed);
-      setStreamingAnswer(sanitizeDisplayedAnswerText(displayedAccRef.current));
-      if (wsTextQueueRef.current) {
-        rafPendingRef.current = requestAnimationFrame(step);
-      }
-    };
-    rafPendingRef.current = requestAnimationFrame(step);
-  }, [sanitizeDisplayedAnswerText]);
-
   const showOptimisticAssistantState = useCallback((questionHint?: string) => {
     setIsStreaming(true);
     setIsAwaitingFirstChunk(true);
@@ -4144,68 +4066,38 @@ export default function MeetingSession() {
     firstChunkWatchdogRef.current = setTimeout(() => {
       if (!isAwaitingFirstChunkRef.current) return;
       console.warn(`[ws] first-chunk-timeout source=${source}`);
-      setIsStreaming(false);
-      setIsAwaitingFirstChunk(false);
-      isAwaitingFirstChunkRef.current = false;
-      setStreamingQuestion("");
-      setStreamingAnswer("");
-      setPendingResponse(null);
-      activeWsStreamIdRef.current = "";
-      streamingAccumulatorRef.current = "";
-      streamBufferRef.current = "";
-      wsTextQueueRef.current = "";
-      displayedAccRef.current = "";
-      clearStreamingRenderTimer();
-      interviewStateRef.current = "listening";
       toast({
         title: "Slow response from AI",
         description: "Request sent but no streamed chunks yet. Retrying Enter is safe.",
         variant: "destructive",
       });
     }, 10000);
-  }, [clearFirstChunkWatchdog, clearStreamingRenderTimer, toast]);
+  }, [clearFirstChunkWatchdog, toast]);
 
   const flushTranscriptPersistQueue = useCallback(async () => {
-    if (!id || transcriptPersistInFlightRef.current) return;
+    if (!id) return;
     const batch = transcriptPersistQueueRef.current.splice(0, transcriptPersistQueueRef.current.length);
     if (!batch.length) return;
-    transcriptPersistInFlightRef.current = true;
-    try {
-      for (let index = 0; index < batch.length; index += 1) {
-        const turn = batch[index];
-        try {
-          const res = await fetch(`/api/meetings/${id}/transcript-turn`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            credentials: "include",
-            body: JSON.stringify(turn),
-          });
-          if (!res.ok) {
-            throw new Error(`status=${res.status}`);
-          }
-        } catch (e) {
-          console.error("[meeting] transcript turn persist failed", e);
-          transcriptPersistQueueRef.current = batch.slice(index).concat(transcriptPersistQueueRef.current);
-          break;
-        }
-      }
-    } finally {
-      transcriptPersistInFlightRef.current = false;
-      if (transcriptPersistQueueRef.current.length > 0 && !transcriptPersistTimerRef.current) {
-        transcriptPersistTimerRef.current = setTimeout(() => {
-          transcriptPersistTimerRef.current = null;
-          void flushTranscriptPersistQueue();
-        }, 1500);
+    for (const turn of batch) {
+      try {
+        await fetch(`/api/meetings/${id}/transcript-turn`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify(turn),
+        });
+      } catch (e) {
+        console.error("[meeting] transcript turn persist failed", e);
       }
     }
   }, [id]);
 
-  const scheduleTranscriptPersistFlush = useCallback((delayMs = 4000) => {
+  const scheduleTranscriptPersistFlush = useCallback(() => {
     if (transcriptPersistTimerRef.current) return;
     transcriptPersistTimerRef.current = setTimeout(() => {
       transcriptPersistTimerRef.current = null;
       void flushTranscriptPersistQueue();
-    }, delayMs);
+    }, 4000);
   }, [flushTranscriptPersistQueue]);
 
   useEffect(() => {
@@ -4239,66 +4131,45 @@ export default function MeetingSession() {
         const msg = JSON.parse(String(event.data || "{}"));
         if (msg?.sessionId && msg.sessionId !== id) return;
 
-        if (msg.type === "no_question" || msg.type === "request_ignored") {
-          clearFirstChunkWatchdog();
-          setIsStreaming(false);
-          setIsAwaitingFirstChunk(false);
-          isAwaitingFirstChunkRef.current = false;
-          setStreamingQuestion("");
-          setStreamingAnswer("");
-          setPendingResponse(null);
-          activeWsStreamIdRef.current = "";
-          streamingAccumulatorRef.current = "";
-          streamBufferRef.current = "";
-          wsTextQueueRef.current = "";
-          displayedAccRef.current = "";
-          clearStreamingRenderTimer();
-          interviewStateRef.current = "listening";
-          if (msg.type === "request_ignored" && msg.reason === "cooldown") {
-            toast({
-              title: "Please wait a few seconds",
-              description: "The current topic was just answered. Retry after a short pause.",
-            });
-          } else if (msg.type === "request_ignored" && (msg.reason === "no_active_question" || msg.reason === "insufficient_context")) {
-            toast({
-              title: "Still listening",
-              description: "No stable interviewer question was ready yet.",
-            });
-          }
-          return;
-        }
-
         if (msg.type === "assistant_start") {
           console.log("[ws] assistant_start received", { requestId: msg.requestId, sessionId: msg.sessionId });
+          // If a previous stream was still accumulating when this new one starts,
+          // save whatever was built so far before wiping — prevents Q1 disappearing when Q2 fires.
+          const prevAnswer = sanitizeDisplayedAnswerText(streamingAccumulatorRef.current + streamBufferRef.current);
+          const prevStreamId = activeWsStreamIdRef.current;
+          if (prevAnswer.trim() && prevStreamId && String(msg.requestId || "") !== prevStreamId) {
+            const prevQuestion =
+              requestQuestionByIdRef.current[prevStreamId] ||
+              streamingQuestionRef.current ||
+              interpretedQuestionRef.current || "";
+            if (prevQuestion && !isApologyResponse(prevAnswer)) {
+              appendLocalResponse(prevQuestion, prevAnswer, responseFormat === "custom" ? "custom" : responseFormat);
+              lastAssistantAnswerRef.current = prevAnswer;
+              appendConversationContextLine("Candidate", prevAnswer.replace(/```[\s\S]*?```/g, "[code]").slice(0, 1500));
+              settleRequestTranscriptQuestionRows(prevStreamId, true);
+            } else {
+              settleRequestTranscriptQuestionRows(prevStreamId, false);
+            }
+          }
           activeWsStreamIdRef.current = String(msg.requestId || "");
           if (activeWsStreamIdRef.current) {
             requestQuestionByIdRef.current[activeWsStreamIdRef.current] =
-              String(msg.question || "").trim() || pendingQuestionForRequestRef.current || interpretedQuestionRef.current || "";
+              pendingQuestionForRequestRef.current || interpretedQuestionRef.current || "";
+            // Snapshot batchNorms for this specific request so that if a later request
+            // updates lastSubmittedBatchNormsRef before this stream ends, assistant_end
+            // still marks the correct segments answered (fixes stale-stream norm mismatch).
+            requestBatchNormsRef.current[activeWsStreamIdRef.current] = [...lastSubmittedBatchNormsRef.current];
+            requestBatchRowIdsRef.current[activeWsStreamIdRef.current] = [...lastSubmittedBatchRowIdsRef.current];
           }
           setIsStreaming(true);
           setIsAwaitingFirstChunk(true);
           triggerMetricRef.current.t_assistant_start_rendered = Date.now();
           isAwaitingFirstChunkRef.current = true;
-          lastStreamingChunkAtRef.current = Date.now();
-          // Start stuck-watchdog: if isStreaming stays true for 30s with no chunks, force-reset
-          if (streamingStuckWatchdogRef.current) clearTimeout(streamingStuckWatchdogRef.current);
-          streamingStuckWatchdogRef.current = setTimeout(() => {
-            if (lastStreamingChunkAtRef.current && (Date.now() - lastStreamingChunkAtRef.current) >= 30_000) {
-              console.warn("[ws] streaming_stuck_timeout on start — force-resetting");
-              setIsStreaming(false);
-              setIsAwaitingFirstChunk(false);
-              isAwaitingFirstChunkRef.current = false;
-              lastAnswerDoneTimestampRef.current = Date.now();
-              streamingStuckWatchdogRef.current = null;
-            }
-          }, 30_000);
-          setStreamingQuestion(String(msg.question || "").trim() || interpretedQuestionRef.current || "Live answer");
+          setStreamingQuestion(interpretedQuestionRef.current || "Live answer");
           setPendingResponse(null);
           setStreamingAnswer("");
           streamBufferRef.current = "";
           streamingAccumulatorRef.current = "";
-          wsTextQueueRef.current = "";
-          displayedAccRef.current = "";
           clearStreamingRenderTimer();
           startFirstChunkWatchdog("assistant_start");
           return;
@@ -4309,21 +4180,6 @@ export default function MeetingSession() {
           const chunk = String(msg.text || "");
           if (!chunk) return;
           console.log("[ws] assistant_chunk received", { requestId: msg.requestId, chars: chunk.length });
-          // Reset streaming-stuck watchdog on every chunk
-          lastStreamingChunkAtRef.current = Date.now();
-          if (streamingStuckWatchdogRef.current) {
-            clearTimeout(streamingStuckWatchdogRef.current);
-            streamingStuckWatchdogRef.current = setTimeout(() => {
-              if (lastStreamingChunkAtRef.current && (Date.now() - lastStreamingChunkAtRef.current) >= 30_000) {
-                console.warn("[ws] streaming_stuck_timeout — force-resetting streaming state");
-                setIsStreaming(false);
-                setIsAwaitingFirstChunk(false);
-                isAwaitingFirstChunkRef.current = false;
-                lastAnswerDoneTimestampRef.current = Date.now();
-                streamingStuckWatchdogRef.current = null;
-              }
-            }, 30_000);
-          }
           if (isAwaitingFirstChunkRef.current) {
             const now = Date.now();
             clearFirstChunkWatchdog();
@@ -4337,15 +4193,94 @@ export default function MeetingSession() {
             const ttfb = now - tRequestSent;
             console.log(`[perf][client] ws_ttft=${now - tDetected}ms request_to_first_token=${ttfb}ms`);
             setDebugMeta((prev) => ({ ...prev, ttfb, sessionState: interviewStateRef.current }));
-            // First chunk: render immediately so TTFT feels instant
-            streamingAccumulatorRef.current += chunk;
-            displayedAccRef.current += chunk;
-            setStreamingAnswer(sanitizeDisplayedAnswerText(displayedAccRef.current));
+            // Refusal detection: if first chunk starts with a known refusal pattern,
+            // cancel immediately — don't show anything to the user, just retry silently.
+            const FIRST_CHUNK_REFUSAL_RE = /^(i('m| am) sorry|sorry,|i need more (context|clarif)|i('m| am) unable|could you (clarify|rephrase|please)|i don't (quite )?understand|it seems (like )?(your|the) question|your question (seems|got|was) (cut off|incomplete|unclear)|i('m| am) not sure (what|which|how to)|to (properly |fully |accurately )?answer (this|that)|i (need|require) (additional|more) (context|information|detail))/i;
+            if (FIRST_CHUNK_REFUSAL_RE.test(chunk.trim())) {
+              console.log("[ws] refusal detected in first chunk — cancelling and retrying");
+              const ws = wsAnswerRef.current;
+              if (ws && ws.readyState === WebSocket.OPEN && id) {
+                ws.send(JSON.stringify({ type: "cancel", sessionId: id }));
+                // Retry with the same question but force: true so server uses liveTranscript prominently
+                const retryQuestion = pendingQuestionForRequestRef.current || interpretedQuestionRef.current || "";
+                if (retryQuestion) {
+                  const retryFullQ = buildFullTranscriptQuestion();
+                  lastSubmittedBatchNormsRef.current = retryFullQ?.batchNorms ?? [];
+                  lastSubmittedBatchRowIdsRef.current = retryFullQ?.batchRowIds ?? [];
+                  setTranscriptQuestionRowsInFlight(lastSubmittedBatchRowIdsRef.current, true);
+                  ws.send(JSON.stringify({
+                    type: "question",
+                    sessionId: id,
+                    text: retryQuestion,
+                    force: true,
+                    format: resolveFormat(retryQuestion),
+                    model: selectedModel,
+                    quickMode: quickResponseMode,
+                    docsMode,
+                    metadata: {
+                      mode: "enter",
+                      audioMode,
+                      submitSource: "retry",
+                      multiQuestionMode: true,
+                      liveTranscript: segmentsRef.current.slice(0, 120).reverse().join("\n") || undefined,
+                      sessionContext: conversationContextLinesRef.current.join("\n") || undefined,
+                      conversationHistory: buildConvHistory(responsesLocalRef.current, retryQuestion),
+                    },
+                  }));
+                }
+              }
+              return;
+            }
+            streamBufferRef.current += chunk;
+            streamingAccumulatorRef.current += streamBufferRef.current;
+            setStreamingAnswer(sanitizeDisplayedAnswerText(streamingAccumulatorRef.current));
+            streamBufferRef.current = "";
             setIsAwaitingFirstChunk(false);
             isAwaitingFirstChunkRef.current = false;
             return;
           }
-          // Subsequent chunks: render directly so the active answer pane stays simple and stable.
+          // Second-chunk refusal guard: server sends "…" as immediateLead before the
+          // real LLM response. isAwaitingFirstChunk was already cleared by "…", so the
+          // first real LLM token arrives here. If the accumulator only has "…" (the lead),
+          // still run refusal detection so we can cancel+retry before showing bad output.
+          const SECOND_CHUNK_REFUSAL_RE = /^(i('m| am) sorry|sorry,|i need more (context|clarif)|i('m| am) unable|could you (clarify|rephrase|please)|i don't (quite )?understand|it seems (like )?(your|the) question|your question (seems|got|was) (cut off|incomplete|unclear)|i('m| am) not sure (what|which|how to)|to (properly |fully |accurately )?answer (this|that)|i (need|require) (additional|more) (context|information|detail))/i;
+          const accumulatorIsOnlyLead = streamingAccumulatorRef.current.trim() === "…" || streamingAccumulatorRef.current.trim() === "";
+          if (accumulatorIsOnlyLead && SECOND_CHUNK_REFUSAL_RE.test(chunk.trim())) {
+            console.log("[ws] refusal detected in second chunk (after lead) — cancelling and retrying");
+            const ws = wsAnswerRef.current;
+            if (ws && ws.readyState === WebSocket.OPEN && id) {
+              ws.send(JSON.stringify({ type: "cancel", sessionId: id }));
+              const retryQuestion = pendingQuestionForRequestRef.current || interpretedQuestionRef.current || "";
+              if (retryQuestion) {
+                const retryFullQ = buildFullTranscriptQuestion();
+                lastSubmittedBatchNormsRef.current = retryFullQ?.batchNorms ?? [];
+                lastSubmittedBatchRowIdsRef.current = retryFullQ?.batchRowIds ?? [];
+                setTranscriptQuestionRowsInFlight(lastSubmittedBatchRowIdsRef.current, true);
+                ws.send(JSON.stringify({
+                  type: "question",
+                  sessionId: id,
+                  text: retryQuestion,
+                  force: true,
+                  format: resolveFormat(retryQuestion),
+                  model: selectedModel,
+                  quickMode: quickResponseMode,
+                  docsMode,
+                  metadata: {
+                    mode: "enter",
+                    audioMode,
+                    submitSource: "retry",
+                    multiQuestionMode: true,
+                    liveTranscript: segmentsRef.current.slice(0, 120).reverse().join("\n") || undefined,
+                    sessionContext: conversationContextLinesRef.current.join("\n") || undefined,
+                    conversationHistory: buildConvHistory(responsesLocalRef.current, retryQuestion),
+                  },
+                }));
+              }
+            }
+            streamingAccumulatorRef.current = "";
+            setStreamingAnswer("");
+            return;
+          }
           streamingAccumulatorRef.current += chunk;
           setStreamingAnswer(sanitizeDisplayedAnswerText(streamingAccumulatorRef.current));
           return;
@@ -4353,25 +4288,53 @@ export default function MeetingSession() {
 
         if (msg.type === "assistant_end") {
           if (activeWsStreamIdRef.current && msg.requestId && msg.requestId !== activeWsStreamIdRef.current) return;
-          console.log("[ws] assistant_end received", { requestId: msg.requestId, cancelled: !!msg.cancelled });
-          if (rafPendingRef.current) {
-            cancelAnimationFrame(rafPendingRef.current);
-            rafPendingRef.current = null;
+          // Deduplicate: same requestId can arrive multiple times (stale streams, retries).
+          const endRequestId = String(msg.requestId || "");
+          if (endRequestId && processedRequestIdsRef.current.has(endRequestId)) {
+            console.log("[ws] assistant_end duplicate ignored", { requestId: endRequestId });
+            return;
           }
+          if (endRequestId) {
+            processedRequestIdsRef.current.add(endRequestId);
+            // Keep set small — only last 20 requestIds needed
+            if (processedRequestIdsRef.current.size > 20) {
+              const first = processedRequestIdsRef.current.values().next().value;
+              if (first) processedRequestIdsRef.current.delete(first);
+            }
+          }
+          console.log("[ws] assistant_end received", { requestId: msg.requestId, cancelled: !!msg.cancelled });
           if (flushTimerRef.current) {
             window.clearTimeout(flushTimerRef.current);
             flushTimerRef.current = null;
           }
           clearFirstChunkWatchdog();
-          clearStreamingRenderTimer();
+          const buffered = streamBufferRef.current;
+          streamBufferRef.current = "";
+          streamingAccumulatorRef.current += buffered;
           const finalAnswer = sanitizeDisplayedAnswerText(streamingAccumulatorRef.current);
           // Layer 2 echo protection: record this answer so isAiFeedbackLoop can filter it if mic picks it up
           if (finalAnswer.trim()) {
             recentAiOutputRef.current = [finalAnswer, ...recentAiOutputRef.current].slice(0, 5);
           }
           if (msg.cancelled) {
+            // If Q1 was cancelled mid-stream (server cancelled it when Q2 arrived),
+            // save whatever Q1 had built so far — prevents Azure answer disappearing when AWS fires.
+            const cancelledAccumulated = sanitizeDisplayedAnswerText(streamingAccumulatorRef.current + streamBufferRef.current);
+            const cancelledRequestId = String(msg.requestId || "");
+            const cancelledQuestion = cancelledRequestId
+              ? requestQuestionByIdRef.current[cancelledRequestId]
+              : (streamingQuestionRef.current || interpretedQuestionRef.current || "");
+            if (cancelledAccumulated.trim().length > 80 && cancelledQuestion && !isApologyResponse(cancelledAccumulated)) {
+              appendLocalResponse(cancelledQuestion, cancelledAccumulated, responseFormat === "custom" ? "custom" : responseFormat);
+              lastAssistantAnswerRef.current = cancelledAccumulated;
+              appendConversationContextLine("Candidate", cancelledAccumulated.replace(/```[\s\S]*?```/g, "[code]").slice(0, 1500));
+              settleRequestTranscriptQuestionRows(cancelledRequestId, true);
+            } else {
+              settleRequestTranscriptQuestionRows(cancelledRequestId, false);
+            }
             if (msg.requestId) {
               delete requestQuestionByIdRef.current[String(msg.requestId)];
+              delete requestBatchNormsRef.current[String(msg.requestId)];
             }
             // This stream was cancelled ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â a new request may have already been re-fired
             // (e.g. continuation combine: "Azure" cancelled ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ "Azure and also AWS" re-fired).
@@ -4387,13 +4350,67 @@ export default function MeetingSession() {
               activeWsStreamIdRef.current = "";
             }
             if (cooldownTimerRef.current) clearTimeout(cooldownTimerRef.current);
-            if (streamingStuckWatchdogRef.current) { clearTimeout(streamingStuckWatchdogRef.current); streamingStuckWatchdogRef.current = null; }
             interviewStateRef.current = "listening";
             lastAnswerDoneTimestampRef.current = Date.now();
             triggerMetricRef.current = {};
             return;
           }
 
+          // If the LLM generated a refusal/apology, wipe the streaming card and bail out.
+          // appendLocalResponse also guards this, but streamingAnswer must be explicitly
+          // cleared — otherwise the streaming card stays visible even though nothing is saved.
+          if (isApologyResponse(finalAnswer)) {
+            console.log("[ws] assistant_end apology detected — discarding and retrying with full context");
+            settleRequestTranscriptQuestionRows(String(msg.requestId || ""), false);
+            setStreamingAnswer("");
+            streamingAccumulatorRef.current = "";
+            setIsStreaming(false);
+            setIsAwaitingFirstChunk(false);
+            isAwaitingFirstChunkRef.current = false;
+            setStreamingQuestion("");
+            setPendingResponse(null);
+            activeWsStreamIdRef.current = "";
+            interpretedQuestionRef.current = "";
+            lastSubmittedBatchNormsRef.current = [];
+            lastSubmittedBatchRowIdsRef.current = [];
+            interviewStateRef.current = "listening";
+            lastAnswerDoneTimestampRef.current = Date.now();
+            // Retry once with full context so vague pronoun questions ("which code",
+            // "what did you mean") get answered using conversation history instead of refused.
+            const retryQ = pendingQuestionForRequestRef.current || streamingQuestionRef.current || "";
+            const ws = wsAnswerRef.current;
+            if (retryQ && ws && ws.readyState === WebSocket.OPEN) {
+              setTimeout(() => {
+                const retryFullQ = buildFullTranscriptQuestion();
+                lastSubmittedBatchNormsRef.current = retryFullQ?.batchNorms ?? [];
+                lastSubmittedBatchRowIdsRef.current = retryFullQ?.batchRowIds ?? [];
+                setTranscriptQuestionRowsInFlight(lastSubmittedBatchRowIdsRef.current, true);
+                showOptimisticAssistantState(retryQ);
+                startFirstChunkWatchdog("apology_end_retry");
+                ws.send(JSON.stringify({
+                  type: "question",
+                  sessionId: id,
+                  text: retryQ,
+                  force: true,
+                  format: responseFormat === "custom" ? "custom" : responseFormat,
+                  model: selectedModel,
+                  quickMode: quickResponseMode,
+                  docsMode,
+                  metadata: {
+                    mode: "enter",
+                    audioMode,
+                    multiQuestionMode: true,
+                    submitSource: "retry",
+                    systemPrompt: customPrompt || undefined,
+                    conversationHistory: buildConvHistory(responsesLocalRef.current, retryQ),
+                    liveTranscript: segmentsRef.current.slice(0, 120).reverse().join("\n") || undefined,
+                    sessionContext: conversationContextLinesRef.current.join("\n") || undefined,
+                  },
+                }));
+              }, 300);
+            }
+            return;
+          }
           setStreamingAnswer(finalAnswer);
           setIsStreaming(false);
           setIsAwaitingFirstChunk(false);
@@ -4402,7 +4419,6 @@ export default function MeetingSession() {
           activeWsStreamIdRef.current = "";
           interpretedQuestionRef.current = "";
           triggerMetricRef.current.t_stream_done_rendered = Date.now();
-          if (streamingStuckWatchdogRef.current) { clearTimeout(streamingStuckWatchdogRef.current); streamingStuckWatchdogRef.current = null; }
           // Go straight back to listening ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â no cooldown delay so next question
           // from the interviewer is captured immediately after the answer ends.
           if (cooldownTimerRef.current) clearTimeout(cooldownTimerRef.current);
@@ -4420,17 +4436,14 @@ export default function MeetingSession() {
             requestQuestionByIdRef.current[requestId] || interpretedQuestionRef.current || streamingQuestionRef.current;
           if (finalAnswer.trim()) {
             const normalizedUsed = normalizeForDedup(questionUsed || "");
-            interviewerQuestionMemoryRef.current = interviewerQuestionMemoryRef.current.map((q) => {
-              if (q.answered) return q;
-              const same = normalizedUsed && normalizeForDedup(q.text) === normalizedUsed;
-              return same ? { ...q, answered: true } : q;
-            });
+            // Exact transcript-row consumption now decides what stays pending.
+            if (requestId) delete requestBatchNormsRef.current[requestId];
             appendLocalResponse(questionUsed, finalAnswer, responseFormat === "custom" ? "custom" : responseFormat);
             lastCommittedResponseQuestionRef.current = questionUsed;
             lastAssistantAnswerRef.current = finalAnswer;
             // Add AI answer to conversation context so follow-up questions like
             // "how much percentage you said?" can reference it
-            appendConversationContextLine("Candidate", finalAnswer.replace(/```[\s\S]*?```/g, "[code]").slice(0, 500));
+            appendConversationContextLine("Candidate", finalAnswer.replace(/```[\s\S]*?```/g, "[code]").slice(0, 1500));
             fetch(`/api/meetings/${id}/set-last-answer`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
@@ -4438,6 +4451,7 @@ export default function MeetingSession() {
               body: JSON.stringify({ answer: finalAnswer, promptUsed: questionUsed }),
             }).catch(() => {});
           }
+          settleRequestTranscriptQuestionRows(requestId, !!finalAnswer.trim());
           if (requestId) delete requestQuestionByIdRef.current[requestId];
           triggerMetricRef.current = {};
           return;
@@ -4472,7 +4486,7 @@ export default function MeetingSession() {
             streamingAccumulatorRef.current = "";
             setPendingResponse((prev) => prev ? { ...prev, answer: refined } : prev);
             lastAssistantAnswerRef.current = refined;
-            appendConversationContextLine("Candidate", refined.replace(/```[\s\S]*?```/g, "[code]").slice(0, 500));
+            appendConversationContextLine("Candidate", refined.replace(/```[\s\S]*?```/g, "[code]").slice(0, 1500));
             fetch(`/api/meetings/${id}/set-last-answer`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
@@ -4499,6 +4513,7 @@ export default function MeetingSession() {
         }
 
         if (msg.type === "assistant_error" || msg.type === "error") {
+          settleRequestTranscriptQuestionRows(String(msg.requestId || activeWsStreamIdRef.current || ""), false);
           clearFirstChunkWatchdog();
           setIsStreaming(false);
           setIsAwaitingFirstChunk(false);
@@ -4508,12 +4523,6 @@ export default function MeetingSession() {
           if (cooldownTimerRef.current) clearTimeout(cooldownTimerRef.current);
           interviewStateRef.current = "listening";
           streamBufferRef.current = "";
-          wsTextQueueRef.current = "";
-          displayedAccRef.current = "";
-          if (rafPendingRef.current) {
-            cancelAnimationFrame(rafPendingRef.current);
-            rafPendingRef.current = null;
-          }
           clearStreamingRenderTimer();
           const errorMsg = String(msg.message || "Please try again");
           console.log("[ws] assistant_error", errorMsg);
@@ -4529,6 +4538,9 @@ export default function MeetingSession() {
 
     ws.onclose = () => {
       console.log("[ws] disconnected /ws (answers)");
+      transcriptQuestionRowsRef.current = transcriptQuestionRowsRef.current.map((row) => ({ ...row, inFlight: false }));
+      requestBatchRowIdsRef.current = {};
+      lastSubmittedBatchRowIdsRef.current = [];
       clearFirstChunkWatchdog();
       setWsTransportConnected(false);
       if (activeWsStreamIdRef.current) {
@@ -4556,6 +4568,7 @@ export default function MeetingSession() {
     clearStreamingRenderTimer,
     queueStreamFlush,
     sanitizeDisplayedAnswerText,
+    settleRequestTranscriptQuestionRows,
     startFirstChunkWatchdog,
     appendLocalResponse,
     replaceLatestLocalResponse,
@@ -4618,12 +4631,15 @@ export default function MeetingSession() {
         triggerMetricRef.current.t_request_sent = now;
         showOptimisticAssistantState(cleanedQuestion);
         startFirstChunkWatchdog("ask_streaming_question");
+        pendingQuestionForRequestRef.current = cleanedQuestion;
+        lastSubmittedBatchNormsRef.current = [];
+        lastSubmittedBatchRowIdsRef.current = [];
         const preparedQuestion =
           speculativePrepareRef.current
           && levenshteinSimilarity(
             speculativePrepareRef.current.norm,
             normalizeQuestionForSimilarity(cleanedQuestion),
-          ) >= SIM_SPECULATIVE_REUSE
+          ) >= 0.82
             ? speculativePrepareRef.current.text
             : undefined;
         ws.send(JSON.stringify({
@@ -4641,7 +4657,11 @@ export default function MeetingSession() {
             customFormatPrompt: responseFormat === "custom" ? customPrompt : undefined,
             docsMode,
             systemPrompt: customPrompt || undefined,
-            jobDescription: conversationHistory || undefined,
+            // Only include Q&A history for follow-up questions; fresh questions get none.
+            conversationHistory: buildConvHistory(responsesLocalRef.current, cleanedQuestion),
+            // Full session transcript for context.
+            liveTranscript: segmentsRef.current.slice(0, 120).reverse().join("\n") || undefined,
+            sessionContext: conversationContextLinesRef.current.join("\n") || undefined,
             preparedQuestion,
             speculative,
           },
@@ -4653,13 +4673,14 @@ export default function MeetingSession() {
     toast({ title: "WebSocket not connected", description: "Reconnect and try again.", variant: "destructive" });
   }, [
     audioMode,
+    buildFullTranscriptQuestion,
     customPrompt,
     docsMode,
     id,
-    conversationHistory,
     quickResponseMode,
     resolveFormat,
     selectedModel,
+    setTranscriptQuestionRowsInFlight,
     startFirstChunkWatchdog,
     showOptimisticAssistantState,
     toast,
@@ -4683,13 +4704,10 @@ export default function MeetingSession() {
       return;
     }
 
-    // Mic-only heuristic: detect candidate self-talk — starts with "I" OR has many "I" words.
-    // Only apply this heuristic in mic-only mode (no speaker diarization).
-    // In system audio mode, never classify by "I" heuristic — only use explicit speaker labels.
-    // When speaker is "unknown", default to treating as interviewer (skip "I" heuristic).
+    // Mic-only: if utterance has more than 3 standalone "I" words, candidate is talking about
+    // themselves — treat as candidate self-talk and skip question detection.
     const selfTalkICount = (trimmed.match(/\bI\b/g) || []).length;
-    const isCandidateSpeech = audioMode === "mic" && speaker !== "unknown" && (/^i\b/i.test(trimmed.trim()) || selfTalkICount > 5);
-    if (isCandidateSpeech) {
+    if (selfTalkICount > 3) {
       if (trimmed && isSubstantiveSegment(trimmed)) {
         appendConversationContextLine("Candidate", trimmed);
       }
@@ -4708,22 +4726,16 @@ export default function MeetingSession() {
       detectQuestion(trimmed)
       || /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are)\b/i.test(normalizedTrimmedBase)
       || /\b(difference|compare|experience|explain|mean)\b/i.test(normalizedTrimmedBase);
-    let allowLowerThreshold = false;
     if (incompleteTail && questionLike) {
       const recovered = getRecentInterimKeywordForRestore(trimmed, Date.now());
       if (recovered) {
         trimmed = `${trimmed.replace(/\?\s*$/, "").trim()} ${recovered}`.replace(/\s+/g, " ").trim();
-      } else {
-        // Recovery failed: attempt detection on original trimmed with a lower confidence threshold
-        allowLowerThreshold = true;
       }
     }
     rememberContinuationTopics(trimmed, Date.now());
     if (pendingQuestionTailRef.current.length > 0 && trimmed) {
-      // Capture current tail before clearing timer and ref to avoid race condition
-      const capturedTail = pendingQuestionTailRef.current;
       if (pendingTailTimerRef.current) { clearTimeout(pendingTailTimerRef.current); pendingTailTimerRef.current = null; }
-      const base = capturedTail.join(" ").replace(/\?\s*$/, "").trim();
+      const base = pendingQuestionTailRef.current.join(" ").replace(/\?\s*$/, "").trim();
       trimmed = `${base} ${trimmed}`.replace(/\s+/g, " ").trim();
       pendingQuestionTailRef.current = [];
     }
@@ -4734,18 +4746,16 @@ export default function MeetingSession() {
     let stitchedFromFragment = false;
     if (trimmed && prevFinal && prevFinal !== trimmed) {
       const currentWordCount = trimmed.split(/\s+/).filter(Boolean).length;
-      const enableTranscriptQuestionCarryover = false;
       // Require at least 2 words so bare noise like "And." or "And. And." is never
       // treated as a joiner continuation ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â it would stitch garbage onto the question.
+      const currentIsContinuationTail = /^(and|and also|also|plus|as well as|along with|including|in addition|regarding|about|specifically)\b/i.test(trimmed) && currentWordCount >= 2 && currentWordCount <= 10;
       const prevLooksFragment =
+        !detectQuestion(prevFinal) &&
         (
           /\b(about|with|on|for|to|in|of)\s*$/i.test(prevFinal)
           || /^(what|why|how|which|who|where|when|explain|describe|tell|walk|talk)\b/i.test(prevFinal)
-          // Dedicated partial-phrase patterns: these are fragments regardless of detectQuestion result
-          || /\b(tell me about|talk me through|walk me through|tell me|explain|describe|what about|how about)\s*$/i.test(prevFinal)
         );
-      const prevIsQuestionLike = enableTranscriptQuestionCarryover && (detectQuestion(prevFinal) || detectQuestionAdvanced(prevFinal).confidence >= 0.5);
-      const currentIsContinuationTail = enableTranscriptQuestionCarryover && /^(and|and also|also|plus|as well as|along with|including|in addition|regarding|about|specifically)\b/i.test(trimmed) && currentWordCount >= 2 && currentWordCount <= 10;
+      const prevIsQuestionLike = detectQuestion(prevFinal) || detectQuestionAdvanced(prevFinal).confidence >= 0.5;
       const currentLooksContinuation =
         startsWithContinuationJoiner(trimmed)
         || currentWordCount <= 4;
@@ -4768,7 +4778,7 @@ export default function MeetingSession() {
         const prevNoQ = prevFinal.replace(/\?\s*$/, "").trim();
         const stitchedTail = `${prevNoQ} ${trimmed}`.replace(/\s+/g, " ").trim();
         const stitchedTailAdv = detectQuestionAdvanced(stitchedTail);
-        if (stitchedTailAdv.isQuestion && stitchedTailAdv.confidence >= 0.5) {
+        if (detectQuestion(stitchedTail) || (stitchedTailAdv.isQuestion && stitchedTailAdv.confidence >= 0.5)) {
           trimmed = stitchedTail.endsWith("?") ? stitchedTail : `${stitchedTail}?`;
           stitchedFromFragment = true;
         }
@@ -4777,22 +4787,22 @@ export default function MeetingSession() {
       // Merge bare short tech-topic fragments (e.g. "AWS", "Django", ".NET") within 10s.
       // Also merge any very short fragment (≤3 words) arriving within 4s of a question —
       // e.g. "roughly", "at peak", "in production", "for this project".
-      const isQuickShortFragment = enableTranscriptQuestionCarryover && currentWordCount <= 3 && msSinceLastSegment <= 4_000 && !currentIsNewQuestion;
+      const isQuickShortFragment = currentWordCount <= 3 && msSinceLastSegment <= 4_000 && !currentIsNewQuestion;
       if (!stitchedFromFragment && !currentIsNewQuestion && prevIsQuestionLike && currentWordCount <= 4 && (keepAsMeaningfulFragment || isQuickShortFragment) && msSinceLastSegment <= 10_000) {
         const prevNoQ = prevFinal.replace(/\?\s*$/, "").trim();
         const joiner = /\b(in|with|on|for|and)\s*$/i.test(prevNoQ) ? "" : " and";
         const stitchedTopic = `${prevNoQ}${joiner} ${trimmed}`.replace(/\s+/g, " ").trim();
         const stitchedTopicAdv = detectQuestionAdvanced(stitchedTopic);
-        if (stitchedTopicAdv.isQuestion && stitchedTopicAdv.confidence >= 0.5) {
+        if (detectQuestion(stitchedTopic) || (stitchedTopicAdv.isQuestion && stitchedTopicAdv.confidence >= 0.5)) {
           trimmed = stitchedTopic.endsWith("?") ? stitchedTopic : `${stitchedTopic}?`;
           stitchedFromFragment = true;
         }
       }
 
-      if (prevLooksFragment && currentLooksContinuation && !currentIsNewQuestion && msSinceLastSegment <= 3_500) {
+      if (prevLooksFragment && currentLooksContinuation && !currentIsNewQuestion) {
         const stitched = `${prevFinal} ${trimmed}`.replace(/\s+/g, " ").trim();
         const stitchedAdvanced = detectQuestionAdvanced(stitched);
-        const stitchedIsQuestion = stitchedAdvanced.isQuestion && stitchedAdvanced.confidence >= 0.5;
+        const stitchedIsQuestion = detectQuestion(stitched) || (stitchedAdvanced.isQuestion && stitchedAdvanced.confidence >= 0.5);
         if (stitchedIsQuestion) {
           trimmed = stitched;
           stitchedFromFragment = true;
@@ -4802,15 +4812,15 @@ export default function MeetingSession() {
       // #8 Fallback: bare tech topic + most recent unanswered question from memory.
       // Only fires when the previous question is also tech-related (has extractable topics)
       // to avoid absurd combinations like "tell me about yourself" + "java".
-      if (enableTranscriptQuestionCarryover && !stitchedFromFragment && !currentIsNewQuestion && keepAsMeaningfulFragment && meaningfulTopics.length > 0) {
+      if (!stitchedFromFragment && !currentIsNewQuestion && keepAsMeaningfulFragment && meaningfulTopics.length > 0) {
         const recentMemQ = interviewerQuestionMemoryRef.current
-          .find(q => !q.answered && (Date.now() - q.ts) <= 15_000);
+          .find(q => q.ts > lastEnterPressTimestampRef.current && (Date.now() - q.ts) <= 15_000);
         if (recentMemQ && extractMeaningfulInterviewTopics(recentMemQ.text).length > 0) {
           const prevNoQ = recentMemQ.text.replace(/\?\s*$/, "").trim();
           const joiner = /\b(in|with|on|for|and)\s*$/i.test(prevNoQ) ? "" : " and";
           const stitchedMem = `${prevNoQ}${joiner} ${trimmed}`.replace(/\s+/g, " ").trim();
           const stitchedMemAdv = detectQuestionAdvanced(stitchedMem);
-          if (stitchedMemAdv.isQuestion && stitchedMemAdv.confidence >= 0.5) {
+          if (detectQuestion(stitchedMem) || (stitchedMemAdv.isQuestion && stitchedMemAdv.confidence >= 0.5)) {
             trimmed = stitchedMem.endsWith("?") ? stitchedMem : `${stitchedMem}?`;
             stitchedFromFragment = true;
           }
@@ -4867,20 +4877,12 @@ export default function MeetingSession() {
     }
     if (
       !trimmed
-      || ((!isSubstantiveSegment(trimmed) && !maybeQ && !keepAsMeaningfulFragment && !allowLowerThreshold))
-      || (isLikelyNoiseSegment(trimmed) && !maybeQ && !keepAsMeaningfulFragment && !allowLowerThreshold)
+      || ((!isSubstantiveSegment(trimmed) && !maybeQ && !keepAsMeaningfulFragment))
+      || (isLikelyNoiseSegment(trimmed) && !maybeQ && !keepAsMeaningfulFragment)
       || (safetyGuardEnabled && isAiFeedbackLoop(trimmed))
     ) {
       // Dropped finals do NOT clear interimText ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â interimHasUnsavedContentRef stays true
       // so the visible partial text stays on screen until the next real final commits it.
-      setInterimText("");
-      interimTextRef.current = "";
-      setStagedTranscriptText("");
-      interimHasUnsavedContentRef.current = false;
-      questionDraftRef.current = "";
-      lastDraftTextRef.current = "";
-      latestPartialQuestionCandidateRef.current = "";
-      latestPartialQuestionCandidateTsRef.current = 0;
       return;
     }
 
@@ -4892,7 +4894,7 @@ export default function MeetingSession() {
         // allow ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â confirmed continuation, must update segmentsRef with combined question
       } else if (keepAsMeaningfulFragment) {
         const prevSegIsQ = detectQuestion(segmentsRef.current[0] || "") || detectQuestionAdvanced(segmentsRef.current[0] || "").confidence >= 0.5;
-        const hasRecentMemQ = interviewerQuestionMemoryRef.current.some(q => !q.answered && (Date.now() - q.ts) <= 12_000);
+        const hasRecentMemQ = interviewerQuestionMemoryRef.current.some(q => q.ts > lastEnterPressTimestampRef.current && (Date.now() - q.ts) <= 12_000);
         if (!prevSegIsQ && !hasRecentMemQ) return;
       } else {
         return;
@@ -4912,8 +4914,7 @@ export default function MeetingSession() {
 
     // When stitching combined the fragment into a full question, use the stitched text for display
     // so that pendingTranscriptLineRef gets the full combined question, not just the raw fragment.
-    const segmentForDisplay = cleanTranscriptForDisplay(String(trimmed || rawFinal || "").replace(/\s+/g, " ").trim())
-      || String(trimmed || rawFinal || "").replace(/\s+/g, " ").trim();
+    const segmentForDisplay = String(rawFinal || trimmed || "").replace(/\s+/g, " ").trim();
     upsertTranscriptSegment(trimmed);
     // Don't merge two independent questions into one line.
     // Allow grouping only when the pending text is a fragment (not yet a complete question)
@@ -4927,8 +4928,7 @@ export default function MeetingSession() {
     // Joiner phrases ("and also Flask", "and React", "also AWS") should always attach
     // to the previous line even across a long pause ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â use a 12 s window for them.
     const newSegStartsJoiner = /^(and also|and|also|plus)\b/i.test(segmentForDisplay.trim());
-    const pendingSegmentIsQuestion = !!pendingTranscriptLineRef.current && detectQuestion(pendingTranscriptLineRef.current);
-    const joinerGroupingMs = (newSegStartsJoiner && pendingSegmentIsQuestion) ? 12_000 : TRANSCRIPT_GROUPING_MS;
+    const joinerGroupingMs = newSegStartsJoiner ? 12_000 : TRANSCRIPT_GROUPING_MS;
     const combinedWordCount = `${pendingTranscriptLineRef.current} ${segmentForDisplay}`.split(/\s+/).filter(Boolean).length;
     const shouldGroupWithPending =
       pendingTranscriptLineRef.current
@@ -4952,13 +4952,11 @@ export default function MeetingSession() {
       }
     } else {
       flushPendingTranscriptLine();
-      const suppressPendingStray = hasLongerTailOwner(segmentForDisplay, segmentsRef.current);
-      pendingTranscriptLineRef.current = suppressPendingStray ? "" : segmentForDisplay;
-      pendingTranscriptTsRef.current = suppressPendingStray ? 0 : Date.now();
-      setPendingTranscriptLine(suppressPendingStray ? "" : segmentForDisplay);
+      pendingTranscriptLineRef.current = segmentForDisplay;
+      pendingTranscriptTsRef.current = Date.now();
+      setPendingTranscriptLine(segmentForDisplay);
       upsertDisplayTranscriptSegment(segmentForDisplay);
     }
-    const latestDisplaySegmentKey = displaySegmentKeysRef.current[0] || "";
     schedulePendingTranscriptFlush();
 
     // No auto-fire: answers only triggered by Enter key press.
@@ -4995,101 +4993,150 @@ export default function MeetingSession() {
     // Mark finalization so updateDraftFromPartial can discard stale post-final echoes
     lastFinalizedTextRef.current = trimmed;
     lastFinalizedAtRef.current = Date.now();
+    suppressPartialUntilRef.current = Date.now() + 300; // suppress Azure's late echo partial for 300ms
 
-    // ASR gap merge: if a pending gap-question exists from within 3s, prepend it.
-    // This handles interviewer pauses (300-500ms) that split one question into two ASR finals.
-    const ASR_GAP_MERGE_MS = 3_000;
-    const QUESTION_STARTER_RE = /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are|tell|walk|explain|give|describe|share|suppose|assume)\b/i;
-    let effectiveTrimmed = trimmed;
-    if (pendingGapQuestionRef.current) {
-      const gap = pendingGapQuestionRef.current;
-      const age = Date.now() - gap.ts;
-      if (age <= ASR_GAP_MERGE_MS) {
-        // Merge: pending start + current continuation
-        const merged = `${gap.text.replace(/[,.]?\s*$/, "")} ${trimmed}`.trim();
-        effectiveTrimmed = merged;
-        console.log(`[asr-gap] merged gap fragment: "${gap.text}" + "${trimmed}" → "${merged}"`);
-      }
-      if (pendingGapTimerRef.current) clearTimeout(pendingGapTimerRef.current);
-      pendingGapQuestionRef.current = null;
-      pendingGapTimerRef.current = null;
-    }
-    const trimmed_orig = trimmed; // keep original for speaker label / conversation context
-    // Use merged text for question detection
-    const trimmedForDetect = effectiveTrimmed;
-
-    const isIncompleteFinal = isLikelyIncompleteFragment(trimmedForDetect) && !keepAsMeaningfulFragment;
-    // If fragment starts with a question-starter and is short/incomplete, park it in
-    // the gap buffer so the next ASR final can complete it.
-    const wordCount = trimmedForDetect.split(/\s+/).filter(Boolean).length;
-    const startsWithQuestionWord = QUESTION_STARTER_RE.test(trimmedForDetect);
-    if (isIncompleteFinal && startsWithQuestionWord && wordCount <= 6 && selfTalkICount === 0) {
-      if (pendingGapTimerRef.current) clearTimeout(pendingGapTimerRef.current);
-      pendingGapQuestionRef.current = { text: trimmedForDetect, ts: Date.now() };
-      pendingGapTimerRef.current = setTimeout(() => {
-        pendingGapQuestionRef.current = null;
-        pendingGapTimerRef.current = null;
-      }, ASR_GAP_MERGE_MS);
-      console.log(`[asr-gap] parked incomplete starter: "${trimmedForDetect}"`);
-    }
-
-    // No "I" pronoun → very likely interviewer: use higher confidence threshold (interviewer asks direct questions);
-    // when "I" is present the speaker may be the candidate, so use a lower threshold.
+    const isIncompleteFinal = isLikelyIncompleteFragment(trimmed) && !keepAsMeaningfulFragment;
+    // No "I" pronoun → very likely interviewer: lower confidence threshold so more gets detected as question
     const noFirstPerson = selfTalkICount === 0;
-    const confidenceThreshold = noFirstPerson ? 0.6 : 0.45;
+    const confidenceThreshold = noFirstPerson ? 0.25 : 0.5;
     const minWords = noFirstPerson ? 2 : 3;
-    // Short question-starter fragments (3-8 words, no "I", not incomplete) are treated as
-    // questions even if detectQuestion scores them low — covers "What is Java?", "Tell me about Python"
-    const shortQuestionStarterBoost =
-      !isIncompleteFinal
-      && noFirstPerson
-      && wordCount >= 3
-      && wordCount <= 8
-      && startsWithQuestionWord
-      && !isLikelyNoiseSegment(trimmedForDetect);
-    const finalIsQuestion = (detectQuestion(trimmedForDetect) || (advanced.isQuestion && advanced.confidence >= confidenceThreshold) || shortQuestionStarterBoost) && !isIncompleteFinal;
+    const finalIsQuestion = (detectQuestion(trimmed) || (advanced.isQuestion && advanced.confidence >= confidenceThreshold)) && !isIncompleteFinal;
     const isSubstantiveStatement = !finalIsQuestion && !isIncompleteFinal && !isLikelyNoiseSegment(trimmed) &&
       trimmed.split(/\s+/).filter(Boolean).length >= minWords;
     if (finalIsQuestion || isSubstantiveStatement) {
       pendingContinuationTopicsRef.current = [];
-      rememberBoundaryQuestionCandidate(trimmedForDetect, Date.now());
-      const existingQuestionTexts = interviewerQuestionMemoryRef.current.map((q) => q.text);
-      if (!hasLongerTailOwner(trimmedForDetect, existingQuestionTexts)) {
-        const prunedQuestionMemory = evictShortTailTexts(trimmedForDetect, existingQuestionTexts);
-        const prunedExistingEntries = interviewerQuestionMemoryRef.current.filter((q) =>
-          prunedQuestionMemory.some((text) => normalizeForDedup(text) === normalizeForDedup(q.text)),
+      rememberBoundaryQuestionCandidate(trimmed, Date.now());
+      // Every new segment starts as answered:false — no overlap pre-marking.
+      // Overlap-based pre-marking was causing Q2/Q3/Q4 to be silently dropped
+      // when they shared common words with an already-answered Q1 ("how", "your",
+      // "experience", "what"). Only exact batchNorms matching at assistant_end
+      // marks segments done — that way pressing Enter always collects ALL pending
+      // unanswered questions since the last Enter press.
+      const newNorm = normalizeForDedup(trimmed);
+      const wordCount = trimmed.split(/\s+/).filter(Boolean).length;
+
+      // Questions need >=2 words (catches "What is Python?", "Explain storage?").
+      // Non-question statements need >=4 words to avoid noise ("AWS,.", "And. Fast.").
+      const meetsWordThreshold = finalIsQuestion ? wordCount >= 2 : wordCount >= 4;
+      const trackedTranscriptRow = upsertTranscriptQuestionRow(trimmed, {
+        isExplicitQuestion: finalIsQuestion,
+        allowShortTopicAppend: !finalIsQuestion,
+      });
+      if (trackedTranscriptRow) {
+        console.log("[multiQ] transcript row tracked", {
+          text: trackedTranscriptRow.text.slice(0, 80),
+          totalRows: transcriptQuestionRowsRef.current.length,
+          pendingRows: getPendingTranscriptQuestionRows().length,
+        });
+      }
+
+      // Short follow-up topic (1-3 words) arriving within 8s of a pending question
+      // → append to that question as "and [topic]" instead of dropping.
+      // Handles: "do you have experience in java" / "python" → "…java and python?"
+      if (!meetsWordThreshold && wordCount >= 1 && wordCount <= 3 && !isLikelyNoiseSegment(trimmed)) {
+        const now8 = Date.now();
+        const recentPendingIdx = interviewerQuestionMemoryRef.current.findIndex(
+          (q) => q.ts > lastEnterPressTimestampRef.current && (now8 - q.ts) <= 8_000,
         );
-        interviewerQuestionMemoryRef.current = [
-          { text: trimmedForDetect, answered: false, ts: Date.now() },
-          ...prunedExistingEntries.filter((q) => normalizeForDedup(q.text) !== normalizeForDedup(trimmedForDetect)),
-        ].slice(0, 30);
+        if (recentPendingIdx !== -1) {
+          const updated = [...interviewerQuestionMemoryRef.current];
+          const prev = updated[recentPendingIdx];
+          const prevText = prev.text.replace(/\?\s*$/, "").trim();
+          updated[recentPendingIdx] = { text: `${prevText} and ${trimmed}?`, ts: now8 };
+          interviewerQuestionMemoryRef.current = updated;
+          console.log("[multiQ] short topic appended to pending question", {
+            prev: prev.text.slice(0, 60), appended: trimmed, result: updated[recentPendingIdx].text.slice(0, 80),
+          });
+        } else {
+          console.log("[multiQ] segment skipped (noise/too short, no pending Q)", { text: trimmed.slice(0, 80), wordCount });
+        }
+      } else if (meetsWordThreshold && !isLikelyNoiseSegment(trimmed)) {
+        // Deduplicate repeated sentences within the segment (STT sometimes echoes itself,
+        // e.g. "What is Python? What is Python?" → "What is Python?").
+        const deduped = trimmed.replace(/(.{10,}?)(\s+\1)+/gi, "$1").trim() || trimmed;
+        const dedupedNorm = normalizeForDedup(deduped);
+        // Check if this is an STT extension of a PENDING (newer than last submit) entry.
+        // e.g. "Do you know Django?" → "Do you know Django and FastAPI?" — update in place.
+        const dedupedSim = normalizeQuestionForSimilarity(deduped);
+        const existingPendingIdx = interviewerQuestionMemoryRef.current.findIndex(
+          (q) => q.ts > lastEnterPressTimestampRef.current && (
+            dedupedNorm.startsWith(normalizeForDedup(q.text)) ||
+            normalizeForDedup(q.text).startsWith(dedupedNorm) ||
+            levenshteinSimilarity(normalizeQuestionForSimilarity(q.text), dedupedSim) >= 0.60
+          ),
+        );
+        if (existingPendingIdx !== -1) {
+          // Replace with longer/newer version
+          const updated = [...interviewerQuestionMemoryRef.current];
+          updated[existingPendingIdx] = { text: deduped, ts: Date.now() };
+          interviewerQuestionMemoryRef.current = updated;
+          console.log("[multiQ] segment updated (STT extension)", { text: deduped.slice(0, 80) });
+        } else {
+          // Skip if already tracked — either exact norm match OR high similarity
+          // to any existing entry (handles STT re-phrasing: "tell me about the time"
+          // vs "tell me about a time" — different norms but same question).
+          const dedupedNormSim = normalizeQuestionForSimilarity(deduped);
+          const alreadyTracked = interviewerQuestionMemoryRef.current.some(
+            (q) => normalizeForDedup(q.text) === dedupedNorm
+              || levenshteinSimilarity(normalizeQuestionForSimilarity(q.text), dedupedNormSim) >= 0.60,
+          );
+          if (!alreadyTracked) {
+            interviewerQuestionMemoryRef.current = [
+              { text: deduped, ts: Date.now() },
+              ...interviewerQuestionMemoryRef.current,
+            ].slice(0, 50);
+            console.log("[multiQ] segment added to memory", {
+              text: deduped.slice(0, 80),
+              totalInMemory: interviewerQuestionMemoryRef.current.length,
+              pendingSinceLastEnter: interviewerQuestionMemoryRef.current.filter(q => q.ts > lastEnterPressTimestampRef.current).length,
+            });
+          } else {
+            console.log("[multiQ] segment skipped (exact dup)", { text: deduped.slice(0, 80) });
+          }
+        }
+      } else {
+        console.log("[multiQ] segment skipped (noise/too short)", { text: trimmed.slice(0, 80), wordCount });
       }
       // Invalidate stale interpreted question when a newer transcript question arrives.
       const currentInterpreted = interpretedQuestionRef.current?.trim() || "";
       if (!currentInterpreted || levenshteinSimilarity(
         normalizeQuestionForSimilarity(currentInterpreted),
-        normalizeQuestionForSimilarity(trimmedForDetect),
-      ) < SIM_DEDUP_BLOCK) {
-        setInterpretedQuestion(trimmedForDetect);
+        normalizeQuestionForSimilarity(trimmed),
+      ) < 0.85) {
+        setInterpretedQuestion(trimmed);
       }
     } else {
       if (keepAsMeaningfulFragment) {
-        rememberBoundaryQuestionCandidate(trimmedForDetect, Date.now());
+        rememberBoundaryQuestionCandidate(trimmed, Date.now());
       }
-      spokenReplyMemoryRef.current = [{ text: trimmedForDetect, ts: Date.now() }, ...spokenReplyMemoryRef.current].slice(0, 30);
+      spokenReplyMemoryRef.current = [{ text: trimmed, ts: Date.now() }, ...spokenReplyMemoryRef.current].slice(0, 30);
     }
     // No "I" and not noise → treat as interviewer in conversation context too
     const speakerLabel: "Interviewer" | "Candidate" = (finalIsQuestion || noFirstPerson) ? "Interviewer" : "Candidate";
-    appendConversationContextLine(speakerLabel, trimmed_orig);
+    appendConversationContextLine(speakerLabel, trimmed);
+
+    // Warm speculative on the COMBINED question (all unanswered segments) so that when
+    // Enter is pressed, the speculative norm matches what buildFullTranscriptQuestion returns.
+    // Without this, speculative fires on the last segment only → mismatch → full delay on Enter.
+    if (finalIsQuestion || isSubstantiveStatement) {
+      const fullQ = buildFullTranscriptQuestion();
+      const speculativeSeed = fullQ?.combined || trimmed;
+      // When the actual question arrives (not just more scenario context), force-clear
+      // the speculative dedup ref so warmSpeculativeAnswerPath always fires fresh —
+      // the server will restart with full scenario+question context.
+      if (finalIsQuestion && speculativePrepareRef.current) {
+        speculativePrepareRef.current = null;
+      }
+      void warmSpeculativeAnswerPathRef.current?.(speculativeSeed);
+    }
 
     // Stage B: reconcile speculative trigger with final transcript.
     const speculative = speculativeQuestionRef.current;
     if (speculative) {
       const finalNorm = normalizeQuestionForSimilarity(trimmed);
       const similarity = finalNorm ? levenshteinSimilarity(speculative.norm, finalNorm) : 0;
-      const elapsed = Math.max(0, Date.now() - (speculative.ts || Date.now()));
-      const withinWindow = elapsed <= SPECULATIVE_WINDOW_MS;
-      const shouldRefine = withinWindow && !speculative.refined && similarity < SIM_REFINEMENT_MAX && maybeQ;
+      const withinWindow = Date.now() - speculative.ts <= 12000;
+      const shouldRefine = withinWindow && !speculative.refined && similarity < 0.8 && maybeQ;
       if (shouldRefine && !isNearDuplicateAskedQuestion(trimmed)) {
         speculative.refined = true;
         if (finalNorm) {
@@ -5098,10 +5145,7 @@ export default function MeetingSession() {
         // Do not start a second stream. Tier-1 refinement is already scheduled
         // after Tier-0 completion in the server streaming pipeline.
         setInterpretedQuestion(trimmed);
-      } else if (shouldRefine && isNearDuplicateAskedQuestion(trimmed)) {
-        // shouldRefine is true but it's a near-duplicate — clear to prevent deadlock
-        speculativeQuestionRef.current = null;
-      } else if (similarity >= SIM_REFINEMENT_MAX || !withinWindow) {
+      } else if (similarity >= 0.8 || !withinWindow) {
         speculativeQuestionRef.current = null;
       }
     }
@@ -5112,93 +5156,66 @@ export default function MeetingSession() {
       && autoAnswerEnabled
       && !isStreaming
       && advanced.isQuestion
-      && advanced.confidence >= 0.55
+      && advanced.confidence >= 0.65
       && !!finalFingerprint
       && !isDuplicateRecentAutoTrigger(finalFingerprint, Date.now())
       && !isNearDuplicateAskedQuestion(trimmed)
     );
+    console.log("[multiQ] handleFinalTurn", {
+      text: trimmed.slice(0, 80),
+      ENTER_ONLY_ANSWER_MODE,
+      autoAnswerEnabled,
+      isStreaming,
+      isQuestion: advanced.isQuestion,
+      confidence: advanced.confidence,
+      canFinalTrigger,
+      pendingSinceLastEnter: getPendingTranscriptQuestionRows().length,
+    });
     // Update debug panel with latest question confidence
     setDebugMeta((prev) => ({ ...prev, questionConf: advanced.confidence, sessionState: interviewStateRef.current }));
 
     if (canFinalTrigger && id) {
-      // Capture state values at detection time (used as fallback if display is empty at fire time)
-      const capturedTrimmed = trimmed;
-      const capturedId = id;
-      const capturedFormat = responseFormat;
-      const capturedModel = selectedModel;
-      const capturedQuickMode = quickResponseMode;
-      const capturedDocsMode = docsMode;
-      const capturedCustomPrompt = customPrompt;
-      const capturedHistory = conversationHistory;
-      const capturedAudioMode = audioMode;
-
-      // Debounce: cancel any pending trigger and start a fresh 700ms window.
-      // This lets rapid-fire multi-question sequences accumulate in displaySegmentsRef
-      // before we fire, so the AI receives ALL questions together instead of just the first.
-      if (autoTriggerDebounceRef.current) clearTimeout(autoTriggerDebounceRef.current);
-
-      autoTriggerDebounceRef.current = setTimeout(() => {
-        autoTriggerDebounceRef.current = null;
-        // Abort if another trigger already locked state during the debounce window
-        if (interviewStateRef.current === "answering") return;
-
-        // Build multi-question text from all consecutive question segments in the display
-        // (newest-first in displaySegmentsRef, so reverse to chronological order).
-        const QSTART_RE = /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are|tell|walk|explain|give|describe|share|suppose|assume)\b/i;
-        const CAND_RE = /^Candidate:\s+/i;
-        const collectedQs: string[] = [];
-        let fragSkips = 0;
-        for (const seg of displaySegmentsRef.current.slice(0, 10)) {
-          const s = String(seg || "").trim();
-          if (!s || CAND_RE.test(s)) break;
-          if (s.includes("?") || QSTART_RE.test(s)) {
-            collectedQs.push(s);
-            fragSkips = 0;
-          } else {
-            if (s.split(/\s+/).filter(Boolean).length <= 2 && fragSkips < 2) fragSkips++;
-            else break;
-          }
-        }
-        const text = collectedQs.length > 1
-          ? collectedQs.slice().reverse().join(" ")
-          : capturedTrimmed;
-        const multiQuestionMode = collectedQs.length > 1 || countExplicitQuestionPrompts(text) >= 2;
-
-        interviewStateRef.current = "answering";
-        rememberAutoTriggerFingerprint(finalFingerprint!, Date.now());
-        rememberAskedFingerprint(finalFingerprint!);
-        triggerMetricRef.current = { t_trigger_decision: Date.now(), t_final_detected: Date.now() };
-        setLastSubmitSource("transcript");
-        setInterpretedQuestion(text);
-        setStreamingQuestion(text);
-        showOptimisticAssistantState(text);
-        const ws = wsAnswerRef.current;
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          startFirstChunkWatchdog("auto_final");
-          ws.send(JSON.stringify({
-            type: "question",
-            sessionId: capturedId,
-            text,
-            format: capturedFormat === "custom" ? "custom" : capturedFormat,
-            model: capturedModel,
-            quickMode: capturedQuickMode,
-            docsMode: capturedDocsMode,
-            metadata: {
-              mode: "final",
-              audioMode: capturedAudioMode,
-              submitSource: "transcript",
-              multiQuestionMode,
-              customFormatPrompt: capturedFormat === "custom" ? capturedCustomPrompt : undefined,
-              docsMode: capturedDocsMode,
-              systemPrompt: capturedCustomPrompt || undefined,
-              jobDescription: capturedHistory || undefined,
-            },
-          }));
-          triggerMetricRef.current.t_request_sent = Date.now();
-        } else {
-          interviewStateRef.current = "listening";
-        }
-      }, 700);
+      interviewStateRef.current = "answering"; // Lock: prevents races/duplicates until cooldown
+      rememberAutoTriggerFingerprint(finalFingerprint!, Date.now());
+      rememberAskedFingerprint(finalFingerprint!);
+      triggerMetricRef.current = { t_trigger_decision: Date.now(), t_final_detected: Date.now() };
+      setLastSubmitSource("transcript");
+      setInterpretedQuestion(trimmed);
+      setStreamingQuestion(trimmed);
+      showOptimisticAssistantState(trimmed);
+      const ws = wsAnswerRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        startFirstChunkWatchdog("auto_final");
+        const autoFullQ = buildFullTranscriptQuestion();
+        // Mark all pending segments as "handled" — next Enter will only collect newer segments.
+        lastEnterPressTimestampRef.current = Date.now();
+        lastSubmittedBatchNormsRef.current = autoFullQ?.batchNorms ?? [];
+        lastSubmittedBatchRowIdsRef.current = autoFullQ?.batchRowIds ?? [];
+        setTranscriptQuestionRowsInFlight(lastSubmittedBatchRowIdsRef.current, true);
+        pendingQuestionForRequestRef.current = autoFullQ?.combined || trimmed;
+        ws.send(JSON.stringify({
+          type: "question",
+          sessionId: id,
+          text: autoFullQ?.combined || trimmed,
+          format: responseFormat === "custom" ? "custom" : responseFormat,
+          model: selectedModel,
+          quickMode: quickResponseMode,
+          docsMode,
+          metadata: {
+            mode: "final",
+            audioMode,
+            submitSource: "transcript",
+            multiQuestionMode: !!(autoFullQ?.isMulti),
+            customFormatPrompt: responseFormat === "custom" ? customPrompt : undefined,
+            docsMode,
+            systemPrompt: customPrompt || undefined,
+            conversationHistory: buildConvHistory(responsesLocalRef.current, autoFullQ?.combined || trimmed),
+            liveTranscript: segmentsRef.current.slice(0, 120).reverse().join("\n") || undefined,
+            sessionContext: conversationContextLinesRef.current.join("\n") || undefined,
+          },
+        }));
+      }
+      triggerMetricRef.current.t_request_sent = Date.now();
     }
 
     try {
@@ -5210,11 +5227,17 @@ export default function MeetingSession() {
           audioMode,
         });
       }
-      const turn = { text: trimmed, startMs, endMs, speaker };
-      transcriptPersistQueueRef.current.push(turn);
-      scheduleTranscriptPersistFlush(socketConnected ? 4000 : 250);
-      if (speaker === "interviewer" || speaker === "unknown") {
-        void detectTranscriptQuestionRealtime(trimmed, latestDisplaySegmentKey);
+      const turn = { text: trimmed, startMs, endMs };
+      if (socketConnected) {
+        transcriptPersistQueueRef.current.push(turn);
+        scheduleTranscriptPersistFlush();
+      } else {
+        await fetch(`/api/meetings/${id}/transcript-turn`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify(turn),
+        });
       }
     } catch (e) {
       console.error("[meeting] turn finalize/detect failed", e);
@@ -5239,10 +5262,12 @@ export default function MeetingSession() {
     getRecentInterimKeywordForRestore,
     rememberAutoTriggerFingerprint,
     isDuplicateRecentAutoTrigger,
+    getPendingTranscriptQuestionRows,
     appendConversationContextLine,
     cleanTranscriptForDisplay,
     autocorrectNoisyQuestionWithContext,
     upsertTranscriptSegment,
+    upsertTranscriptQuestionRow,
     upsertDisplayTranscriptSegment,
     replaceLatestDisplayTranscriptSegment,
     flushPendingTranscriptLine,
@@ -5252,13 +5277,11 @@ export default function MeetingSession() {
     quickResponseMode,
     docsMode,
     customPrompt,
-    conversationHistory,
     safetyGuardEnabled,
     showOptimisticAssistantState,
     startFirstChunkWatchdog,
-    hasLongerTailOwner,
-    evictShortTailTexts,
-    detectTranscriptQuestionRealtime,
+    buildFullTranscriptQuestion,
+    wordOverlap,
   ]);
 
   const setupAudioAnalyser = useCallback((stream: MediaStream) => {
@@ -5961,13 +5984,15 @@ export default function MeetingSession() {
 
   const clearTranscriptSegments = useCallback(() => {
     segmentsRef.current = [];
+    transcriptQuestionRowsRef.current = [];
     displaySegmentsRef.current = [];
     displaySegmentKeysRef.current = [];
+    requestBatchRowIdsRef.current = {};
+    lastSubmittedBatchRowIdsRef.current = [];
     setTranscriptSegments([]);
     setTranscriptSegmentKeys([]);
     setDisplayTranscriptSegments([]);
     setDisplayTranscriptSegmentKeys([]);
-    setTranscriptQuestionDetections({});
     setInterimText("");
     interimTextRef.current = "";
     setStagedTranscriptText("");
@@ -6119,13 +6144,19 @@ export default function MeetingSession() {
     const now = Date.now();
     triggerMetricRef.current = { t_trigger_decision: now };
     const submitSource: SubmitSeedSource = mode === "enter" ? "interpreted" : "transcript";
-    const multiQuestionMode = countExplicitQuestionPrompts(cleanedOverride) >= 2;
     setLastSubmitSource(submitSource);
     setInterpretedQuestion(cleanedOverride);
     setStreamingQuestion(cleanedOverride);
     triggerMetricRef.current.t_request_sent = now;
     showOptimisticAssistantState(cleanedOverride);
     startFirstChunkWatchdog(`ws_${mode}`);
+    pendingQuestionForRequestRef.current = questionToSend;
+    const wsAnswerFullQ = buildFullTranscriptQuestion();
+    // Mark all pending segments as "handled" so next Enter only collects newer segments.
+    lastEnterPressTimestampRef.current = Date.now();
+    lastSubmittedBatchNormsRef.current = wsAnswerFullQ?.batchNorms ?? [];
+    lastSubmittedBatchRowIdsRef.current = wsAnswerFullQ?.batchRowIds ?? [];
+    setTranscriptQuestionRowsInFlight(lastSubmittedBatchRowIdsRef.current, true);
     console.log(`[submit] transport=ws source=${submitSource} mode=${mode}`, { preview: cleanedOverride.slice(0, 160) });
     const formatToSend = responseFormat === "custom" ? "custom" : responseFormat;
     const preparedQuestion =
@@ -6133,9 +6164,17 @@ export default function MeetingSession() {
       && levenshteinSimilarity(
         speculativePrepareRef.current.norm,
         normalizeQuestionForSimilarity(cleanedOverride),
-      ) >= SIM_SPECULATIVE_REUSE
+      ) >= 0.82
         ? speculativePrepareRef.current.text
         : undefined;
+    // Send speculative_question synchronously before the real question so the
+    // server always has a running speculative stream to adopt — eliminating the
+    // race condition where Enter and question-arrival happen in the same tick.
+    ws.send(JSON.stringify({
+      type: "speculative_question",
+      sessionId: id,
+      text: questionToSend,
+    }));
     ws.send(JSON.stringify({
       type: "question",
       sessionId: id,
@@ -6149,11 +6188,13 @@ export default function MeetingSession() {
         mode,
         audioMode,
         submitSource,
-        multiQuestionMode,
+        multiQuestionMode: !!(wsAnswerFullQ?.isMulti),
         customFormatPrompt: responseFormat === "custom" ? customPrompt : undefined,
         docsMode,
         systemPrompt: customPrompt || undefined,
-        jobDescription: conversationHistory || undefined,
+        conversationHistory: buildConvHistory(responsesLocalRef.current, questionToSend),
+        liveTranscript: segmentsRef.current.slice(0, 120).reverse().join("\n") || undefined,
+        sessionContext: conversationContextLinesRef.current.join("\n") || undefined,
         preparedQuestion,
       },
     }));
@@ -6166,8 +6207,9 @@ export default function MeetingSession() {
     quickResponseMode,
     docsMode,
     customPrompt,
-    conversationHistory,
     showOptimisticAssistantState,
+    buildFullTranscriptQuestion,
+    setTranscriptQuestionRowsInFlight,
     startFirstChunkWatchdog,
     isStreaming,
     getLiveVisionStream,
@@ -6193,12 +6235,23 @@ export default function MeetingSession() {
     const norm = normalizeQuestionForSimilarity(cleanedQuestion);
     if (!norm) return;
     const existing = speculativePrepareRef.current;
-    if (existing && existing.norm === norm && (Date.now() - existing.ts) <= SPECULATIVE_WINDOW_MS) {
+    if (existing && existing.norm === norm && (Date.now() - existing.ts) <= 12000) {
       return;
     }
 
     speculativePrepareRef.current = { norm, text: cleanedQuestion, ts: Date.now(), prepared: false };
     speculativeQuestionRef.current = { norm, text: cleanedQuestion, ts: Date.now(), refined: false };
+
+    // Fire background LLM generation immediately via WebSocket so chunks are buffered
+    // before Enter is pressed. On Enter the server replays buffered chunks instantly.
+    const wsSpec = wsAnswerRef.current;
+    if (wsSpec && wsSpec.readyState === WebSocket.OPEN) {
+      wsSpec.send(JSON.stringify({
+        type: "speculative_question",
+        sessionId: id,
+        text: cleanedQuestion,
+      }));
+    }
 
     try {
       await fetch(`/api/meetings/${id}/prepare-answer`, {
@@ -6212,7 +6265,10 @@ export default function MeetingSession() {
           docsMode,
           model: selectedModel,
           systemPrompt: customPrompt || undefined,
-          jobDescription: conversationHistory || undefined,
+          // Include full context so speculative answer quality matches the actual Enter request.
+          liveTranscript: segmentsRef.current.slice(0, 120).reverse().join("\n") || undefined,
+          sessionContext: conversationContextLinesRef.current.join("\n") || undefined,
+          conversationHistory: buildConvHistory(responsesLocalRef.current, cleanedQuestion),
         }),
       });
       if (speculativePrepareRef.current?.norm === norm) {
@@ -6222,7 +6278,10 @@ export default function MeetingSession() {
     } catch {
       // Best-effort warm path only.
     }
-  }, [id, responseFormat, quickResponseMode, docsMode, selectedModel, customPrompt, conversationHistory]);
+  }, [id, responseFormat, quickResponseMode, docsMode, selectedModel, customPrompt]);
+
+  // Keep ref current so handleFinalTurn can call it without forward-declaration issues.
+  useEffect(() => { warmSpeculativeAnswerPathRef.current = warmSpeculativeAnswerPath; }, [warmSpeculativeAnswerPath]);
 
   const triggerQuestionExtraction = useCallback(async (mode: "pause" | "enter" | "final"): Promise<string | null> => {
     // Use pending transcript line (combined multi-segment context) when interim is gone
@@ -6235,7 +6294,7 @@ export default function MeetingSession() {
     // preposition/conjunction like "in", "with", "about"), prefer the latest final segment
     // which is the complete previous sentence, rather than sending a truncated interim.
     if (mode === "enter" && latestFinal) {
-      const endsIncomplete = /\b(with|on|for|to|of|at|by|from|or|that|a|an|the|is|are|was|have|has)\s*$/i.test(sourceText);
+      const endsIncomplete = /\b(in|with|on|for|to|of|at|by|from|about|and|or|that|a|an|the|is|are|was|have|has)\s*$/i.test(sourceText);
       if (endsIncomplete && latestFinal.split(/\s+/).filter(Boolean).length > sourceText.split(/\s+/).filter(Boolean).length) {
         sourceText = latestFinal;
       }
@@ -6292,8 +6351,8 @@ export default function MeetingSession() {
       if (!baseQuestion || mode !== "enter") return null;
       const nowTs = Date.now();
       const baseNorm = normalizeForDedup(baseQuestion);
-      const followups = interviewerQuestionMemoryRef.current
-        .filter((q) => !q.answered && (nowTs - q.ts) <= HYBRID_FOLLOWUP_WINDOW_MS)
+      const followups = transcriptQuestionRowsRef.current
+        .filter((q) => !q.used && !q.inFlight && (nowTs - q.ts) <= HYBRID_FOLLOWUP_WINDOW_MS)
         .map((q) => q.text)
         .filter((q) => normalizeForDedup(q) !== baseNorm)
         .filter((q) => !isLikelyNoiseSegment(q))
@@ -6332,16 +6391,13 @@ export default function MeetingSession() {
       }
     }
 
-    // Enter key = explicit user intent: skip similarity-based duplicate checks.
-    // Auto-trigger modes still use dedup to prevent rapid re-firing.
-    if (mode !== "enter" && sourceFingerprint && isNearDuplicateAskedQuestion(sourceText)) {
+    if (sourceFingerprint && isNearDuplicateAskedQuestion(sourceText)) {
       return null;
     }
 
-    const sameRecentTrigger = mode !== "enter"
-      && sourceFingerprint
+    const sameRecentTrigger = sourceFingerprint
       && lastTriggeredNormalizedTextRef.current
-      && levenshteinSimilarity(sourceFingerprint, lastTriggeredNormalizedTextRef.current) >= SIM_DEDUP_BLOCK
+      && levenshteinSimilarity(sourceFingerprint, lastTriggeredNormalizedTextRef.current) >= 0.85
       && (now - lastTriggerTimestampRef.current) <= 12000;
     if (sameRecentTrigger) {
       return null;
@@ -6405,7 +6461,7 @@ export default function MeetingSession() {
     if (!questionToAnswer) return null;
     const normalized = normalizeForDedup(questionToAnswer);
     const duplicateByTime = normalized === lastAnsweredQuestionHashRef.current && (now - lastAnsweredQuestionTsRef.current) <= 12000;
-    const duplicateByOverlap = lastAnsweredQuestionHashRef.current && wordOverlap(normalized, lastAnsweredQuestionHashRef.current) > SIM_SPECULATIVE_REUSE && (now - lastAnsweredQuestionTsRef.current) <= 12000;
+    const duplicateByOverlap = lastAnsweredQuestionHashRef.current && wordOverlap(normalized, lastAnsweredQuestionHashRef.current) > 0.82 && (now - lastAnsweredQuestionTsRef.current) <= 12000;
     if (duplicateByTime || duplicateByOverlap) return null;
 
     const canAutoAnswer = (mode === "enter") || (!ENTER_ONLY_ANSWER_MODE && autoAnswerEnabled);
@@ -6448,15 +6504,15 @@ export default function MeetingSession() {
     const LONG_CONTINUATION_MS = 30_000;
     const PARTIAL_CANDIDATE_TTL_MS = 6_000;
     const REOPEN_CUE_RE = /\b(coming back to|as asked earlier|again about|revisit)\b/i;
-    const QUESTION_START_RE = /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are|tell|walk|explain|give|describe|share|suppose|assume)\b/i;
+    const QUESTION_START_RE = /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are|tell|walk|explain)\b/i;
     // resolveEnterSeed is always called from the Enter key path.
     // Keep hybrid follow-up bundling conservative to avoid packaging noisy transcript into one prompt.
     const maybeWrapHybridFollowups = (baseQuestion: string): { seedText: string; displayQuestion: string; source: "transcript"; multiQuestionMode?: boolean } | null => {
       if (!baseQuestion) return null;
       const nowTs = Date.now();
       const baseNorm = normalizeForDedup(baseQuestion);
-      const followups = interviewerQuestionMemoryRef.current
-        .filter((q) => !q.answered && (nowTs - q.ts) <= HYBRID_FOLLOWUP_WINDOW_MS)
+      const followups = transcriptQuestionRowsRef.current
+        .filter((q) => !q.used && !q.inFlight && (nowTs - q.ts) <= HYBRID_FOLLOWUP_WINDOW_MS)
         .map((q) => q.text)
         .filter((q) => normalizeForDedup(q) !== baseNorm)
         .filter((q) => !isLikelyNoiseSegment(q))
@@ -6492,90 +6548,74 @@ export default function MeetingSession() {
     // Previous segment ends with a word that cannot close a sentence ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ the next segment MUST continue it.
     const INCOMPLETE_ENDING_RE = /\b(about|with|in|on|for|of|from|to|at|through|by|into|over|under|between|among|the|a|an|your|my|their|his|her|our|some|any|this|that|these|those|and|or|but|is|are|have|has|do|does|can|could|would|will|shall|may|might|what|how|when|where|who|which|why|whether|if|as|than|also|both|either|neither|each|every|such|same)\s*[.,]?\s*$/i;
     const splitExplicitQuestions = (raw: string): string[] => {
-      const line = String(raw || "").trim();
+      const line = stripInterviewerLeadIn(stripTranscriptRolePrefix(String(raw || "").trim()));
       if (!line) return [];
-      const chunks = line.includes("?")
-        ? line.split("?").map((p) => p.trim()).filter(Boolean).map((p) => `${p}?`)
-        : line
-          .split(/(?=\b(?:what|why|how|when|where|who|which|do you|does|did|can you|could you|would you|have you|has|is|are|tell me|walk me|explain|give me|describe|share|suppose|assume)\b)/gi)
-          .map((p) => p.trim())
-          .filter(Boolean);
-      return chunks
-        .map((chunk) => extractSharedQuestionCandidate(chunk) || chunk)
-        .filter((chunk) => {
-        const normalized = normalizeText(chunk);
+      if (isPureTranscriptMetaLine(line)) return [];
+      const chunks = line
+        .split("?")
+        .map((p) => p.trim())
+        .filter(Boolean)
+        .flatMap((part) => part
+          .split(/\s+(?=(?:and\s+(?:also\s+)?)?(?:what(?:'s| is)?|why|how(?: do you)?|when|where|who|which|do you|does|did|can you|could you|would you|have you|has|is|are|tell me|walk me|explain|describe|share|give me|name a few)\b)/gi)
+          .map((p) => p.replace(/^and\s+/i, "").trim())
+          .filter(Boolean)
+        )
+        .map((p) => `${p.replace(/[?]+$/g, "").trim()}?`);
+      return chunks.filter((chunk) => {
+        const normalized = chunk.toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
         const words = normalized.split(/\s+/).filter(Boolean);
-        if (words.length < 2 || words.length > 22) return false;
-        if (!extractSharedQuestionCandidate(chunk) && !QUESTION_START_RE.test(normalized) && !chunk.includes("?")) return false;
+        if (words.length < 2 || words.length > 34) return false;
+        if (!QUESTION_START_RE.test(normalized) && !/^(what s|what is|how do you|can you|could you|would you|name a few)\b/i.test(normalized) && !chunk.includes("?")) return false;
         return true;
       });
+    };
+    const buildExplicitQuestionSeed = (
+      questions: string[],
+    ): { seedText: string; displayQuestion: string; source: "transcript"; multiQuestionMode?: boolean } | null => {
+      const deduped = questions
+        .map((q) => rewriteMixedTopicQuestion(cleanDetectedInterviewQuestion(String(q || "").trim())))
+        .filter(Boolean)
+        .filter((q, idx, arr) => arr.findIndex((x) => normalizeForDedup(x) === normalizeForDedup(q)) === idx);
+      if (!deduped.length) return null;
+      if (deduped.length === 1) {
+        return { seedText: deduped[0], displayQuestion: deduped[0], source: "transcript" };
+      }
+      const seed = [
+        "Interviewer asked multiple direct questions in the same utterance.",
+        "Answer all of them in order using one response.",
+        "Questions:",
+        ...deduped,
+      ].join("\n");
+      return {
+        seedText: seed,
+        displayQuestion: deduped.join("\n"),
+        source: "transcript",
+        multiQuestionMode: true,
+      };
     };
     const isExplicitQuestion = (value: string): boolean => {
       const s = String(value || "").trim();
       if (!s) return false;
-      const sharedCandidate = extractSharedQuestionCandidate(s);
-      if (sharedCandidate) return true;
-      const q = normalizeText(s);
-      return detectQuestion(s) || s.includes("?") || QUESTION_START_RE.test(q);
+      const q = s.toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
+      return s.includes("?") || QUESTION_START_RE.test(q);
     };
 
-    // Collect ALL unanswered interviewer questions since the last AI answer.
-    // Uses interviewerQuestionMemoryRef (not displaySegmentsRef) so candidate speech
-    // segments between questions don't break the chain.
-    // Grace period: subtract 8s from answer-done time so questions asked WHILE the
-    // previous answer was still streaming are not excluded. Also cap at 90s lookback
-    // so a brand-new session doesn't sweep in questions from 10+ minutes ago.
-    const rawSinceTs = lastAnswerDoneTimestampRef.current || 0;
-    const sinceTs = rawSinceTs > 0
-      ? Math.max(rawSinceTs - 8_000, Date.now() - 90_000)
-      : Date.now() - 90_000;
-    const unansweredQuestions = interviewerQuestionMemoryRef.current
-      .filter((q) => !q.answered && q.ts >= sinceTs)
-      .map((q) => q.text.trim())
-      .filter(Boolean);
-    // De-duplicate by normalised text while preserving chronological order (oldest first)
-    const unansweredNormSeen = new Set<string>();
-    const unansweredOrdered: string[] = [];
-    for (const q of unansweredQuestions.slice().reverse()) {
-      const norm = normalizeForDedup(q);
-      if (!norm || unansweredNormSeen.has(norm)) continue;
-      unansweredNormSeen.add(norm);
-      unansweredOrdered.push(q);
-    }
-    // Also include the latest display question if it's not yet in memory
-    // (it may have just arrived and not been committed to memory yet).
-    const CANDIDATE_SEG_RE = /^Candidate:\s+/i;
-    const latestDisplayQ = displaySegmentsRef.current.find((seg) => {
-      const s = String(seg || "").trim();
-      return s && !CANDIDATE_SEG_RE.test(s) && (isStrongInterviewerQuestion(s) || isExplicitQuestion(s));
-    });
-    if (latestDisplayQ) {
-      const latestNorm = normalizeForDedup(latestDisplayQ);
-      if (latestNorm && !unansweredNormSeen.has(latestNorm)) {
-        unansweredOrdered.push(latestDisplayQ.trim());
-      }
-    }
-    if (unansweredOrdered.length === 1) {
+    const latestVisibleQuestion =
+      displaySegmentsRef.current.find((seg) => isStrongInterviewerQuestion(seg || "") || isExplicitQuestion(seg || "")) || "";
+    if (latestVisibleQuestion) {
       const sanitizedVisible = rewriteMixedTopicQuestion(
-        cleanDetectedInterviewQuestion(dedupeExperienceTopics(sanitizeQuestionCandidate(unansweredOrdered[0]))),
+        cleanDetectedInterviewQuestion(dedupeExperienceTopics(sanitizeQuestionCandidate(latestVisibleQuestion))),
       );
+      const visibleSeed = buildExplicitQuestionSeed(splitExplicitQuestions(sanitizedVisible || latestVisibleQuestion));
+      if (visibleSeed) return visibleSeed;
       return {
-        seedText: sanitizedVisible || unansweredOrdered[0],
-        displayQuestion: sanitizedVisible || unansweredOrdered[0],
+        seedText: sanitizedVisible || latestVisibleQuestion,
+        displayQuestion: sanitizedVisible || latestVisibleQuestion,
         source: "transcript",
       };
     }
-    if (unansweredOrdered.length > 1) {
-      // Join with "? " separator so server's extractInterviewerQuestions (which splits on "?")
-      // correctly identifies each question as a separate item in multi-question mode.
-      const seedText = unansweredOrdered.map(q => q.replace(/\?\s*$/, "").trim()).join("? ") + "?";
-      const displayQuestion = unansweredOrdered.join(" / ");
-      return { seedText, displayQuestion, source: "transcript" };
-    }
 
-    // Limit fallback scan to the most recent 15 segments to avoid picking up questions
-    // from 10+ minutes ago. segmentsRef is newest-first so slice(0,15) = last ~2 minutes.
-    const transcriptQuestions = segmentsRef.current.slice(0, 15).filter((seg) => isStrongInterviewerQuestion(seg || ""));
+    const transcriptQuestions = segmentsRef.current.filter((seg) => isStrongInterviewerQuestion(seg || ""));
     const latestTranscriptQuestion = transcriptQuestions[0] || "";
     const now = Date.now();
 
@@ -6622,13 +6662,9 @@ export default function MeetingSession() {
     // it is a question EXTENSION to be combined with the prior transcript question, NOT a follow-up
     // on the previous AI answer. Skip follow-up detection entirely for these phrases.
     const liveStartsJoiner = /^(and\b|and also\b|also\b|plus\b|or\b)/i.test(currentLiveText.trim());
-    const hasRecentAnswerContext = lastAssistantAnswerRef.current.trim().length > 0 || responsesLocalRef.current.length > 0;
     if (currentLiveText && lastAssistantAnswerRef.current.trim() && !liveStartsJoiner) {
       const fuResult = isFollowUp(currentLiveText);
-      // Guard: single follow-up words like "more", "next", "proceed" should only trigger
-      // if there is a recent answered question to provide context.
-      const isSingleWordNoContext = fuResult.reason === "very_short_followup_cue" && !hasRecentAnswerContext;
-      if (fuResult.isFollowUp && !isSingleWordNoContext) {
+      if (fuResult.isFollowUp) {
         return {
           seedText: currentLiveText,
           displayQuestion: currentLiveText,
@@ -6754,18 +6790,10 @@ export default function MeetingSession() {
         }
       }
 
-      const latestRawExplicit = splitExplicitQuestions(latestSanitized || latestRawLine)
-        .map((q) => rewriteMixedTopicQuestion(cleanDetectedInterviewQuestion(q)))
-        .filter(Boolean);
-      if (latestRawExplicit.length === 1) {
-        return { seedText: latestRawExplicit[0], displayQuestion: latestRawExplicit[0], source: "transcript" };
-      }
-      if (latestRawExplicit.length > 1) {
-        // Send all questions joined with "? " separator so server's extractInterviewerQuestions
-        // (which splits on "?") correctly identifies each as a separate question.
-        const seedText = latestRawExplicit.map(q => q.replace(/\?\s*$/, "").trim()).join("? ") + "?";
-        const displayQuestion = latestRawExplicit.join(" / ");
-        return { seedText, displayQuestion, source: "transcript" };
+      const latestRawExplicit = splitExplicitQuestions(latestSanitized || latestRawLine);
+      const latestRawExplicitSeed = buildExplicitQuestionSeed(latestRawExplicit);
+      if (latestRawExplicitSeed) {
+        return latestRawExplicitSeed;
       }
 
       if (!latestLooksExplicit) {
@@ -6891,13 +6919,9 @@ export default function MeetingSession() {
     // 2) if no explicit question in latest turn window, fall back to follow-up context
     // 3) only then use broader ranking/older fallback logic
     const latestLineExplicitQuestions = splitExplicitQuestions(latestUtterance);
-    if (latestLineExplicitQuestions.length === 1) {
-      return { seedText: latestLineExplicitQuestions[0], displayQuestion: latestLineExplicitQuestions[0], source: "transcript" };
-    }
-    if (latestLineExplicitQuestions.length > 1) {
-      const seedText = latestLineExplicitQuestions.map(q => q.replace(/\?\s*$/, "").trim()).join("? ") + "?";
-      const displayQuestion = latestLineExplicitQuestions.join(" / ");
-      return { seedText, displayQuestion, source: "transcript" };
+    const latestLineExplicitSeed = buildExplicitQuestionSeed(latestLineExplicitQuestions);
+    if (latestLineExplicitSeed) {
+      return latestLineExplicitSeed;
     }
     // If latest line is a short topic fragment (single word or short tail),
     // attach it to the previous explicit question chain.
@@ -7001,8 +7025,9 @@ export default function MeetingSession() {
       const out: Array<{ q: string; score: number }> = [];
 
       for (let idx = 0; idx < window.length; idx += 1) {
-        const raw = String(window[idx] || "").trim();
+        const raw = stripInterviewerLeadIn(stripTranscriptRolePrefix(String(window[idx] || "").trim()));
         if (!raw) continue;
+        if (isPureTranscriptMetaLine(raw)) continue;
 
         // Remove common filler/noise scaffolding but preserve semantic content.
         const cleanedLine = raw
@@ -7018,19 +7043,23 @@ export default function MeetingSession() {
         for (const chunk of chunks) {
           const normalized = chunk.toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
           const words = normalized.split(/\s+/).filter(Boolean);
-          if (words.length < 3 || words.length > 24) continue;
+          if (words.length < 3 || words.length > 34) continue;
 
-          const startsQuestion = /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are|tell|walk|explain)\b/i.test(normalized);
+          const startsQuestion = /^(what(?:\s+s| is)?|why|how(?: do you)?|when|where|who|which|do|does|did|can|could|would|have|has|is|are|tell|walk|explain|describe|share|give|name)\b/i.test(normalized);
           const hasQuestionCue = chunk.includes("?") || startsQuestion;
           if (!hasQuestionCue) continue;
 
           // Skip obvious candidate monologue lines unless they are explicit questions.
-          const firstPersonHeavy = /\b(i|my|we|our)\b/i.test(normalized) && !startsQuestion;
+          const firstPersonHeavy =
+            /\b(i|my|we|our)\b/i.test(normalized)
+            && !startsQuestion
+            && /\b(have|worked|built|developed|implemented|focus|focused|primarily|utili[sz]e|use|manage)\b/i.test(normalized);
           if (firstPersonHeavy) continue;
 
           const adv = detectQuestionAdvanced(chunk);
           const recency = Math.max(0, 1 - idx * 0.12);
-          const score = (0.6 * recency) + (0.4 * (adv.isQuestion ? adv.confidence : 0.45));
+          const hasInterviewCue = extractMeaningfulInterviewTopics(chunk).length > 0;
+          const score = (0.55 * recency) + (0.35 * (adv.isQuestion ? adv.confidence : 0.45)) + (hasInterviewCue ? 0.3 : 0);
           const withQ = chunk.trim().endsWith("?") ? chunk.trim() : `${chunk.trim()}?`;
           out.push({ q: withQ, score });
         }
@@ -7053,6 +7082,57 @@ export default function MeetingSession() {
       const hybrid = maybeWrapHybridFollowups(best);
       if (hybrid) return { seedText: hybrid.seedText, displayQuestion: hybrid.displayQuestion, source: hybrid.source, multiQuestionMode: hybrid.multiQuestionMode };
       return { seedText: best, displayQuestion: best, source: "transcript" };
+    }
+
+    const salvageNoisyInterviewerSeed = (): {
+      seedText: string;
+      displayQuestion: string;
+      source: "transcript";
+      multiQuestionMode?: boolean;
+    } | null => {
+      const window = recentSegments.slice(0, 12);
+      const candidates: Array<{ text: string; score: number }> = [];
+
+      for (let idx = 0; idx < window.length; idx += 1) {
+        const cleaned = stripInterviewerLeadIn(stripTranscriptRolePrefix(String(window[idx] || "").trim()));
+        if (!cleaned || isPureTranscriptMetaLine(cleaned) || isLikelyNoiseSegment(cleaned)) continue;
+
+        const normalized = cleaned.toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
+        const words = normalized.split(/\s+/).filter(Boolean);
+        if (words.length < 5 || words.length > 40) continue;
+
+        const candidateLike =
+          /^(i |we |my |our )/i.test(normalized)
+          || (/\b(i|my|we|our)\b/i.test(normalized)
+            && /\b(have|worked|built|developed|implemented|focus|focused|primarily|utili[sz]e|use|manage)\b/i.test(normalized));
+        if (candidateLike) continue;
+
+        const startsStrong = /^(what(?:\s+s| is)?|why|how(?: do you)?|when|where|who|which|do|does|did|can|could|would|have|has|is|are|tell|walk|explain|describe|share|give|name)\b/i.test(normalized);
+        const hasInterviewCue = extractMeaningfulInterviewTopics(cleaned).length > 0;
+        if (!startsStrong && !hasInterviewCue && !cleaned.includes("?")) continue;
+
+        const adv = detectQuestionAdvanced(cleaned);
+        const recency = Math.max(0, 1 - idx * 0.1);
+        const score = (startsStrong ? 0.9 : 0) + (cleaned.includes("?") ? 0.5 : 0) + (hasInterviewCue ? 0.45 : 0) + (adv.confidence * 0.5) + recency;
+        candidates.push({ text: cleaned, score });
+      }
+
+      candidates.sort((a, b) => b.score - a.score);
+      const top = candidates
+        .map((c) => rewriteMixedTopicQuestion(cleanDetectedInterviewQuestion(dedupeExperienceTopics(sanitizeQuestionCandidate(c.text)))))
+        .filter(Boolean)
+        .filter((q, idx, arr) => arr.findIndex((x) => normalizeForDedup(x) === normalizeForDedup(q)) === idx)
+        .slice(0, 2);
+
+      if (!top.length) return null;
+      const explicit = buildExplicitQuestionSeed(top);
+      if (explicit) return explicit;
+      return { seedText: top[0], displayQuestion: top[0], source: "transcript" };
+    };
+
+    const salvageSeed = salvageNoisyInterviewerSeed();
+    if (salvageSeed) {
+      return salvageSeed;
     }
 
     // Interim text fallback: if the question is still being transcribed (not yet committed to
@@ -7204,11 +7284,10 @@ export default function MeetingSession() {
     const transcriptCandidate = latestTranscriptQuestion || latestHeuristicQuestion;
     const interpreted = interpretedQuestionRef.current?.trim() || "";
     const latestReopenCue = recentSegments.find((seg) => REOPEN_CUE_RE.test(String(seg || ""))) || "";
-    const freshUnansweredPool = interviewerQuestionMemoryRef.current
-      .filter((q) => (now - q.ts) <= UNANSWERED_TTL_MS);
+    const freshUnansweredPool = transcriptQuestionRowsRef.current
+      .filter((q) => !q.used && !q.inFlight && (now - q.ts) <= UNANSWERED_TTL_MS);
     const unanswered = [...freshUnansweredPool]
-      .sort((a, b) => b.ts - a.ts)
-      .find((q) => !q.answered)?.text || "";
+      .sort((a, b) => b.ts - a.ts)[0]?.text || "";
     const recentReply = spokenReplyMemoryRef.current[0]?.text || "";
     const isLikelySameQuestionExpansion = (prevQuestion: string, newUtterance: string): boolean => {
       const prev = normalizeForDedup(prevQuestion || "");
@@ -7236,7 +7315,6 @@ export default function MeetingSession() {
       const hasExperienceStub = windowSegs.some((s) =>
         /\b(do you have experience in|do i have experience in|have experience in|experience in)\b/i.test(s),
       );
-      if (!hasExperienceStub) return "";
       const topics: string[] = [];
       for (const raw of windowSegs) {
         if (!raw) continue;
@@ -7260,7 +7338,7 @@ export default function MeetingSession() {
       if (topics.length >= 2) {
         return `Do you have experience with ${topics.slice(0, 3).join(" and ")}?`;
       }
-      if (topics.length === 1) {
+      if (topics.length === 1 && hasExperienceStub) {
         return `Do you have experience with ${topics[0]}?`;
       }
       return "";
@@ -7315,17 +7393,14 @@ export default function MeetingSession() {
         for (const raw of recentSegments.slice(0, 8)) {
           const line = String(raw || "").trim();
           if (!line || isLikelyNoiseSegment(line)) continue;
-          const sharedCandidate = extractSharedQuestionCandidate(line);
-          if (sharedCandidate) return sharedCandidate.endsWith("?") ? sharedCandidate : `${sharedCandidate}?`;
           const chunks = line.includes("?")
             ? line.split("?").map((p) => p.trim()).filter(Boolean).map((p) => `${p}?`)
             : line.split(starterSplit).map((p) => p.trim()).filter(Boolean);
           for (const chunk of chunks.reverse()) {
-            const normalized = normalizeText(chunk);
+            const normalized = chunk.toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
             const words = normalized.split(/\s+/).filter(Boolean);
             const explicit =
-              Boolean(extractSharedQuestionCandidate(chunk))
-              || chunk.includes("?")
+              chunk.includes("?")
               || /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are|tell|walk|explain)\b/i.test(normalized);
             if (!explicit) continue;
             if (words.length < 2 || words.length > 22) continue;
@@ -7440,6 +7515,27 @@ export default function MeetingSession() {
       const inferredFromShort = inferQuestionFromShortFragments();
       if (inferredFromShort) return inferredFromShort;
 
+      const inferredSemantic = inferSemanticQuestionFromConversation();
+      if (inferredSemantic) return inferredSemantic;
+
+      const joined = window
+        .filter((s) => !isLikelyNoiseSegment(s))
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (!joined) return "";
+
+      const topicPatterns: Array<{ re: RegExp; label: string }> = [
+        { re: /\breact\b/i, label: "React" },
+        { re: /\bflask\b/i, label: "Flask" },
+        { re: /\bfastapi|fast api|fast apis\b/i, label: "FastAPI" },
+        { re: /\bdjango\b/i, label: "Django" },
+        { re: /\bpython\b/i, label: "Python" },
+        { re: /\bdatabase|databases|sql|postgres|mysql|mongodb|oracle\b/i, label: "databases" },
+        { re: /\bkubernetes|docker|aws|azure|terraform|ansible\b/i, label: "cloud and DevOps" },
+      ];
+      const topic = topicPatterns.find((t) => t.re.test(joined))?.label || "";
+      if (topic) return `Can you share your hands-on experience with ${topic}?`;
       return "";
     };
 
@@ -7840,64 +7936,6 @@ export default function MeetingSession() {
     const interimSnapshot = interimTextRef.current.trim();
     const latestSegmentSnapshot = segmentsRef.current[0]?.trim() || "";
     flushPendingTranscriptLine();
-    const now = Date.now();
-    const transcriptWindow = segmentsRef.current
-      .slice()
-      .reverse()
-      .join("\n")
-      .trim();
-    const backendWindowHint =
-      pendingSnapshot
-      || draftSnapshot
-      || latestSegmentSnapshot
-      || interimSnapshot
-      || "";
-
-    if (wsAnswerRef.current?.readyState === WebSocket.OPEN && id) {
-      triggerMetricRef.current = { t_trigger_decision: now };
-      triggerMetricRef.current.t_request_sent = now;
-      if (isStreaming || isAwaitingFirstChunk) {
-        try {
-          wsAnswerRef.current.send(JSON.stringify({ type: "cancel", sessionId: id }));
-        } catch {}
-      }
-      setLastSubmitSource("enter_window");
-      lastEnterSeedRef.current = { text: backendWindowHint, ts: now };
-      lastEnterSegmentCountRef.current = segmentsRef.current.length;
-      setInterpretedQuestion(INTERPRETED_PLACEHOLDER);
-      setStreamingQuestion("Generating...");
-      showOptimisticAssistantState("Generating...");
-      startFirstChunkWatchdog("enter_window");
-      pendingQuestionForRequestRef.current = backendWindowHint;
-        wsAnswerRef.current.send(JSON.stringify({
-          type: "question",
-          sessionId: id,
-          text: backendWindowHint,
-          force: false,
-          format: responseFormat === "custom" ? "custom" : responseFormat,
-        model: selectedModel,
-        quickMode: quickResponseMode,
-        docsMode,
-        metadata: {
-          mode: "enter",
-          audioMode,
-          submitSource: "enter_window",
-          customFormatPrompt: responseFormat === "custom" ? customPrompt : undefined,
-          docsMode,
-          systemPrompt: customPrompt || undefined,
-          jobDescription: conversationHistory || undefined,
-          liveTranscript: transcriptWindow || undefined,
-        },
-      }));
-      return;
-    }
-
-    clearFirstChunkWatchdog();
-    setIsStreaming(false);
-    setIsAwaitingFirstChunk(false);
-    toast({ title: "WebSocket not connected", description: "Reconnect and try again.", variant: "destructive" });
-    return;
-
     let rawManualText = sourceLabel === "enter_key"
       ? (
         pendingSnapshot
@@ -7945,12 +7983,97 @@ export default function MeetingSession() {
         || manualWordCount <= 12
       );
     let seed = shouldUseImmediateManualText
-      ? {
-        seedText: manualExplicitQuestion || immediateManualText,
-        displayQuestion: manualExplicitQuestion || immediateManualText,
-        source: "transcript" as SubmitSeedSource,
-      }
-      : resolveEnterSeed();
+      ? (() => {
+        // Always collect ALL unanswered segments from memory and combine with the
+        // immediate text so pressing Enter answers EVERYTHING pending, not just the
+        // latest segment. The immediate text may not be in memory yet (handleFinalTurn
+        // fires async), so we append it to the batch manually if not already included.
+        const fullQ = buildFullTranscriptQuestion();
+        const immNorm = normalizeForDedup(immediateManualText);
+        if (fullQ && fullQ.combined.trim()) {
+          // Check if immediate text is already represented in the batch —
+          // exact match OR prefix/extension match (handles STT-extended segments).
+          const immWords = immNorm.split(" ").filter(Boolean);
+          const alreadyInBatch = fullQ.batchNorms.some(n => {
+            if (n === immNorm) return true;
+            const nWords = n.split(" ").filter(Boolean);
+            const shorter = immWords.length < nWords.length ? immWords : nWords;
+            const longer = immWords.length < nWords.length ? nWords : immWords;
+            // Consider "represented" if shorter is a prefix of longer (>=4 shared words)
+            return shorter.length >= 4 && longer.slice(0, shorter.length).join(" ") === shorter.join(" ");
+          });
+          const combinedText = alreadyInBatch
+            ? fullQ.combined
+            : [fullQ.combined, immediateManualText].filter(Boolean).join("\n");
+          const combinedNorms = alreadyInBatch
+            ? fullQ.batchNorms
+            : [...fullQ.batchNorms, immNorm].filter(Boolean);
+          const immediateRow = alreadyInBatch
+            ? null
+            : upsertTranscriptQuestionRow(manualExplicitQuestion || immediateManualText, {
+              isExplicitQuestion: !!manualExplicitQuestion || immediateManualLooksLikeQuestion,
+              allowShortTopicAppend: !manualExplicitQuestion,
+            });
+          const combinedRowIds = alreadyInBatch
+            ? fullQ.batchRowIds
+            : [...fullQ.batchRowIds, immediateRow?.id].filter(Boolean) as string[];
+          lastSubmittedBatchNormsRef.current = combinedNorms;
+          lastSubmittedBatchRowIdsRef.current = combinedRowIds;
+          return {
+            seedText: combinedText,
+            displayQuestion: combinedText,
+            source: "transcript" as SubmitSeedSource,
+            multiQuestionMode: combinedNorms.length > 1,
+          };
+        }
+        // No prior unanswered segments — just send the immediate text alone.
+        const immediateRow = upsertTranscriptQuestionRow(manualExplicitQuestion || immediateManualText, {
+          isExplicitQuestion: !!manualExplicitQuestion || immediateManualLooksLikeQuestion,
+          allowShortTopicAppend: !manualExplicitQuestion,
+        });
+        lastSubmittedBatchNormsRef.current = immNorm ? [immNorm] : [];
+        lastSubmittedBatchRowIdsRef.current = immediateRow?.id ? [immediateRow.id] : [];
+        return {
+          seedText: manualExplicitQuestion || immediateManualText,
+          displayQuestion: manualExplicitQuestion || immediateManualText,
+          source: "transcript" as SubmitSeedSource,
+        };
+      })()
+      : (() => {
+        // Try to build full question from ALL unanswered segments newer than last answer.
+        // This fixes "only last fragment sent" when Azure STT splits a long question.
+        const fullQ = buildFullTranscriptQuestion();
+        if (fullQ && fullQ.combined.trim()) {
+          lastSubmittedBatchNormsRef.current = fullQ.batchNorms;
+          lastSubmittedBatchRowIdsRef.current = fullQ.batchRowIds;
+          return {
+            seedText: fullQ.combined,
+            displayQuestion: fullQ.combined,
+            source: "transcript" as SubmitSeedSource,
+            multiQuestionMode: fullQ.isMulti,
+          };
+        }
+        lastSubmittedBatchNormsRef.current = [];
+        lastSubmittedBatchRowIdsRef.current = [];
+        // buildFullTranscriptQuestion returned null — no new unanswered segments found.
+        // Before falling back to resolveEnterSeed's 15-branch chain, try the latest
+        // fresh segment directly if it arrived recently and isn't candidate speech.
+        const latestSeg = segmentsRef.current[0]?.trim() || "";
+        const latestSegAge = Date.now() - (lastSegmentCommittedAtRef.current || 0);
+        const isFreshSeg = latestSegAge < 60_000 && !!latestSeg;
+        const isLatestCandidate = /^(I |I'm |I've |I have |I am |We |My |Our )/i.test(latestSeg);
+        if (isFreshSeg && !isLatestCandidate && !isLikelyNoiseSegment(latestSeg)) {
+          const latestRow = upsertTranscriptQuestionRow(latestSeg, { isExplicitQuestion: true });
+          lastSubmittedBatchRowIdsRef.current = latestRow?.id ? [latestRow.id] : [];
+          return {
+            seedText: latestSeg,
+            displayQuestion: latestSeg,
+            source: "transcript" as SubmitSeedSource,
+          };
+        }
+        lastSubmittedBatchRowIdsRef.current = [];
+        return resolveEnterSeed();
+      })();
 
     // If the live partial starts with a continuation joiner ("and fastapi", "also AWS", etc.)
     // but isn't the primary seed, combine it with the resolved seed so we answer the full
@@ -8000,7 +8123,7 @@ export default function MeetingSession() {
       seedText: safeSeedText,
       displayQuestion: safeDisplayQuestion,
     };
-    const legacyNow = Date.now();
+    const now = Date.now();
     const seedFingerprint = normalizeQuestionForSimilarity(safeSeed.displayQuestion || safeSeed.seedText || "");
     const allowsSameTurnFollowup =
       safeSeed.source === "memory-followup"
@@ -8008,40 +8131,32 @@ export default function MeetingSession() {
 
     if (
       sourceLabel !== "enter_key"
-      &&
+      && 
       seedFingerprint
       && !safeSeed.multiQuestionMode
       && !allowsSameTurnFollowup
-      && isRecentDuplicateIntent(seedFingerprint, "enter", legacyNow)
+      && isRecentDuplicateIntent(seedFingerprint, "enter", now)
     ) {
       // Silent duplicate suppression: keep current UI/stream state unchanged.
       return;
     }
 
-    // If Enter was pressed but no question could be resolved, preserve the existing
-    // answer display instead of blanking it or sending an empty question to the server.
-    if (!safeSeed.seedText.trim() && sourceLabel === "enter_key") {
-      console.log("[submit] Enter with no question found — preserving current answer");
-      return;
-    }
-
     setLastSubmitSource(safeSeed.source);
-    lastEnterSeedRef.current = { text: safeSeed.displayQuestion || safeSeed.seedText || "", ts: legacyNow };
+    lastEnterSeedRef.current = { text: safeSeed.displayQuestion || safeSeed.seedText || "", ts: now };
     lastEnterSegmentCountRef.current = segmentsRef.current.length;
     // Record the question being answered in conversation history so follow-ups have context
     const questionForHistory = (safeSeed.displayQuestion || safeSeed.seedText || "").trim();
     if (questionForHistory && questionForHistory !== "[Continue with latest interviewer context]") {
-      appendConversationContextLine("Interviewer", questionForHistory.slice(0, 400));
+      appendConversationContextLine("Interviewer", questionForHistory.slice(0, 800));
     }
     setInterpretedQuestion(safeSeed.displayQuestion || INTERPRETED_PLACEHOLDER);
     setStreamingQuestion(safeSeed.displayQuestion || "Answering...");
     showOptimisticAssistantState(safeSeed.displayQuestion || "Answering...");
 
-    const activeWs = wsAnswerRef.current;
-    if (activeWs?.readyState === WebSocket.OPEN && id) {
-      const ws = activeWs as WebSocket;
-      triggerMetricRef.current = { t_trigger_decision: legacyNow };
-      triggerMetricRef.current.t_request_sent = legacyNow;
+    const ws = wsAnswerRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN && id) {
+      triggerMetricRef.current = { t_trigger_decision: now };
+      triggerMetricRef.current.t_request_sent = now;
       if (isStreaming || isAwaitingFirstChunk) {
         try {
           ws.send(JSON.stringify({ type: "cancel", sessionId: id }));
@@ -8049,12 +8164,13 @@ export default function MeetingSession() {
       }
       startFirstChunkWatchdog(safeSeed.source);
       pendingQuestionForRequestRef.current = safeSeed.displayQuestion || safeSeed.seedText || "";
+      setTranscriptQuestionRowsInFlight(lastSubmittedBatchRowIdsRef.current, true);
       console.log(`[submit] chosen seed source=${safeSeed.source}`, { transport: "ws", preview: safeSeed.seedText.slice(0, 160) });
       ws.send(JSON.stringify({
         type: "question",
         sessionId: id,
         text: safeSeed.seedText,
-        force: false,
+        force: true,
         format: resolveFormat(safeSeed.seedText),
         model: selectedModel,
         quickMode: quickResponseMode,
@@ -8069,13 +8185,15 @@ export default function MeetingSession() {
           customFormatPrompt: responseFormat === "custom" ? customPrompt : undefined,
           docsMode,
           systemPrompt: customPrompt || undefined,
-          jobDescription: conversationHistory || undefined,
+          // Only send Q&A history for follow-up questions; fresh questions get none.
+          conversationHistory: buildConvHistory(responsesLocalRef.current, safeSeed.seedText),
           // Send recent transcript (chronological order) so AI has full interview context.
-          liveTranscript: segmentsRef.current.slice().reverse().join("\n") || undefined,
+          liveTranscript: segmentsRef.current.slice(0, 120).reverse().join("\n") || undefined,
+          sessionContext: conversationContextLinesRef.current.join("\n") || undefined,
         },
       }));
       if (seedFingerprint) {
-        lastRequestedIntentRef.current = { fp: seedFingerprint, ts: legacyNow, mode: "enter" };
+        lastRequestedIntentRef.current = { fp: seedFingerprint, ts: now, mode: "enter" };
         rememberAskedFingerprint(seedFingerprint);
       }
       return;
@@ -8088,6 +8206,7 @@ export default function MeetingSession() {
   }, [
     flushPendingTranscriptLine,
     resolveEnterSeed,
+    buildFullTranscriptQuestion,
     sanitizeMergedSeed,
     dedupeExperienceTopics,
     autocorrectNoisyQuestionWithContext,
@@ -8099,18 +8218,18 @@ export default function MeetingSession() {
     docsMode,
     audioMode,
     customPrompt,
-    conversationHistory,
     clearFirstChunkWatchdog,
     showOptimisticAssistantState,
+    setTranscriptQuestionRowsInFlight,
     startFirstChunkWatchdog,
     toast,
     INTERPRETED_PLACEHOLDER,
     isStreaming,
     isAwaitingFirstChunk,
-    recentQuestions,
     isRecentDuplicateIntent,
     rememberAskedFingerprint,
     appendConversationContextLine,
+    upsertTranscriptQuestionRow,
   ]);
 
   // Keep a stable ref so handleFinalTurn can call submitCurrentQuestion
@@ -8167,6 +8286,30 @@ export default function MeetingSession() {
   }, []);
 
   useEffect(() => {
+    if (!ENABLE_PARTIAL_AUTO_TRIGGER) return;
+    if (ENTER_ONLY_ANSWER_MODE) return;
+    if (!isListening || !autoAnswerEnabled) return;
+    const timer = setInterval(() => {
+      const now = Date.now();
+      const draft = questionDraftRef.current.trim();
+      if (!draft) return;
+      const draftWordCount = draft.split(/\s+/).filter(Boolean).length;
+      if (draftWordCount < 1) return;
+      if (isLikelyNoiseSegment(draft)) return;
+
+      const paused = now - lastPartialTsRef.current >= AUTO_PAUSE_MS;
+      const stable = now - stableSinceTsRef.current >= STABLE_MS;
+      if (!paused || !stable) return;
+
+      void triggerQuestionExtraction("pause");
+      stableSinceTsRef.current = now;
+      lastPartialTsRef.current = now;
+    }, 200);
+
+    return () => clearInterval(timer);
+  }, [isListening, autoAnswerEnabled, triggerQuestionExtraction, ENTER_ONLY_ANSWER_MODE, ENABLE_PARTIAL_AUTO_TRIGGER, isLikelyNoiseSegment]);
+
+  useEffect(() => {
     if (!id || !isListening) return;
     const timer = setInterval(() => {
       const now = Date.now();
@@ -8179,7 +8322,7 @@ export default function MeetingSession() {
       // like a sentence tail ("one over the other", "into your application"), prefer the
       // last finalized segment so speculative starts with a complete question.
       const draftEndsIncomplete =
-        /\b(with|on|for|to|of|at|by|from|or|that|a|an|the|is|are|was|have|has)\s*$/i.test(draft)
+        /\b(in|with|on|for|to|of|at|by|from|about|and|or|that|a|an|the|is|are|was|have|has)\s*$/i.test(draft)
         || /\b(one over the other|into your application|in your application|in your project|over the other|each other|one another|than the other)\s*$/i.test(draft);
       const latestFinalForSpec = segmentsRef.current[0]?.trim();
       if (draftEndsIncomplete && latestFinalForSpec && latestFinalForSpec.split(/\s+/).filter(Boolean).length > draft.split(/\s+/).filter(Boolean).length) {
@@ -8198,7 +8341,7 @@ export default function MeetingSession() {
       const normalizedDraft = normalizeQuestionForSimilarity(draft);
       if (!normalizedDraft) return;
       const existing = speculativePrepareRef.current;
-      if (existing && existing.norm === normalizedDraft && (now - existing.ts) <= SPECULATIVE_WINDOW_MS) return;
+      if (existing && existing.norm === normalizedDraft && (now - existing.ts) <= 12000) return;
       void warmSpeculativeAnswerPath(draft);
     }, 250);
     return () => clearInterval(timer);
@@ -8208,9 +8351,6 @@ export default function MeetingSession() {
     if (ENTER_ONLY_ANSWER_MODE) return;
     if (!isListening || !autoAnswerEnabled) return;
     if (!transcriptSegments[0]) return;
-    // If handleFinalTurn already has a debounce pending (multi-question accumulation mode),
-    // skip this effect-based trigger entirely — the debounce will fire with all questions.
-    if (autoTriggerDebounceRef.current) return;
     void triggerQuestionExtraction("final");
   }, [transcriptSegments, isListening, autoAnswerEnabled, triggerQuestionExtraction, ENTER_ONLY_ANSWER_MODE]);
 
@@ -8264,6 +8404,11 @@ export default function MeetingSession() {
     askStreamingQuestion(question);
   }, [askStreamingQuestion]);
 
+  const handleCopilotAsk = () => {
+    console.log("[submit] send icon clicked");
+    submitCurrentQuestion("send_icon");
+  };
+
   // Retry: re-sends the last interpreted question
   const handleRetry = useCallback(() => {
     const q = interpretedQuestionRef.current || streamingQuestionRef.current;
@@ -8287,7 +8432,8 @@ export default function MeetingSession() {
           answerStyle,
           isStreaming,
         });
-        pipWin.addEventListener("pagehide", () => { pipWindowRef.current = null; });
+        const onPipHide = () => { pipWindowRef.current = null; pipWin.removeEventListener("pagehide", onPipHide); };
+        pipWin.addEventListener("pagehide", onPipHide);
         setShowReadingPane(false);
         return;
       } catch {
@@ -8324,10 +8470,7 @@ export default function MeetingSession() {
   const buildScreenAnalysisContext = useCallback(() => {
     const interpreted = interpretedQuestionRef.current.trim();
     const streamQuestion = streamingQuestionRef.current.trim();
-    const latestFramedQuestion = interviewerQuestionMemoryRef.current
-      .map((q) => cleanDetectedInterviewQuestion(String(q.text || "").trim()))
-      .find(Boolean) || "";
-    const latestQuestion = interpreted || streamQuestion || latestFramedQuestion || "";
+    const latestQuestion = interpreted || streamQuestion || recentQuestions[0] || "";
     const latestQuestionLooksCodeRelated =
       isCodeRequestQuestion(latestQuestion)
       || isExplainFollowup(latestQuestion)
@@ -8396,7 +8539,7 @@ export default function MeetingSession() {
         explanationFirstSuffix,
       ].join("\n"),
     };
-  }, [meeting, isCodeRequestQuestion, isExplainFollowup, wantsLineByLineExplanation, isModifyCodeFollowup]);
+  }, [meeting, recentQuestions, isCodeRequestQuestion, isExplainFollowup, wantsLineByLineExplanation, isModifyCodeFollowup]);
 
   const stopVisionScreenShare = useCallback(() => {
     const stream = getLiveVisionStream();
@@ -8521,7 +8664,7 @@ export default function MeetingSession() {
           image,
           question: promptQuestion,
           displayQuestion,
-          liveTranscript: segmentsRef.current.slice().reverse().join("\n") || undefined,
+          liveTranscript: segmentsRef.current.slice(0, 120).reverse().join("\n") || undefined,
         }),
       });
 
@@ -8571,13 +8714,11 @@ export default function MeetingSession() {
                   capturedAt: normalizedResponse.createdAt ? new Date(normalizedResponse.createdAt).getTime() : captureTs,
                 };
                 setResponsesLocal((prev) => {
+                  // Remove placeholder and any duplicate of this response.
                   const without = prev.filter((r) => r.id !== placeholderId && r.id !== normalizedResponse.id);
-                  const next = [{ ...normalizedResponse, _streaming: false }, ...without];
-                  return next.sort((a: any, b: any) => {
-                    const at = a.createdAt ? new Date(a.createdAt).getTime() : 0;
-                    const bt = b.createdAt ? new Date(b.createdAt).getTime() : 0;
-                    return bt - at;
-                  });
+                  // Always put the screen card at position 0 — a sort by createdAt would push it
+                  // below WS answers that arrived while the analysis was running (~7s).
+                  return [{ ...normalizedResponse, _streaming: false }, ...without];
                 });
                 queryClient.invalidateQueries({ queryKey: ["/api/meetings", id, "responses"] });
                 highlightAndScrollResponse(normalizedResponse.id);
@@ -8659,7 +8800,7 @@ export default function MeetingSession() {
           images: queueSnapshot,
           question: promptQuestion,
           displayQuestion: effectiveDisplay,
-          liveTranscript: segmentsRef.current.slice().reverse().join("\n") || undefined,
+          liveTranscript: segmentsRef.current.slice(0, 120).reverse().join("\n") || undefined,
         }),
       });
 
@@ -8701,11 +8842,9 @@ export default function MeetingSession() {
                 };
                 setResponsesLocal((prev) => {
                   const without = prev.filter((r) => r.id !== placeholderId && r.id !== serverResponse.id);
-                  return [{ ...serverResponse, _streaming: false }, ...without].sort((a: any, b: any) => {
-                    const at = a.createdAt ? new Date(a.createdAt).getTime() : 0;
-                    const bt = b.createdAt ? new Date(b.createdAt).getTime() : 0;
-                    return bt - at;
-                  });
+                  // Always pin screen card at top — sort by createdAt would push it below
+                  // any WS answers that arrived while the multi-screen analysis was running.
+                  return [{ ...serverResponse, _streaming: false }, ...without];
                 });
                 queryClient.invalidateQueries({ queryKey: ["/api/meetings", id, "responses"] });
                 highlightAndScrollResponse(serverResponse.id);
@@ -9152,10 +9291,26 @@ export default function MeetingSession() {
               End Session
             </Button>
           </div>
-          <div className="flex-1 flex overflow-hidden min-h-0">
+          <div className="flex-1 flex flex-col overflow-hidden min-h-0">
+            {/* Mobile tab bar — hidden on lg+ */}
+            <div className="lg:hidden flex shrink-0 border-b">
+              <button
+                className={`flex-1 py-2 text-xs font-semibold transition-colors ${mobileTab === "transcript" ? "border-b-2 border-primary text-primary" : "text-muted-foreground"}`}
+                onClick={() => setMobileTab("transcript")}
+              >
+                Live Transcript
+              </button>
+              <button
+                className={`flex-1 py-2 text-xs font-semibold transition-colors ${mobileTab === "ai" ? "border-b-2 border-primary text-primary" : "text-muted-foreground"}`}
+                onClick={() => setMobileTab("ai")}
+              >
+                AI Insights
+              </button>
+            </div>
+            <div className="flex-1 flex overflow-hidden min-h-0">
             <div className="w-full h-full flex flex-col lg:flex-row overflow-hidden">
               <div
-                className="lg:w-[360px] xl:w-[400px] lg:min-w-[280px] lg:max-w-[640px] shrink-0 border-b lg:border-b-0 lg:border-r flex flex-col lg:resize-x lg:overflow-auto"
+                className={`lg:w-[360px] xl:w-[400px] lg:min-w-[280px] lg:max-w-[640px] shrink-0 border-b lg:border-b-0 lg:border-r flex flex-col lg:resize-x lg:overflow-auto ${mobileTab !== "transcript" ? "hidden lg:flex" : "flex"}`}
                 style={{ minHeight: 0 }}
               >
                 <div className="px-3 py-2 border-b shrink-0 flex items-center justify-between">
@@ -9373,7 +9528,7 @@ export default function MeetingSession() {
                   {displayTranscriptSegments.length > 0 || interimText || stagedTranscriptText || pendingTranscriptLine ? (
                     <div className="space-y-1">
                       {(() => {
-                        const activeLiveText = [cleanTranscriptForDisplay(interimText || stagedTranscriptText) || (interimText || stagedTranscriptText)]
+                        const activeLiveText = [interimText || stagedTranscriptText]
                           .filter(Boolean)
                           .join(" ")
                           .replace(/\s+/g, " ")
@@ -9381,34 +9536,21 @@ export default function MeetingSession() {
                         const latestSeg = displayTranscriptSegments[0];
                         const isStaleEcho = !!activeLiveText && !!latestSeg
                           && normalizeForDedup(latestSeg) === normalizeForDedup(activeLiveText);
-                        const isTailEcho = !!activeLiveText && !!latestSeg
-                          && (Date.now() - lastFinalizedAtRef.current) < 2_000
-                          && isShortTailFragment(activeLiveText, latestSeg);
-                        const isLooseLiveFragment = !!activeLiveText
-                          && activeLiveText.split(/\s+/).filter(Boolean).length <= 2
-                          && isLikelyIncompleteFragment(activeLiveText);
-                        const liveText = (isStaleEcho || isTailEcho || isLooseLiveFragment) ? "" : activeLiveText;
+                        const liveText = isStaleEcho ? "" : activeLiveText;
                         const rows = (liveText
                           ? [liveText, ...displayTranscriptSegments.filter((seg) => normalizeForDedup(seg) !== normalizeForDedup(liveText))]
                           : displayTranscriptSegments).slice(0, 15);
                         return rows.map((seg, i) => {
-                          const rowKey = i === 0 && liveText
-                            ? "live-current"
-                            : (displayTranscriptSegmentKeys[liveText ? i - 1 : i] || `${seg}-${i}`);
-                          const detection = rowKey === "live-current"
-                            ? undefined
-                            : transcriptQuestionDetections[rowKey];
-                          const cleanedSeg = cleanTranscriptForDisplay(seg) || seg;
-                          const renderedText = detection?.cleanQuestion
-                            ? (/[?]$/.test(detection.cleanQuestion.trim()) ? detection.cleanQuestion.trim() : `${detection.cleanQuestion.trim()}?`)
-                            : cleanedSeg;
+                          const adv = detectQuestionAdvanced(seg);
+                          const isQ = detectQuestion(seg) || (adv.isQuestion && adv.confidence >= 0.5);
                           return (
                             <div
-                              key={rowKey}
-                              className="rounded px-2 py-1.5"
+                              key={i === 0 && liveText ? "live-current" : (displayTranscriptSegmentKeys[liveText ? i - 1 : i] || `${seg}-${i}`)}
+                              className={`text-sm leading-relaxed rounded px-2 py-1 ${isQ ? "text-foreground font-medium bg-primary/8 border-l-2 border-primary" : "text-foreground/80"}`}
                               data-testid={i === 0 && liveText ? "text-segment-live" : `text-segment-${i}`}
                             >
-                              <p className="text-sm leading-relaxed text-foreground">{renderedText}</p>
+                              {isQ && <MessageSquare className="w-3 h-3 text-primary inline mr-1.5 align-text-bottom" />}
+                              {seg}
                             </div>
                           );
                         });
@@ -9416,8 +9558,11 @@ export default function MeetingSession() {
                     </div>
                   ) : (
                     <div className="flex flex-col items-center justify-center h-full text-center py-8">
-                      <div className="mb-3">
+                      <div className="relative mb-3">
                         <Mic className="w-6 h-6 text-muted-foreground/20" />
+                        <div className="absolute inset-0 flex items-center justify-center">
+                          <div className="w-8 h-8 rounded-full border border-primary/20 animate-ping" />
+                        </div>
                       </div>
                       <p className="text-xs text-muted-foreground">
                         {audioMode === "system"
@@ -9429,8 +9574,29 @@ export default function MeetingSession() {
                 </div>
 
                 <div className="p-3 border-t space-y-2 shrink-0">
+                  <Button
+                    className="w-full h-10 text-sm"
+                    variant="secondary"
+                    onClick={handleSendTranscript}
+                    disabled={isStreaming}
+                    data-testid="button-send-transcript"
+                  >
+                    <Sparkles className="w-3 h-3 mr-1.5" />
+                    Generate Answer from Transcript
+                  </Button>
+                  <div className="flex items-center gap-2">
+                  <Button
+                    size="icon"
+                    className="h-10 w-10 shrink-0"
+                    onClick={handleCopilotAsk}
+                    disabled={isStreaming}
+                    data-testid="button-ask"
+                  >
+                      {isStreaming ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+                    </Button>
+                  </div>
                   <p className="text-center text-xs text-muted-foreground/70">
-                    Finalized transcript stays here. Use <kbd className="px-1 py-0.5 border rounded font-mono bg-muted text-[10px]">Enter</kbd> or <span className="font-medium text-foreground">Generate</span> in AI Insights for the current topic.
+                    <kbd className="px-1 py-0.5 border rounded font-mono bg-muted text-[10px]">Enter</kbd> to generate answer from live conversation
                   </p>
                 </div>
               </div>
@@ -9450,7 +9616,7 @@ export default function MeetingSession() {
                 </div>
               )}
 
-              <div className="flex-1 flex flex-col overflow-hidden">
+              <div className={`flex-1 flex flex-col overflow-hidden ${mobileTab !== "ai" ? "hidden lg:flex" : "flex"}`}>
                 <div className="shrink-0 border-b px-4 py-1.5 flex items-center justify-between">
                   <div className="flex items-center gap-2">
                     <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">AI Insights</h3>
@@ -9528,12 +9694,17 @@ export default function MeetingSession() {
                       Generate
                     </Button>
                   </div>
-                  <span className="text-xs text-muted-foreground">
-                    {responsesLocal.length > 0 ? `${responsesLocal.length} recent response${responsesLocal.length === 1 ? "" : "s"}` : "Waiting for a generated response"}
-                  </span>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 text-xs"
+                    onClick={() => setShowResponseHistory((v) => !v)}
+                  >
+                    {showResponseHistory ? "Hide History" : `View History (${responsesLocal.length})`}
+                  </Button>
                 </div>
                 <div
-                  className="flex-1 overflow-y-auto min-h-0 p-3"
+                  className="flex-1 overflow-y-auto min-h-0 p-3" style={{ scrollbarGutter: "stable" }}
                   ref={scrollRef}
                   onScroll={() => {
                     if (!scrollRef.current) return;
@@ -9543,50 +9714,50 @@ export default function MeetingSession() {
                   {responsesLocal.length > 0 || shouldShowStreamingCard ? (
                     <div className="space-y-3">
                       {shouldShowStreamingCard && (
-                        <div data-testid="card-streaming-response">
+                        <div className="py-2" data-testid="card-streaming-response">
                           {(streamingAnswer || pendingResponse?.answer) ? (
-                            <div>
-                              <MarkdownRenderer
-                                content={streamingDisplayAsCode
-                                  ? enforceCodeOnlyDisplay(streamingDisplayAnswer, streamingDisplayQuestion)
-                                  : streamingDisplayAnswer}
-                                streaming={isStreaming}
-                              />
-                              {isStreaming && !isRefining && <span className="stream-cursor" />}
-                              {isRefining && (
-                                <span className="text-[11px] text-muted-foreground ml-2" style={{ animation: "thinking-pulse 1.4s ease-in-out infinite" }}>refining…</span>
+                            <div className="text-sm leading-relaxed">
+                              {streamingDisplayAsCode ? (
+                                <MarkdownRenderer content={enforceCodeOnlyDisplay(streamingDisplayAnswer, streamingDisplayQuestion)} streaming={isStreaming} />
+                              ) : (
+                                <MarkdownRenderer content={streamingDisplayAnswer} streaming={isStreaming} />
                               )}
+                              {isRefining
+                                ? <span className="text-[10px] text-muted-foreground ml-1 animate-pulse">Refining...</span>
+                                : <span className="inline-block w-0.5 h-4 bg-primary animate-pulse ml-0.5 align-text-bottom" />
+                              }
                             </div>
                           ) : (
-                            <div className="flex items-center gap-2 py-2" data-testid="badge-streaming-status">
-                              {[0, 1, 2].map((i) => (
-                                <span
-                                  key={i}
-                                  className="inline-block w-1.5 h-1.5 rounded-full bg-primary/60"
-                                  style={{ animation: "thinking-pulse 1.2s ease-in-out infinite", animationDelay: `${i * 0.18}s` }}
-                                />
-                              ))}
-                              <span className="text-xs text-muted-foreground">Generating…</span>
+                            <div className="flex items-center gap-1.5 py-1" data-testid="badge-streaming-status">
+                              <span className="inline-block w-2 h-2 rounded-full bg-primary animate-bounce" style={{ animationDelay: "0ms" }} />
+                              <span className="inline-block w-2 h-2 rounded-full bg-primary animate-bounce" style={{ animationDelay: "120ms" }} />
+                              <span className="inline-block w-2 h-2 rounded-full bg-primary animate-bounce" style={{ animationDelay: "240ms" }} />
+                              <span className="text-xs text-muted-foreground ml-1">Thinking...</span>
                             </div>
                           )}
                         </div>
                       )}
 
-                      {!shouldShowStreamingCard && newestResponse ? (() => {
-                        const displayAsCode = shouldDisplayAnswerAsCode(newestResponse.question, newestResponse.answer);
-                        const content = displayAsCode
-                          ? enforceCodeOnlyDisplay(newestResponse.answer, newestResponse.question)
-                          : newestResponse.answer;
-                        return (
-                          <ResponseCard
-                            key={newestResponse.id}
-                            resp={newestResponse}
-                            isHighlighted={highlightResponseId === newestResponse.id}
-                            content={content}
-                            onMount={handleResponseCardMount}
-                          />
-                        );
-                      })() : null}
+                      {(showResponseHistory ? responsesLocal.slice(0, 6) : responsesLocal.slice(0, 1))
+                        .map((resp) => (
+                          <div
+                            key={resp.id}
+                            ref={(el) => { responseCardRefs.current[resp.id] = el; }}
+                            className="py-2"
+                            data-testid={`card-response-${resp.id}`}
+                          >
+                            <div className="text-sm leading-relaxed">
+                              {shouldDisplayAnswerAsCode(resp.question, resp.answer) ? (
+                                <MarkdownRenderer content={enforceCodeOnlyDisplay(resp.answer, resp.question)} />
+                              ) : (
+                                <MarkdownRenderer content={resp.answer} />
+                              )}
+                            </div>
+                            <div className="mt-1 text-[10px] text-muted-foreground/50">
+                              {resp.createdAt ? new Date(resp.createdAt).toLocaleTimeString() : ""}
+                            </div>
+                          </div>
+                        ))}
                     </div>
                   ) : (
                     <div className="flex flex-col items-center justify-center h-full text-center py-12">
@@ -9707,28 +9878,6 @@ export default function MeetingSession() {
                   </div>
                 </div>
                 <div className="px-3 py-2 border-b">
-                  <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Recent Responses</h3>
-                </div>
-                <div className="max-h-[220px] overflow-y-auto px-3 py-2 space-y-2 border-b">
-                  {responsesLocal.length === 0 ? (
-                    <p className="text-xs text-muted-foreground">Generated answers will appear here.</p>
-                  ) : (
-                    responsesLocal.slice(0, 5).map((resp) => (
-                      <div key={resp.id} className="rounded-md border p-2 bg-muted/20">
-                        <p className="text-[11px] font-medium text-foreground line-clamp-2">
-                          {resp.question || "Recent answer"}
-                        </p>
-                        <p className="mt-1 text-[11px] text-muted-foreground line-clamp-4">
-                          {String(resp.answer || "")
-                            .replace(/```[\s\S]*?```/g, "[code]")
-                            .replace(/\s+/g, " ")
-                            .trim()}
-                        </p>
-                      </div>
-                    ))
-                  )}
-                </div>
-                <div className="px-3 py-2 border-b">
                   <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Recent Questions</h3>
                 </div>
                 <div className="flex-1 overflow-y-auto p-3 space-y-2" style={{ minHeight: 0 }}>
@@ -9764,6 +9913,26 @@ export default function MeetingSession() {
                         </button>
                       </div>
                     ))
+                  )}
+                </div>
+                <div className="border-t px-3 py-2">
+                  <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">History</h4>
+                </div>
+                <div className="flex-1 overflow-y-auto px-3 py-2 space-y-2" style={{ minHeight: 0 }}>
+                  {selectedQuestionFilter ? (
+                    responsesLocal
+                      .filter((resp) => normalizeForDedup(resp.question || "") === normalizeForDedup(selectedQuestionFilter))
+                      .map((resp) => (
+                        <div key={resp.id} className="text-xs text-muted-foreground leading-relaxed border rounded-md p-2 bg-muted/20">
+                          {shouldDisplayAnswerAsCode(resp.question, resp.answer) ? (
+                            <MarkdownRenderer content={enforceCodeOnlyDisplay(resp.answer, resp.question)} />
+                          ) : (
+                            <MarkdownRenderer content={resp.answer} />
+                          )}
+                        </div>
+                      ))
+                  ) : (
+                    <p className="text-xs text-muted-foreground">Select a question to view its answer history.</p>
                   )}
                 </div>
               </div>
@@ -9933,6 +10102,7 @@ export default function MeetingSession() {
             </AnimatePresence>
           </div>
         </div>
+      </div>
       </div>
     )}
     <video

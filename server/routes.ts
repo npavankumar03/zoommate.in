@@ -3,7 +3,7 @@ import { createServer, type Server } from "http";
 import crypto from "crypto";
 import { storage } from "./storage";
 import { generateResponse, generateStreamingResponse, analyzeScreen, analyzeScreenStream, analyzeMultiScreenStream, getAvailableModels } from "./openai";
-import { detectQuestion, detectQuestionAdvanced, normalizeForDedup, isSubstantiveSegment, resolveActiveQuestionWindow } from "@shared/questionDetection";
+import { detectQuestion, detectQuestionAdvanced, normalizeForDedup, isSubstantiveSegment } from "@shared/questionDetection";
 import { invalidateSettingsCache, getPrewarmedOpenAIKey, prewarmApiKey, FAST_MODEL, keepAliveAgent, resolveLLMConfig } from "./llmRouter";
 import { resolveAutomaticInterviewModel } from "./llmRouter2";
 import { streamOpenAIFast } from "./llmStream";
@@ -25,13 +25,14 @@ import { encryptSettingValue, decryptSettingValue } from "./settingsCrypto";
 import { runDetectionPipeline, extractQuestionsWithLLM, composeQuestionWithLLM, normalizeQuestion, isDuplicateQuestion } from "./assist/questionDetect";
 import { streamAssistantAnswer } from "./assist/answerStream";
 import { orchestrate } from "./assist/orchestrator";
-import { getState as getMeetingState, getRecentFinals, setAnswerStyle, getAnswerStyle, setCodeContext, enqueueQuestion, getActiveQuestion, setActiveQuestion } from "./realtime/meetingStore";
+import { getState as getMeetingState, getRecentFinals, setAnswerStyle, getAnswerStyle, setCodeContext } from "./realtime/meetingStore";
 import { recordInterviewerQuestion, recordSpokenReply, getCodingProblemState } from "./assist/sessionState";
 import { getStructuredInterviewAnswer } from "./assist/structuredAnswer";
 import { indexDocumentForRag, retrieveDocumentContext } from "./rag";
 import { getOrLoadConversationSummary, getOrLoadDocRetrieval, getOrLoadSettings } from "./cache/hotPathCache";
 import { generateSessionReview } from "./sessionReview";
 import { getUseCaseConfigWithScope } from "./llmRouter2";
+import { clearHeuristicCache, warmHeuristicAnswers } from "./assist/heuristicAnswerCache";
 
 const upload = multer({ dest: "/tmp/audio-uploads/", limits: { fileSize: 25 * 1024 * 1024 } });
 const docUpload = multer({ dest: "/tmp/doc-uploads/", limits: { fileSize: 20 * 1024 * 1024 } });
@@ -534,7 +535,9 @@ export async function registerRoutes(
   app.get("/api/documents", requireAuth, async (req: any, res) => {
     try {
       const docs = await storage.getDocuments(req.userId);
-      res.json(docs);
+      // Filter out internal auto-generated documents (e.g. session answer logs)
+      const INTERNAL_TYPES = new Set(["past_answers", "session_review"]);
+      res.json(docs.filter((d: any) => !INTERNAL_TYPES.has(d.type) && !String(d.name || "").startsWith("_session_")));
     } catch (error: any) {
       res.status(500).json({ message: error.message });
     }
@@ -862,6 +865,14 @@ export async function registerRoutes(
       }
       const updated = await storage.updateMeeting(req.params.id, updateData);
       res.json(updated);
+
+      // If custom instructions changed, invalidate heuristic cache and re-warm
+      // so the next common question uses the new instructions immediately.
+      if (typeof updateData.customInstructions === "string") {
+        clearHeuristicCache(req.params.id);
+        const profileContext = updateData.customInstructions || meeting.customInstructions || "";
+        void warmHeuristicAnswers(req.userId, req.params.id, profileContext, updateData.customInstructions).catch(() => {});
+      }
 
       // Fire-and-forget: generate post-session review when session completes
       if (updateData.status === "completed" && !meeting.incognito) {
@@ -2774,22 +2785,12 @@ Return ONLY valid JSON. No explanation, no markdown, no code fences. Just the JS
       const t0 = Date.now();
 
       const advanced = detectQuestionAdvanced(text);
-      const activeQuestion = getActiveQuestion(req.params.id)?.clean || "";
-      const framed = resolveActiveQuestionWindow(text, { previousQuestion: activeQuestion });
-      const cleanQuestion = framed.cleanQuestion || text.trim();
-      // detectQuestionAdvanced is a superset of detectQuestion — use it exclusively to avoid double evaluation
-      const isLikelyQuestion =
-        framed.answerability === "complete"
-        && framed.questions.length > 0
-        && framed.stable
-        && Math.max(advanced.confidence, framed.confidence) >= 0.72;
+      const cleanQuestion = text.trim();
+      const isLikelyQuestion = detectQuestion(text) || (advanced.isQuestion && advanced.confidence >= 0.6);
       const normalizedTurn = text.toLowerCase().replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim();
       const isShortAck = /^(yes|yeah|yep|yup|correct|right|sure|i do|i did|absolutely|of course|exactly)$/i.test(normalizedTurn);
 
-      const requestedSpeaker = String(req.body?.speaker || "").trim().toLowerCase();
-      const speaker = requestedSpeaker === "interviewer" || requestedSpeaker === "candidate" || requestedSpeaker === "unknown"
-        ? requestedSpeaker
-        : (isLikelyQuestion ? "interviewer" : "unknown");
+      const speaker = isLikelyQuestion ? "interviewer" : "candidate";
       const created = await storage.createTranscriptTurn({
         meetingId: req.params.id,
         turnIndex: nextTurnIndex,
@@ -2799,23 +2800,13 @@ Return ONLY valid JSON. No explanation, no markdown, no code fences. Just the JS
         endMs: typeof req.body?.endMs === "number" ? req.body.endMs : null,
         confidence: null,
         isQuestion: isLikelyQuestion,
-        questionType: isLikelyQuestion ? (framed.labels[0] || advanced.type || "other") : null,
+        questionType: isLikelyQuestion ? (advanced.type || "other") : null,
         cleanQuestion: isLikelyQuestion ? cleanQuestion : null,
       });
 
       if (isLikelyQuestion) {
         recordInterviewerQuestion(req.params.id, cleanQuestion || text);
-        enqueueQuestion(req.params.id, cleanQuestion || text, Date.now(), {
-          windowHash: framed.windowHash,
-          answerability: framed.answerability,
-          labels: framed.labels,
-        });
-        setActiveQuestion(req.params.id, cleanQuestion || text, Date.now(), {
-          windowHash: framed.windowHash,
-          answerability: framed.answerability,
-          labels: framed.labels,
-        });
-      } else if (speaker === "candidate" && (isSubstantiveSegment(text) || isShortAck || text.split(/\s+/).filter(Boolean).length <= 40)) {
+      } else if (isSubstantiveSegment(text) || isShortAck || text.split(/\s+/).filter(Boolean).length <= 40) {
         recordSpokenReply(req.params.id, text);
       }
 
@@ -2836,12 +2827,11 @@ Return ONLY valid JSON. No explanation, no markdown, no code fences. Just the JS
       const text = String(req.body?.text || "").trim();
       if (!text) return res.status(400).json({ message: "text is required" });
       const audioMode = typeof req.body?.audioMode === "string" ? req.body.audioMode : undefined;
-      const segmentKey = String(req.body?.segmentKey || "").trim();
 
       const recentTurns = await storage.getRecentTranscriptTurns(req.params.id, 4);
       const recentContext = recentTurns.reverse().map((t) => t.text).join("\n");
       const memoryContext = await formatMemorySlotsForPrompt(req.userId, req.params.id);
-      const threshold = audioMode === "mic" ? 0.85 : 0.8;
+      const threshold = audioMode === "mic" ? 0.8 : 0.65;
 
       const result = await runDetectionPipeline(
         text,
@@ -2851,65 +2841,12 @@ Return ONLY valid JSON. No explanation, no markdown, no code fences. Just the JS
         threshold,
       );
 
-      const latestRecentTurn = recentTurns[0];
-      const previousQuestion = getActiveQuestion(req.params.id)?.clean
-        || getMeetingState(req.params.id).lastPrompt
-        || String(latestRecentTurn?.cleanQuestion || latestRecentTurn?.text || "").trim();
-      const framed = resolveActiveQuestionWindow(String(result.cleanQuestion || result.questionSpan || text).trim(), {
-        previousQuestion,
-      });
-
-      const shouldRecordQuestion =
-        result.isQuestion
-        && result.confidence >= threshold
-        && framed.answerability === "complete"
-        && framed.stable
-        && framed.questions.length > 0;
-      if (shouldRecordQuestion) {
-        const detectedQuestion = framed.cleanQuestion || String(result.cleanQuestion || result.questionSpan || text).trim();
-        recordInterviewerQuestion(
-          req.params.id,
-          detectedQuestion,
-        );
-        enqueueQuestion(req.params.id, detectedQuestion, Date.now(), {
-          windowHash: framed.windowHash,
-          answerability: framed.answerability,
-          labels: framed.labels,
-        });
-        setActiveQuestion(req.params.id, detectedQuestion, Date.now(), {
-          windowHash: framed.windowHash,
-          answerability: framed.answerability,
-          labels: framed.labels,
-        });
-      }
-
       res.json({
         is_question: result.isQuestion,
         confidence: result.confidence,
         question_span: result.questionSpan,
         clean_question: result.cleanQuestion,
         type: result.type,
-        recorded: shouldRecordQuestion,
-        segment_key: segmentKey || undefined,
-        framed: {
-          text: framed.text,
-          kind: framed.kind,
-          labels: framed.labels,
-          answerability: framed.answerability,
-          anchor: framed.anchor,
-          followup_to_previous: framed.followupToPrevious,
-          questions: framed.questions.map((item) => ({
-            text: item.text,
-            labels: item.labels,
-            confidence: item.confidence,
-            answerability: item.answerability,
-          })),
-          source_turn_ids: framed.sourceTurnIds,
-          window_hash: framed.windowHash,
-          confidence: framed.confidence,
-          stable: framed.stable,
-          clean_question: framed.cleanQuestion,
-        },
       });
     } catch (error: any) {
       res.status(500).json({ message: error.message });

@@ -89,15 +89,6 @@ const QUESTION_PHRASES = [
   "share your background",
   "share a time",
   "thoughts on",
-  "write",
-  "implement",
-  "build",
-  "create",
-  "design",
-  "generate",
-  "show me",
-  "develop",
-  "make",
 ];
 
 const INTERVIEW_INTENT_KEYWORDS = /\b(experience|worked|used|familiar|comfortable|exposure|background|hands on|knowledge|certification|strong in|thoughts?|opinion|approach|perspective|take)\b/i;
@@ -107,16 +98,10 @@ const SECOND_PERSON_DECLARATIVE = /^(you\s+(have|got|worked|used|built|implement
 export const INTERVIEW_SIGNAL_RE = /\b(your\s+(thoughts?|opinion|take|approach|perspective|view|understanding)\b|any\s+(experience|background|knowledge|exposure|familiarity|idea)\b|familiar\s+with\b|comfortable\s+with\b|experience\s+(with|in|using|on|of)\b|background\s+(in|with|on)\b|knowledge\s+of\b|exposure\s+to\b|talk\s+(me|us)\s+through\b|share\s+(your|a|an|with)\b|give\s+(me|us)\s+(an?\s+)?(example|idea|sense|overview|insight|walkthrough)\b|thoughts?\s+on\b|opinion\s+on\b|approach\s+to\b|worked?\s+with\b|done\s+any\b)\b/i;
 
 // Standalone tech terms — interviewer says just "Flask" or "React and Vue" as a question cue
-export const STANDALONE_TECH_RE = /^(?:react|angular|vue|svelte|nextjs|nuxtjs|gatsby|remix|astro|ember|backbone|jquery|bootstrap|tailwind|tailwindcss|chakra|antd|shadcn|materialui|storybook|nodejs|node|express|fastapi|flask|django|spring|springboot|rails|laravel|aspnet|nestjs|fastify|hapi|koa|gin|echo|fiber|phoenix|sinatra|tornado|sanic|aiohttp|typescript|javascript|python|java|golang|go|rust|kotlin|swift|scala|csharp|cpp|php|ruby|dart|elixir|clojure|haskell|fsharp|julia|perl|lua|bash|powershell|shell|cobol|matlab|postgres|postgresql|mysql|sqlite|mongodb|redis|cassandra|dynamodb|elasticsearch|solr|neo4j|influxdb|cockroachdb|mariadb|oracle|sqlserver|firestore|supabase|planetscale|fauna|couchbase|hbase|aurora|aws|azure|gcp|heroku|vercel|netlify|cloudflare|digitalocean|linode|railway|render|docker|kubernetes|k8s|terraform|ansible|chef|puppet|jenkins|githubactions|gitlabci|circleci|argocd|helm|vagrant|packer|kafka|rabbitmq|sqs|sns|pubsub|nats|zeromq|activemq|celery|tensorflow|pytorch|keras|sklearn|scikit|pandas|numpy|opencv|nltk|spacy|huggingface|langchain|llamaindex|llm|gpt|bert|transformers|xgboost|lightgbm|rag|spark|hadoop|airflow|flink|databricks|snowflake|dbt|looker|tableau|powerbi|redshift|bigquery|hive|presto|trino|graphql|grpc|websocket|rest|restful|http|https|tcp|udp|mqtt|amqp|oauth|jwt|saml|openid|microservices|monolith|serverless|eventdriven|cqrs|ddd|tdd|bdd|git|github|gitlab|bitbucket|jira|confluence|figma|postman|swagger|openapi|webpack|vite|rollup|babel|eslint|prettier|devops|sre|cicd|agile|scrum|kanban|dotnet|blazor|xamarin|unity|wpf|winforms|api|sdk|cli|oop|solid|mvc|mvvm|spa|pwa|ssr|csr|cdn|dns|vpn|ssl|tls|microservice|containerization|orchestration|html|css|sass|less|json|xml|yaml|toml|markdown|linux|ubuntu|debian|centos|macos|unix|stripe|twilio|sendgrid|datadog|sentry|pagerduty|splunk|newrelic|grafana|prometheus|sqlalchemy|alembic|pydantic|nginx|apache|gunicorn|uvicorn|wipro|anthem|tcs|infosys|cognizant|accenture|capgemini|deloitte|ibm|microsoft|google|amazon|meta|apple|netflix|uber|airbnb|backend|frontend|fullstack|devops|sysadmin|architect|engineer|developer|programmer|\.net)$/i;
+export const STANDALONE_TECH_RE = /\b(react|angular|vue|svelte|nextjs|nuxtjs|gatsby|remix|astro|ember|backbone|jquery|bootstrap|tailwind|tailwindcss|chakra|antd|shadcn|materialui|storybook|nodejs|node|express|fastapi|flask|django|spring|springboot|rails|laravel|aspnet|nestjs|fastify|hapi|koa|gin|echo|fiber|phoenix|sinatra|tornado|sanic|aiohttp|typescript|javascript|python|java|golang|go|rust|kotlin|swift|scala|csharp|cpp|php|ruby|dart|elixir|clojure|haskell|fsharp|julia|perl|lua|bash|powershell|shell|cobol|matlab|postgres|postgresql|mysql|sqlite|mongodb|redis|cassandra|dynamodb|elasticsearch|solr|neo4j|influxdb|cockroachdb|mariadb|oracle|sqlserver|firestore|supabase|planetscale|fauna|couchbase|hbase|aurora|aws|azure|gcp|heroku|vercel|netlify|cloudflare|digitalocean|linode|railway|render|docker|kubernetes|k8s|terraform|ansible|chef|puppet|jenkins|githubactions|gitlabci|circleci|argocd|helm|vagrant|packer|kafka|rabbitmq|sqs|sns|pubsub|nats|zeromq|activemq|celery|tensorflow|pytorch|keras|sklearn|scikit|pandas|numpy|opencv|nltk|spacy|huggingface|langchain|llamaindex|llm|gpt|bert|transformers|xgboost|lightgbm|rag|spark|hadoop|airflow|flink|databricks|snowflake|dbt|looker|tableau|powerbi|redshift|bigquery|hive|presto|trino|graphql|grpc|websocket|rest|restful|http|https|tcp|udp|mqtt|amqp|oauth|jwt|saml|openid|microservices|monolith|serverless|eventdriven|cqrs|ddd|tdd|bdd|git|github|gitlab|bitbucket|jira|confluence|figma|postman|swagger|openapi|webpack|vite|rollup|babel|eslint|prettier|devops|sre|cicd|agile|scrum|kanban|dotnet|blazor|xamarin|unity|wpf|winforms|api|sdk|cli|oop|solid|mvc|mvvm|spa|pwa|ssr|csr|cdn|dns|vpn|ssl|tls|microservice|containerization|orchestration|html|css|sass|less|json|xml|yaml|toml|markdown|linux|ubuntu|debian|centos|macos|unix|stripe|twilio|sendgrid|datadog|sentry|pagerduty|splunk|newrelic|grafana|prometheus|sqlalchemy|alembic|pydantic|nginx|apache|gunicorn|uvicorn|wipro|anthem|tcs|infosys|cognizant|accenture|capgemini|deloitte|ibm|microsoft|google|amazon|meta|apple|netflix|uber|airbnb|backend|frontend|fullstack|devops|sysadmin|architect|engineer|developer|programmer)\b|\.NET\b/i;
 
 function hasSecondPersonDeclarativeQuestionIntent(text: string): boolean {
-  if (!SECOND_PERSON_DECLARATIVE.test(text) || !INTERVIEW_INTENT_KEYWORDS.test(text)) return false;
-  // Guard: only treat as a question if the sentence ends with "?" (direct question)
-  // OR if there is aux-verb inversion (verb before subject: "have you", "did you", "do you")
-  // — not just "you have" (subject before verb) which is a declarative statement.
-  if (/\?\s*$/.test(text)) return true;
-  if (/\b(have|has|did|do|does|is|are|was|were|can|could|would|will|should)\s+you\b/i.test(text)) return true;
-  return false;
+  return SECOND_PERSON_DECLARATIVE.test(text) && INTERVIEW_INTENT_KEYWORDS.test(text);
 }
 
 function hasQuestionPunctuationSignal(text: string): boolean {
@@ -233,8 +218,7 @@ const ASR_FIXES: Array<[RegExp, string]> = [
   [/\bjson(?:\s+)?web(?:\s+)?token\b/gi, "JWT"],
   [/\boath\b/gi, "OAuth"],
   // ── Indian accent: Celery mishears (sounds like "salary") ──
-  // Note: /\bsalary\b/ is intentionally NOT here — it's context-guarded in ASR_CONTEXTUAL_FIXES
-  // to avoid converting real salary mentions to "Celery".
+  [/\bsalary\b/gi, "Celery"],
   [/\bsillary\b/gi, "Celery"],
   [/\bsel(?:e|a)ry\b/gi, "Celery"],
   [/\bsell(?:e|a)ry\b/gi, "Celery"],
@@ -445,11 +429,7 @@ export function applyAsrCorrections(raw: string): string {
   return text;
 }
 
-// "like" is stripped only when surrounded by other fillers (um like, you know like, like um)
-// "so" is stripped only when it appears at the very start of the text as a pause filler
-const FILLER_WORD_RE = /\b(uh+|um+|erm|hmm+|you know|sort of|kind of|basically|actually|literally|okay|ok)\b/g;
-const FILLER_LIKE_RE = /\b(um+|uh+|erm|hmm+|you know)\s+like\b|\blike\s+(um+|uh+|erm|hmm+|you know)\b/gi;
-const FILLER_SO_RE = /^so\s+/i;
+const FILLER_WORD_RE = /\b(uh+|um+|erm|hmm+|like|you know|sort of|kind of|basically|actually|literally|so|okay|ok)\b/g;
 const STOPWORDS = new Set([
   "a", "an", "the", "is", "are", "am", "was", "were", "be", "been", "being",
   "do", "does", "did", "to", "for", "of", "in", "on", "at", "by", "with",
@@ -458,11 +438,7 @@ const STOPWORDS = new Set([
 ]);
 
 function stripRepeatedFillers(input: string): string {
-  // Strip "like" only when flanked by other filler words (e.g. "um like", "like um")
-  // Strip "so" only when it starts the sentence as a pause filler
   return input
-    .replace(FILLER_LIKE_RE, " ")
-    .replace(FILLER_SO_RE, "")
     .replace(FILLER_WORD_RE, " ")
     .replace(/\b(\w+)(\s+\1){1,}\b/g, "$1")
     .replace(/\s+/g, " ")
@@ -533,7 +509,7 @@ export function detectQuestionAdvanced(text: string): {
     .trim();
   const words = normalized.split(" ").filter(Boolean);
   // Strip leading filler words so "Alright, write a function..." detects "write" as a command starter
-  const strippedNorm = normalized.replace(/^(alright|okay|ok|so|now|well|right|sure|let'?s|go ahead|actually|basically|essentially|next|then|first|second|third|after that)[,.]?\s*/i, "").trim();
+  const strippedNorm = normalized.replace(/^(alright|okay|ok|so|now|well|right|sure|let'?s|go ahead|actually|basically|essentially)[,.]?\s*/i, "").trim();
   const startsWh = /^(what|why|how|when|where|who|which)\b/.test(strippedNorm);
   const startsInterrogative = /^(what|why|how|when|where|who|which|can|could|would|should|is|are|do|does|did)\b/.test(strippedNorm);
   const startsCommand = /^(explain|tell me|tell us|walk me|walk us|describe|share|give me|give us|talk me through|talk us through|your experience|your thoughts|your opinion|your take|your approach|any experience|familiar with|comfortable with|experience with|experience in|have you|are you familiar|are you comfortable|write|implement|build|create|design|code|generate|show me|make|develop|define|list|find|calculate|solve|convert|parse|sort|search|optimize|refactor)/.test(strippedNorm);
@@ -548,11 +524,7 @@ export function detectQuestionAdvanced(text: string): {
   if (/\b(difference between|walk me through|tell me about|explain|what happens if|how would you)\b/.test(normalized)) score += 0.5;
   if (/\b(do you have experience|have you worked with|have you used|have you ever|are you familiar with|are you comfortable with|what was your|when did you|can you share|could you share|your experience with|your background in|your experience in|describe a time|give me an example|give an example|your thoughts on|your opinion on|your take on|your approach to|any experience with|any experience in|familiar with|comfortable with|thoughts on)\b/.test(normalized)) score += 0.35;
   // Standalone tech term with no other signals still warrants a small boost
-  // Guard: only boost if a question word or "?" is present
-  if (STANDALONE_TECH_RE.test(normalized) && words.length <= 5) {
-    const hasQWord = /[?]\s*$/.test(normalized) || /\b(what|how|why|when|where|which|who|can|could|would|will|do|did|does|is|are|have|has|tell|explain|describe)\b/i.test(normalized);
-    if (hasQWord) score += 0.3;
-  }
+  if (STANDALONE_TECH_RE.test(normalized) && words.length <= 5) score += 0.3;
 
   if (words.length > 8) score += 0.2;
   if (/\b(you|your)\b/.test(normalized)) score += 0.2;
@@ -639,7 +611,7 @@ export function detect(
   const cues: string[] = [];
   let score = 0;
 
-  if (/\?\s*$/.test(text)) { score += 0.55; cues.push("ends_with_qmark"); }
+  if (/\?$/.test(text)) { score += 0.55; cues.push("ends_with_qmark"); }
   if (hasQuestionPunctuationSignal(span) && !cues.includes("ends_with_qmark")) { score += 0.18; cues.push("punctuation_backup"); }
   if (/^(what|why|how|when|where|who|which|can|could|would|should|is|are|do|does|did|have|has|will|was|were)\b/.test(text)) {
     score += 0.45; cues.push("starts_interrogative");
@@ -648,10 +620,8 @@ export function detect(
     score += 0.35; cues.push("imperative_prompt");
   }
   // Standalone tech term (≤5 words) — "Flask", "React and Vue"
-  // Guard: only boost if the segment also contains a question word or ends with "?"
   if (STANDALONE_TECH_RE.test(text) && text.split(/\s+/).filter(Boolean).length <= 5) {
-    const hasQuestionWord = /\?\s*$/.test(text) || /\b(what|how|why|when|where|which|who|can|could|would|will|do|did|does|is|are|have|has|tell|explain|describe)\b/i.test(text);
-    if (hasQuestionWord) { score += 0.3; cues.push("standalone_tech"); }
+    score += 0.3; cues.push("standalone_tech");
   }
 
   const words = text.split(/\s+/).filter(Boolean);
@@ -681,7 +651,7 @@ export function detect(
   const confidence = Math.max(0, Math.min(1, score));
   const isQuestion = confidence >= 0.6;
   let kind: "direct" | "imperative" | "implicit" | "unknown" = "unknown";
-  if (/\?\s*$/.test(text)) kind = "direct";
+  if (/\?$/.test(text)) kind = "direct";
   else if (/\b(explain|describe|walk me through|tell me about|tell us about|talk me through|share|give me an example|compare|have you worked|have you used|have you ever|are you familiar|are you comfortable|your experience|your background|describe a time|your thoughts|your opinion|your take|your approach|any experience|familiar with|comfortable with|thoughts on|background in|knowledge of)\b/.test(text) || cues.includes("standalone_tech")) kind = "imperative";
   else if (/^(what|why|how|when|where|who|which|can|could|would|should|is|are|do|does|did|have|has|will|was|were)\b/.test(text)) kind = "implicit";
 
@@ -716,9 +686,7 @@ export function detectQuestion(text: string): boolean {
 
   const auxVerbs = ["have", "has", "was", "were", "is", "are", "do", "does", "did", "will", "shall", "may", "might", "can", "could", "would", "should"];
   if (INTERROGATIVE_STARTERS.includes(firstWord)) {
-    // Allow 2-word questions when ending with "?" (e.g. "Have you?", "Are you?")
-    const endsWithQ = normalized.endsWith("?");
-    const minWords = endsWithQ ? 2 : 3;
+    const minWords = auxVerbs.includes(firstWord) ? 3 : 3;
     if (words.length >= minWords) {
       if (auxVerbs.includes(firstWord)) {
         const secondWord = words[1] || "";
@@ -744,11 +712,7 @@ export function detectQuestion(text: string): boolean {
   if (INTERVIEW_SIGNAL_RE.test(normalized)) return true;
 
   // Standalone tech term — widened to 10 words (e.g. "tell me about your Docker experience")
-  // Guard: only fire if the segment also contains a question word or ends with "?"
-  if (words.length <= 10 && STANDALONE_TECH_RE.test(normalized)) {
-    const hasQuestionWord = /\?\s*$/.test(normalized) || /\b(what|how|why|when|where|which|who|can|could|would|will|do|did|does|is|are|have|has|tell|explain|describe)\b/i.test(normalized);
-    if (hasQuestionWord) return true;
-  }
+  if (words.length <= 10 && STANDALONE_TECH_RE.test(normalized)) return true;
 
   // Interview-intent statement without explicit question word
   // e.g. "Previous experience", "Python background", "AWS knowledge"
@@ -773,18 +737,14 @@ export function likelyContainsQuestion(text: string): boolean {
   if (INTERROGATIVE_STARTERS.includes(firstWord)) return true;
 
   if (/\b(can|could|would|should|do|does|did|are|is|have|has)\s+you\b/.test(normalized)) return true;
-  if (/\b(tell me|walk me through|describe|explain|hit me with|talk about|write|implement|build|create|design|generate|show me|develop|make)\b/.test(normalized)) return true;
+  if (/\b(tell me|walk me through|describe|explain|hit me with|talk about)\b/.test(normalized)) return true;
   if (hasSecondPersonDeclarativeQuestionIntent(normalized)) return true;
 
   // Broader interview signals — "your thoughts on X", "any experience with X", "familiar with X" etc.
   if (INTERVIEW_SIGNAL_RE.test(normalized)) return true;
 
   // Standalone tech term (1–5 words) — interviewer says "Flask" or "React and Vue"
-  // Guard: only fire if the segment also contains a question word or ends with "?"
-  if (words.length <= 5 && STANDALONE_TECH_RE.test(normalized)) {
-    const hasQuestionWord = /\?\s*$/.test(normalized) || /\b(what|how|why|when|where|which|who|can|could|would|will|do|did|does|is|are|have|has|tell|explain|describe)\b/i.test(normalized);
-    if (hasQuestionWord) return true;
-  }
+  if (words.length <= 5 && STANDALONE_TECH_RE.test(normalized)) return true;
 
   return false;
 }
@@ -909,7 +869,7 @@ export function extractQuestionFromSegment(segment: string): string | null {
       }
     }
 
-    const questionStart = trimmed.search(/\b(what|why|how|when|where|who|which|can you|could you|would you|do you|have you|are you|tell me|explain|describe|walk me|hit me with|hit us with|write|implement|build|create|design|generate|show me|develop|make|you have|youve|youre)\b/i);
+    const questionStart = trimmed.search(/\b(what|why|how|when|where|who|which|can you|could you|would you|do you|have you|are you|tell me|explain|describe|walk me|hit me with|hit us with|you have|youve|youre)\b/i);
     if (questionStart > 0) {
       const questionPart = trimmed.slice(questionStart).trim();
       const qWords = questionPart.split(/\s+/);
@@ -925,7 +885,6 @@ export function extractQuestionFromSegment(segment: string): string | null {
     /^(so\s+)?ok(ay)?\s+(so\s+)?/i,
     /^(so\s+)?(um|uh|hmm|well|like|right|yeah|yes|alright|sure)\s+/i,
     /^(and\s+)?(the\s+)?(next|another|following)\s+(question\s+)?(is\s+)?/i,
-    /^(next|then|now|after that|first|second|third)[,:]?\s+/i,
     /^(question\s+(is\s+)?)/i,
     /^(let me ask you\s+)/i,
     /^(i want to ask\s+)/i,
@@ -954,7 +913,7 @@ export function extractQuestionFromSegment(segment: string): string | null {
     }
   }
 
-  const questionStart = cleaned.search(/\b(what|why|how|when|where|who|which|can you|could you|would you|do you|have you|are you|tell me|explain|describe|walk me|hit me with|hit us with|write|implement|build|create|design|generate|show me|develop|make|you have|youve|youre)\b/i);
+  const questionStart = cleaned.search(/\b(what|why|how|when|where|who|which|can you|could you|would you|do you|have you|are you|tell me|explain|describe|walk me|hit me with|hit us with|you have|youve|youre)\b/i);
   if (questionStart >= 0) {
     const questionPart = cleaned.slice(questionStart).trim();
     if (questionPart && detectQuestion(questionPart)) {
@@ -1095,423 +1054,4 @@ export function isNovelQuestion(newQuestion: string, lastQuestion: string, recen
   }
 
   return true;
-}
-
-export type QuestionPatternLabel =
-  | "direct"
-  | "one_word"
-  | "keyword_prompt"
-  | "multi_question"
-  | "followup"
-  | "rapid_fire"
-  | "pause_based"
-  | "incomplete_prompt"
-  | "interrupt"
-  | "drill_down"
-  | "scenario"
-  | "comparison"
-  | "challenge"
-  | "rephrased_repeat"
-  | "silent_pressure"
-  | "binary"
-  | "metric_demand"
-  | "ownership_test"
-  | "ambiguous"
-  | "clarification"
-  | "resume_pointer"
-  | "assumption_check"
-  | "behavioral"
-  | "broad_to_narrow"
-  | "narrow_to_broad";
-
-export type QuestionAnswerability = "complete" | "fragment" | "no_question";
-export type QuestionAnchor = "none" | "current_window" | "previous_answer";
-export type ActiveTopicKind = "complete" | "fragment" | "none" | "multi";
-
-export interface FramedQuestionItem {
-  text: string;
-  norm: string;
-  labels: QuestionPatternLabel[];
-  confidence: number;
-  answerability: QuestionAnswerability;
-}
-
-export interface FramedQuestionResult {
-  rawText: string;
-  normalizedText: string;
-  text: string;
-  kind: ActiveTopicKind;
-  labels: QuestionPatternLabel[];
-  answerability: QuestionAnswerability;
-  anchor: QuestionAnchor;
-  followupToPrevious: boolean;
-  questions: FramedQuestionItem[];
-  sourceTurnIds: string[];
-  windowHash: string;
-  confidence: number;
-  stable: boolean;
-  cleanQuestion: string;
-  isQuestion: boolean;
-}
-
-export type ActiveTopicFrame = FramedQuestionResult;
-
-function simpleStableHash(text: string): string {
-  let hash = 2166136261;
-  for (let i = 0; i < text.length; i++) {
-    hash ^= text.charCodeAt(i);
-    hash = Math.imul(hash, 16777619);
-  }
-  return (hash >>> 0).toString(36);
-}
-
-function ensureSentenceCase(text: string): string {
-  const trimmed = String(text || "").trim();
-  if (!trimmed) return "";
-  return trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
-}
-
-export function ensureQuestionMark(text: string): string {
-  const trimmed = String(text || "").trim().replace(/[.]\s*$/, "");
-  if (!trimmed) return "";
-  return /[?]$/.test(trimmed) ? trimmed : `${trimmed}?`;
-}
-
-function isFollowupPhrase(normalized: string): boolean {
-  return /^(why|how|how so|how come|what happened next|what next|what else|tell me more|go deeper|dig deeper|dive deeper|go on|continue|expand|elaborate|clarify|break it down|example|give me one example|real case|when exactly|who decided|what was your part|how do you know|why that)\??$/.test(normalized);
-}
-
-function isPauseOrIncompletePrompt(normalized: string): boolean {
-  if (!normalized) return false;
-  if (/^(and|also|plus|or|so|hmm|hm|okay|ok|right|wait|hold on|then|next|backend|frontend|database|project|team|testing|scale|yourself|role|outcome|after that)\??$/.test(normalized)) {
-    return true;
-  }
-  if (/\b(in|with|at|for|on|about|of|from|to|by|and|or|the|a|an|any|some|your|our|their|its|this|that|these|those)\s*$/.test(normalized)) {
-    return true;
-  }
-  return /^(and your|and after|and the outcome|tell me about|what about|can you|could you|would you|do you|have you|are you|wait who|hold on did)\s*$/.test(normalized)
-    && !/[?]$/.test(normalized);
-}
-
-function detectPatternLabelsInternal(text: string): QuestionPatternLabel[] {
-  const normalized = normalizeForDedup(text || "");
-  if (!normalized) return [];
-
-  const labels = new Set<QuestionPatternLabel>();
-  const words = normalized.split(/\s+/).filter(Boolean);
-
-  if (/[?]$/.test(String(text || "").trim()) || /^(what|why|how|when|where|who|which|can|could|would|should|is|are|do|does|did|have|has|tell|explain|describe|walk|write|implement|build|create|design|generate|show|develop|make)\b/.test(normalized)) {
-    labels.add("direct");
-  }
-  if (words.length === 1) labels.add("one_word");
-  if ((words.length <= 4 && STANDALONE_TECH_RE.test(normalized)) || /^(polymorphism|normalization|caching|database|project|team|scale|testing)$/.test(normalized)) {
-    labels.add("keyword_prompt");
-  }
-  if (isFollowupPhrase(normalized) || /^(and your|and after that|and the outcome|what do you mean|what exactly was your contribution)\b/.test(normalized)) {
-    labels.add("followup");
-  }
-  if (/^(wait|hold on)\b/.test(normalized)) labels.add("interrupt");
-  if (/\b(go deeper|explain in detail|how exactly|under the hood|drill down)\b/.test(normalized)) labels.add("drill_down");
-  if (/\b(what if|suppose|assume)\b/.test(normalized)) labels.add("scenario");
-  if (/\b(vs|versus|compare|difference between|better than)\b/.test(normalized)) labels.add("comparison");
-  if (/\b(are you sure|why not|that sounds expensive|but you said)\b/.test(normalized)) labels.add("challenge");
-  if (/^(yes or no|did you|did it|do you)\b/.test(normalized)) labels.add("binary");
-  if (/\b(how much|how many|what latency|what percentage|what was the improvement)\b/.test(normalized)) labels.add("metric_demand");
-  if (/\b(not the team|what exactly did you do|what was your part|your contribution)\b/.test(normalized)) labels.add("ownership_test");
-  if (/\b(i see .* here|you mentioned|this startup experience)\b/.test(normalized)) labels.add("resume_pointer");
-  if (/\b(so you were|so this was|so you deployed)\b/.test(normalized)) labels.add("assumption_check");
-  if (/\b(tell me about a time|give me an example when|describe a situation)\b/.test(normalized)) labels.add("behavioral");
-  if (/\b(focus on|focus only on)\b/.test(normalized)) labels.add("broad_to_narrow");
-  if (/^(how did .* work|how did login work)\b/.test(normalized) || /\b(explain the whole architecture|whole architecture)\b/.test(normalized)) {
-    labels.add("narrow_to_broad");
-  }
-  if (/^(right|correct|fair)\??$/.test(normalized)) labels.add("silent_pressure");
-  if (isPauseOrIncompletePrompt(normalized)) labels.add("incomplete_prompt");
-  if (/(\?|^)\s*(what|why|how|who|which|where|when|tell me|explain|describe|do you|have you|are you|can you|could you|would you)\b/gi.test(normalized) && splitSentences(ensureQuestionMark(text)).length > 1) {
-    labels.add("multi_question");
-  }
-  if (/\b(and then|who decided|what was your part|how do you know|what happened next)\b/.test(normalized)) labels.add("rapid_fire");
-  if (/\.\.\.|^so\b|^hmm\b|^okay\b/.test(String(text || "").trim().toLowerCase())) labels.add("pause_based");
-  if (/\b(what do you mean|can you clarify|could you clarify|what exactly)\b/.test(normalized)) labels.add("clarification");
-  if (!labels.size && likelyContainsQuestion(text)) labels.add("ambiguous");
-
-  return Array.from(labels);
-}
-
-export function detectQuestionPatternLabels(text: string): QuestionPatternLabel[] {
-  return detectPatternLabelsInternal(text);
-}
-
-function splitQuestionUnits(text: string): string[] {
-  const raw = String(text || "").trim();
-  if (!raw) return [];
-
-  const splitByLines = raw
-    .split(/\n+|\|+/)
-    .map((part) => part.trim())
-    .filter(Boolean)
-    .flatMap((part) => {
-      const withSentenceBreaks = part
-        .replace(/([?])\s+(?=(what|why|how|when|where|who|which|tell me|explain|describe|walk me|do you|have you|are you|can you|could you|would you)\b)/gi, "$1\n")
-        .replace(/,\s+(?=(what|why|how|when|where|who|which|tell me|explain|describe|walk me|do you|have you|are you|can you|could you|would you)\b)/gi, "\n");
-      return withSentenceBreaks.split(/\n+/).map((item) => item.trim()).filter(Boolean);
-    });
-
-  return splitByLines;
-}
-
-export function questionSupersedes(candidate: string, existing: string): boolean {
-  const next = normalizeForDedup(candidate || "");
-  const prev = normalizeForDedup(existing || "");
-  if (!next || !prev || next === prev) return false;
-
-  const nextWords = next.split(/\s+/).filter(Boolean);
-  const prevWords = prev.split(/\s+/).filter(Boolean);
-  if (nextWords.length < prevWords.length) return false;
-
-  const overlap = Math.max(computeWordOverlap(next, prev), computeWordOverlap(prev, next));
-  const prevLooksFragment = prevWords.length <= 4 || isPauseOrIncompletePrompt(prev) || isFollowupPhrase(prev);
-  if (prevLooksFragment && (next.includes(prev) || overlap >= 0.66)) return true;
-
-  const prevPrefix = prevWords.join(" ");
-  return Boolean(prevPrefix && next.startsWith(prevPrefix) && next.length > prev.length + 4);
-}
-
-export function dedupeAndSupersedeQuestions(questions: string[]): string[] {
-  const result: string[] = [];
-  for (const raw of questions) {
-    const next = ensureSentenceCase(String(raw || "").trim());
-    if (!next) continue;
-    const nextNorm = normalizeForDedup(next);
-    if (!nextNorm) continue;
-
-    let suppressed = false;
-    for (let i = result.length - 1; i >= 0; i--) {
-      const current = result[i];
-      const currentNorm = normalizeForDedup(current);
-      if (!currentNorm) continue;
-      if (currentNorm === nextNorm || questionSupersedes(current, next)) {
-        suppressed = true;
-        break;
-      }
-      if (questionSupersedes(next, current)) {
-        result.splice(i, 1);
-      }
-    }
-    if (!suppressed) result.push(next);
-  }
-  return result;
-}
-
-export function buildQuestionWindowHash(text: string): string {
-  const normalized = normalizeForDedup(String(text || ""));
-  return normalized ? `qwin_${simpleStableHash(normalized)}` : "";
-}
-
-function stripSpeakerPrefix(text: string): string {
-  return String(text || "").replace(/^\s*(?:interviewer|candidate)\s*:\s*/i, "").trim();
-}
-
-function lowercaseFirst(text: string): string {
-  const trimmed = String(text || "").trim();
-  if (!trimmed) return "";
-  return trimmed.charAt(0).toLowerCase() + trimmed.slice(1);
-}
-
-function isTopicAppendableQuestion(text: string): boolean {
-  const normalized = normalizeForDedup(stripSpeakerPrefix(text));
-  if (!normalized) return false;
-  if (/(tell me about|describe a time|share an experience|conflict|manager|yourself|strength|weakness|background)\b/.test(normalized)) {
-    return false;
-  }
-  return /\b(experience|worked with|worked on|used|use|familiar with|comfortable with|background in|knowledge of|exposure to|skills|stack|technologies|tools)\b/.test(normalized)
-    || /\b(?:do|does|did|have|has|are|is|can|could|would)\s+you\b/.test(normalized);
-}
-
-function isSafeTopicTail(text: string): boolean {
-  const normalized = normalizeForDedup(text);
-  if (!normalized) return false;
-  const words = normalized.split(/\s+/).filter(Boolean);
-  if (words.length < 1 || words.length > 5) return false;
-  if (/^(and|also|plus|or|what about|how about|more|detail|details|it|that|this)$/i.test(normalized)) return false;
-  if (STANDALONE_TECH_RE.test(normalized)) return true;
-  return /\b(api|backend|frontend|cloud|database|sql|nosql|devops|microservices?|system design|project|architecture|testing|security|scalability|performance|storage|bucket|account)\b/i.test(normalized);
-}
-
-export function mergeFollowupQuestion(previousQuestion: string, fragment: string): string {
-  const prev = ensureQuestionMark(stripSpeakerPrefix(previousQuestion));
-  const rawFragment = stripSpeakerPrefix(fragment);
-  const fragmentNorm = normalizeForDedup(rawFragment);
-  if (!prev || !fragmentNorm) return "";
-
-  const prevBase = prev.replace(/[?]+\s*$/, "").trim();
-  if (!prevBase) return "";
-
-  if (/^(explain more|tell me more|go deeper|dig deeper|dive deeper|elaborate|elaborate more|in detail|more detail|clarify|break it down|expand|expand on that|can you elaborate|can you explain more)\??$/i.test(fragmentNorm)) {
-    return ensureQuestionMark(`Explain more about ${lowercaseFirst(prevBase)}`);
-  }
-
-  if (/^(why|how|what happened next|what next|what else|who decided|what was your part|how do you know)\??$/i.test(fragmentNorm)) {
-    return ensureQuestionMark(`${ensureSentenceCase(rawFragment.replace(/[?]+\s*$/, ""))} about ${lowercaseFirst(prevBase)}`);
-  }
-
-  const connectorMatch = /^(and also|and|also|plus|or|what about|how about)\s+/i.exec(rawFragment);
-  const tail = rawFragment.replace(/^(and also|and|also|plus|or|what about|how about)\s+/i, "").replace(/[?]+\s*$/, "").trim();
-  const connector = connectorMatch?.[1]?.toLowerCase() || "";
-  const appendWith = connector === "or" ? "or" : "and";
-
-  if (isTopicAppendableQuestion(prevBase) && isSafeTopicTail(tail)) {
-    return ensureQuestionMark(`${prevBase} ${appendWith} ${tail}`);
-  }
-
-  if (/^(yourself|role|your role|the outcome|outcome|after that)\??$/i.test(fragmentNorm) && /\b(tell me about|and your|what is your)\b/i.test(normalizeForDedup(prevBase))) {
-    return ensureQuestionMark(`${prevBase} ${rawFragment.replace(/[?]+\s*$/, "").trim()}`);
-  }
-
-  return "";
-}
-
-export function frameQuestionWindow(
-  text: string,
-  options?: { previousQuestion?: string },
-): FramedQuestionResult {
-  const rawText = String(text || "").trim();
-  const normalizedText = normalizeForDedup(rawText);
-  const labels = detectPatternLabelsInternal(rawText);
-  const windowHash = buildQuestionWindowHash(rawText);
-
-  if (!normalizedText) {
-    return {
-      rawText,
-      normalizedText,
-      text: "",
-      kind: "none",
-      labels,
-      answerability: "no_question",
-      anchor: "none",
-      followupToPrevious: false,
-      questions: [],
-      sourceTurnIds: [],
-      windowHash,
-      confidence: 0,
-      stable: false,
-      cleanQuestion: "",
-      isQuestion: false,
-    };
-  }
-
-  const extracted = extractQuestionFromSegment(rawText);
-  const units = splitQuestionUnits(rawText);
-  const explicitQuestions = dedupeAndSupersedeQuestions(
-    units
-      .map((unit) => extractQuestionFromSegment(unit) || (detectQuestion(unit) ? ensureSentenceCase(unit.trim()) : ""))
-      .filter(Boolean)
-      .map((unit) => ensureQuestionMark(unit)),
-  );
-
-  const answerability: QuestionAnswerability = (() => {
-    if (labels.includes("one_word") || labels.includes("keyword_prompt") || labels.includes("pause_based") || labels.includes("incomplete_prompt")) {
-      return "fragment";
-    }
-    if (!detectQuestion(rawText) && !likelyContainsQuestion(rawText) && !extracted && explicitQuestions.length === 0) {
-      return "no_question";
-    }
-    if (isPauseOrIncompletePrompt(normalizedText)) return "fragment";
-    if (explicitQuestions.length === 0 && !extracted) return "fragment";
-    return "complete";
-  })();
-
-  const anchor: QuestionAnchor =
-    answerability === "fragment" && labels.includes("followup") && options?.previousQuestion
-      ? "previous_answer"
-      : (answerability === "complete" ? "current_window" : "none");
-
-  const questions = (explicitQuestions.length > 0
-    ? explicitQuestions
-    : (extracted && answerability === "complete" ? [ensureQuestionMark(extracted)] : []))
-    .map((question) => {
-      const questionLabels = detectPatternLabelsInternal(question);
-      return {
-        text: question,
-        norm: normalizeForDedup(question),
-        labels: questionLabels,
-        confidence: Math.max(
-          detectQuestionAdvanced(question).confidence,
-          detect(question, "final").confidence,
-          answerability === "complete" ? 0.72 : 0.45,
-        ),
-        answerability: answerability === "complete" ? "complete" : "fragment",
-      } satisfies FramedQuestionItem;
-    });
-
-  const confidence = questions.length > 0
-    ? Math.max(...questions.map((item) => item.confidence))
-    : Math.max(
-        detectQuestionAdvanced(rawText).confidence,
-        detect(rawText, "final").confidence,
-        answerability === "fragment" ? 0.45 : 0,
-      );
-
-  return {
-    rawText,
-    normalizedText,
-    text: questions[0]?.text || "",
-    kind: questions.length > 1 ? "multi" : answerability === "no_question" ? "none" : answerability,
-    labels: Array.from(new Set<QuestionPatternLabel>([
-      ...labels,
-      ...(questions.length > 1 ? ["multi_question"] as QuestionPatternLabel[] : []),
-    ])),
-    answerability,
-    anchor,
-    followupToPrevious: false,
-    questions,
-    sourceTurnIds: [],
-    windowHash,
-    confidence,
-    stable: answerability === "complete" && confidence >= 0.7,
-    cleanQuestion: questions[0]?.text || "",
-    isQuestion: answerability === "complete" && questions.length > 0,
-  };
-}
-
-export function resolveActiveQuestionWindow(
-  text: string,
-  options?: { previousQuestion?: string },
-): FramedQuestionResult {
-  const base = frameQuestionWindow(text, options);
-  if (base.answerability === "complete" && base.questions.length > 0) {
-    return base;
-  }
-
-  const previousQuestion = String(options?.previousQuestion || "").trim();
-  const mergedQuestion = previousQuestion ? mergeFollowupQuestion(previousQuestion, text) : "";
-  if (!mergedQuestion) {
-    return base;
-  }
-
-  const mergedLabels = Array.from(new Set<QuestionPatternLabel>([
-    ...base.labels,
-    "followup",
-  ]));
-  const mergedConfidence = Math.max(base.confidence, 0.8);
-  return {
-    ...base,
-    text: mergedQuestion,
-    kind: "complete",
-    labels: mergedLabels,
-    answerability: "complete",
-    anchor: "previous_answer",
-    followupToPrevious: true,
-    questions: [{
-      text: mergedQuestion,
-      norm: normalizeForDedup(mergedQuestion),
-      labels: mergedLabels,
-      confidence: mergedConfidence,
-      answerability: "complete",
-    }],
-    confidence: mergedConfidence,
-    stable: true,
-    cleanQuestion: mergedQuestion,
-    isQuestion: true,
-  };
 }

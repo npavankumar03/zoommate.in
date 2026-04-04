@@ -497,11 +497,34 @@ export async function orchestrate(input: OrchestrateInput): Promise<OrchestrateO
 
   markTriggered(input.meetingId, fp, sourceKind, now);
 
+  // Auto path for partial/final: do not invoke extractor LLM to keep latency low.
+  if (input.mode !== "enter") {
+    const q = composeInstantQuestion(candidateSpan);
+    const questionNorm = normalizeForDedup(q);
+    enqueueQuestion(input.meetingId, q, now);
+    const displayQuestion = q;
+    const prompt = applyAnswerStyle(baseStyle, displayQuestion);
+    const dedupeKey = hash(normalizeForDedup(`answer::${baseStyle}::${questionNorm || displayQuestion}`));
+    if (isDuplicateAction(input.meetingId, dedupeKey, 12000)) {
+      incrementSuppression(input.meetingId, "dedupe");
+      return { action: "ignore", displayQuestion: "", llmPrompt: "", prompt: "", questions: [], questionNorms: [], dedupeKey, confidence: effectiveConfidence, style: baseStyle };
+    }
+    return {
+      action: "answer",
+      displayQuestion,
+      llmPrompt: prompt,
+      prompt,
+      questions: [{ text: q, clean: q, confidence: effectiveConfidence }],
+      questionNorms: questionNorm ? [questionNorm] : [],
+      dedupeKey,
+      confidence: effectiveConfidence,
+      style: baseStyle,
+    };
+  }
+
   let extractedQuestions = input.overrideQuestion?.trim()
     ? [composeInstantQuestion(sourceText)]
-    : input.mode !== "enter"
-      ? extractQuestionsFast(sourceText)
-      : await extractQuestionsPrecise(sourceText, input.recentFinals || [], input.meetingId);
+    : await extractQuestionsPrecise(sourceText, input.recentFinals || [], input.meetingId);
 
   if (!extractedQuestions.length) {
     const fallback = extractFallbackQuestionSpan(sourceText) || composeInstantQuestion(sourceText);

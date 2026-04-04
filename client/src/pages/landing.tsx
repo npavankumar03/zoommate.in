@@ -1,231 +1,456 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { Link } from "wouter";
 import { Button } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
-import { ThemeToggle } from "@/components/theme-toggle";
 import { useQuery } from "@tanstack/react-query";
+import { motion, AnimatePresence } from "framer-motion";
 import {
-  Mic, Monitor, Zap, Eye, Shield, Clock, CreditCard, Sparkles,
-  ChevronDown, ChevronUp, Check, X, ArrowRight, MessageSquare,
-  FileText, Upload, Play, Users, Star, Headphones, MonitorSmartphone,
-  Download, BookOpen, Search, Target, AlertCircle, Shuffle
+  Zap, ArrowRight, Check, X, Star, Mic, Monitor, Shield, Brain,
+  ChevronDown, ChevronUp, Download, Sparkles, Play, Upload, Target,
+  MessageSquare, Clock, FileText, CreditCard, Eye, Layers,
 } from "lucide-react";
-import { motion } from "framer-motion";
 
-const fadeUp = {
-  hidden: { opacity: 0, y: 30 },
-  visible: { opacity: 1, y: 0, transition: { duration: 0.6, ease: "easeOut" } },
-};
+// ─── Shared styles ─────────────────────────────────────────────────────────
+const CARD = "bg-white border border-gray-200 rounded-2xl shadow-sm";
+const CARD_HOVER = "hover:border-violet-300 hover:shadow-md transition-all duration-300";
+const SECTION = "py-24 px-4 sm:px-6 lg:px-8";
+const MAX = "max-w-7xl mx-auto";
 
-const stagger = {
-  visible: { transition: { staggerChildren: 0.1 } },
-};
+// ─── Typing animation ───────────────────────────────────────────────────────
+function TypingText({ text, speed = 35 }: { text: string; speed?: number }) {
+  const [displayed, setDisplayed] = useState("");
+  const [done, setDone] = useState(false);
+  useEffect(() => {
+    setDisplayed("");
+    setDone(false);
+    let i = 0;
+    const id = setInterval(() => {
+      i++;
+      setDisplayed(text.slice(0, i));
+      if (i >= text.length) { clearInterval(id); setDone(true); }
+    }, speed);
+    return () => clearInterval(id);
+  }, [text, speed]);
+  return (
+    <span>
+      {displayed}
+      {!done && <span className="inline-block w-0.5 h-4 bg-violet-500 ml-0.5 animate-pulse align-middle" />}
+    </span>
+  );
+}
 
+// ─── Glow blob ──────────────────────────────────────────────────────────────
+function Glow({ className }: { className: string }) {
+  return <div className={`absolute rounded-full blur-3xl pointer-events-none ${className}`} />;
+}
+
+// ─── Navbar ─────────────────────────────────────────────────────────────────
 function Navbar() {
-  const scrollTo = (id: string) => {
-    document.getElementById(id)?.scrollIntoView({ behavior: "smooth" });
-  };
+  const [scrolled, setScrolled] = useState(false);
+  useEffect(() => {
+    const fn = () => setScrolled(window.scrollY > 20);
+    window.addEventListener("scroll", fn);
+    return () => window.removeEventListener("scroll", fn);
+  }, []);
+  const scrollTo = (id: string) => document.getElementById(id)?.scrollIntoView({ behavior: "smooth" });
 
   return (
-    <nav className="fixed top-0 left-0 right-0 z-50 backdrop-blur-xl bg-background/80 border-b border-border/50">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <div className="flex items-center justify-between gap-4 h-16">
-          <div className="flex items-center gap-2">
-            <div className="w-8 h-8 rounded-md bg-primary flex items-center justify-center">
-              <Zap className="w-5 h-5 text-primary-foreground" />
-            </div>
-            <span className="text-lg font-bold" data-testid="text-logo">Zoom Mate</span>
+    <nav className={`fixed top-0 left-0 right-0 z-50 transition-all duration-300 ${scrolled ? "bg-white/90 backdrop-blur-xl border-b border-gray-200 shadow-sm" : "bg-transparent"}`}>
+      <div className={`${MAX} flex items-center justify-between gap-4 h-16 px-4 sm:px-6 lg:px-8`}>
+        <div className="flex items-center gap-2.5">
+          <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-violet-500 to-violet-700 flex items-center justify-center shadow-md shadow-violet-200">
+            <Zap className="w-4 h-4 text-white" />
           </div>
-          <div className="hidden md:flex items-center gap-6">
-            <button onClick={() => scrollTo("how-it-works")} className="text-sm text-muted-foreground hover:text-foreground transition-colors" data-testid="link-how-it-works">How it Works</button>
-            <button onClick={() => scrollTo("features")} className="text-sm text-muted-foreground hover:text-foreground transition-colors" data-testid="link-features">Features</button>
-            <button onClick={() => scrollTo("comparison")} className="text-sm text-muted-foreground hover:text-foreground transition-colors" data-testid="link-comparison">Comparison</button>
-            <button onClick={() => scrollTo("pricing")} className="text-sm text-muted-foreground hover:text-foreground transition-colors" data-testid="link-pricing">Pricing</button>
-            <button onClick={() => scrollTo("faq")} className="text-sm text-muted-foreground hover:text-foreground transition-colors" data-testid="link-faq">FAQ</button>
-            <button onClick={() => scrollTo("download")} className="text-sm text-muted-foreground hover:text-foreground transition-colors" data-testid="link-download">Download</button>
-          </div>
-          <div className="flex items-center gap-2">
-            <ThemeToggle />
-            <Link href="/login">
-              <Button variant="ghost" size="sm" data-testid="button-signin">Sign in</Button>
-            </Link>
-            <Link href="/signup">
-              <Button size="sm" data-testid="button-signup">
-                Get Started
-                <ArrowRight className="w-4 h-4 ml-1" />
-              </Button>
-            </Link>
-          </div>
+          <span className="text-gray-900 font-bold text-lg tracking-tight" data-testid="text-logo">Zoom Mate</span>
+        </div>
+
+        <div className="hidden md:flex items-center gap-7">
+          {["how-it-works", "features", "comparison", "pricing", "faq"].map((id) => (
+            <button
+              key={id}
+              onClick={() => scrollTo(id)}
+              className="text-sm text-gray-500 hover:text-gray-900 transition-colors capitalize font-medium"
+            >
+              {id.replace("-", " ")}
+            </button>
+          ))}
+        </div>
+
+        <div className="flex items-center gap-3">
+          <Link href="/login">
+            <button className="text-sm text-gray-500 hover:text-gray-900 transition-colors font-medium" data-testid="button-signin">
+              Sign in
+            </button>
+          </Link>
+          <Link href="/signup">
+            <button
+              className="text-sm font-semibold px-4 py-2 rounded-xl bg-gray-900 text-white hover:bg-gray-800 transition-all duration-200 shadow-sm"
+              data-testid="button-signup"
+            >
+              Get Started
+            </button>
+          </Link>
         </div>
       </div>
     </nav>
   );
 }
 
+// ─── Hero mockup ────────────────────────────────────────────────────────────
+const AI_RESPONSES = [
+  "I've led cross-functional teams across 3 time zones, delivering a platform that reduced our client onboarding time by 40%...",
+  "The core bottleneck was the database layer. I profiled the queries, added composite indexes, and moved hot data to Redis — brought p99 latency from 800ms to 60ms...",
+  "My approach is always to align on the desired outcome first. I scheduled a sync with both stakeholders and built a shared priority matrix...",
+];
+
+function HeroMockup() {
+  const [idx, setIdx] = useState(0);
+  const [key, setKey] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => {
+      setIdx((i) => (i + 1) % AI_RESPONSES.length);
+      setKey((k) => k + 1);
+    }, 6000);
+    return () => clearInterval(id);
+  }, []);
+
+  return (
+    <div className="bg-white border border-gray-200 rounded-2xl overflow-hidden w-full max-w-lg shadow-xl shadow-gray-200/80">
+      {/* Window bar */}
+      <div className="flex items-center gap-2 px-4 py-3 border-b border-gray-100 bg-gray-50">
+        <div className="flex gap-1.5">
+          <span className="w-3 h-3 rounded-full bg-red-400" />
+          <span className="w-3 h-3 rounded-full bg-yellow-400" />
+          <span className="w-3 h-3 rounded-full bg-green-400" />
+        </div>
+        <div className="flex-1 text-center text-xs text-gray-400 font-mono">zoom-mate · live</div>
+        <div className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
+      </div>
+
+      {/* Transcript */}
+      <div className="px-4 pt-4 pb-2">
+        <div className="flex items-start gap-3">
+          <div className="w-7 h-7 rounded-full bg-gray-100 flex items-center justify-center shrink-0 mt-0.5">
+            <Mic className="w-3.5 h-3.5 text-gray-400" />
+          </div>
+          <div>
+            <p className="text-[11px] text-gray-400 font-semibold uppercase tracking-wider mb-1">Interviewer</p>
+            <p className="text-sm text-gray-700 leading-relaxed">
+              "Can you walk me through a situation where you had to handle a difficult technical challenge under pressure?"
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <div className="mx-4 my-2 border-t border-gray-100" />
+
+      {/* AI response */}
+      <div className="px-4 pb-5">
+        <div className="flex items-start gap-3">
+          <div className="w-7 h-7 rounded-full bg-gradient-to-br from-violet-500 to-violet-700 flex items-center justify-center shrink-0 mt-0.5 shadow-sm shadow-violet-200">
+            <Zap className="w-3.5 h-3.5 text-white" />
+          </div>
+          <div className="flex-1">
+            <p className="text-[11px] text-violet-600 font-semibold uppercase tracking-wider mb-1.5">Zoom Mate</p>
+            <p className="text-sm text-gray-800 leading-relaxed">
+              <TypingText key={key} text={AI_RESPONSES[idx]} speed={28} />
+            </p>
+          </div>
+        </div>
+        <div className="flex gap-2 mt-4 ml-10">
+          {["Concise", "STAR", "Detailed"].map((f, i) => (
+            <span
+              key={f}
+              className={`text-[10px] font-semibold px-2.5 py-1 rounded-lg border ${i === 0 ? "bg-violet-50 text-violet-600 border-violet-200" : "bg-gray-50 text-gray-400 border-gray-200"}`}
+            >
+              {f}
+            </span>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Hero ────────────────────────────────────────────────────────────────────
 function HeroSection() {
   return (
-    <section className="relative pt-32 pb-20 overflow-hidden">
-      <div className="absolute inset-0 bg-gradient-to-b from-primary/5 via-transparent to-transparent" />
-      <div className="absolute top-20 left-1/4 w-96 h-96 bg-primary/10 rounded-full blur-3xl" />
-      <div className="absolute top-40 right-1/4 w-72 h-72 bg-chart-2/10 rounded-full blur-3xl" />
-      <div className="absolute bottom-10 left-1/2 w-64 h-64 bg-chart-5/8 rounded-full blur-3xl" />
-      <div className="relative max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+    <section className="relative min-h-screen flex items-center justify-center overflow-hidden bg-white">
+      <Glow className="w-[700px] h-[500px] bg-violet-100 -top-20 left-1/2 -translate-x-1/2 opacity-70" />
+      <Glow className="w-[300px] h-[300px] bg-violet-50 bottom-10 right-0" />
+
+      <div className={`${MAX} ${SECTION} relative z-10 flex flex-col lg:flex-row items-center gap-16 w-full`}>
         <motion.div
-          initial="hidden"
-          animate="visible"
-          variants={stagger}
-          className="text-center max-w-4xl mx-auto"
+          initial={{ opacity: 0, y: 40 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.8, ease: [0.16, 1, 0.3, 1] }}
+          className="flex-1 text-center lg:text-left"
         >
-          <motion.div variants={fadeUp}>
-            <Badge variant="secondary" className="mb-6">
-              <Sparkles className="w-3 h-3 mr-1" />
-              AI-Powered Interview Assistant
-            </Badge>
-          </motion.div>
-          <motion.h1
-            variants={fadeUp}
-            className="text-4xl sm:text-5xl md:text-6xl lg:text-7xl font-bold tracking-tight leading-tight"
-            data-testid="text-hero-title"
-          >
-            Answer every question in your next{" "}
-            <span className="bg-gradient-to-r from-primary via-chart-2 to-chart-5 bg-clip-text text-transparent">
-              interview
+          <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-violet-50 border border-violet-200 text-violet-700 text-xs font-semibold mb-8 uppercase tracking-widest">
+            <Sparkles className="w-3 h-3" />
+            AI Meeting Copilot
+          </div>
+
+          <h1 className="text-5xl sm:text-6xl lg:text-7xl font-black tracking-[-0.03em] leading-[1.04] text-gray-900" data-testid="text-hero-title">
+            Your AI edge
+            <br />
+            in every{" "}
+            <span className="bg-gradient-to-r from-violet-600 via-fuchsia-500 to-violet-400 bg-clip-text text-transparent">
+              conversation
             </span>
-          </motion.h1>
-          <motion.p
-            variants={fadeUp}
-            className="mt-6 text-lg sm:text-xl text-muted-foreground max-w-2xl mx-auto leading-relaxed"
-            data-testid="text-hero-description"
-          >
-            Zoom Mate listens to your conversation, sees your screen and provides instant AI-powered responses exactly when you need them.
-          </motion.p>
-          <motion.div variants={fadeUp} className="mt-10 flex flex-col sm:flex-row items-center justify-center gap-4">
+          </h1>
+
+          <p className="mt-6 text-lg text-gray-500 max-w-lg leading-relaxed mx-auto lg:mx-0" data-testid="text-hero-description">
+            Zoom Mate listens to your meetings in real time, reads your screen, and surfaces the perfect response — instantly and invisibly.
+          </p>
+
+          <div className="mt-10 flex flex-col sm:flex-row items-center gap-4 justify-center lg:justify-start">
             <Link href="/signup">
-              <Button size="lg" className="text-base px-8" data-testid="button-hero-cta">
-                Try Zoom Mate Free
-                <ArrowRight className="w-4 h-4 ml-2" />
-              </Button>
+              <button
+                className="group flex items-center gap-2 px-7 py-3.5 rounded-2xl bg-gray-900 text-white font-bold text-sm hover:bg-gray-800 transition-all duration-200 shadow-lg shadow-gray-900/15"
+                data-testid="button-hero-cta"
+              >
+                Start for Free
+                <ArrowRight className="w-4 h-4 group-hover:translate-x-0.5 transition-transform" />
+              </button>
             </Link>
-            <Badge variant="outline" className="text-muted-foreground">
-              <Clock className="w-3 h-3 mr-1" />
-              5 free minutes every hour
-            </Badge>
-          </motion.div>
+            <div className="flex items-center gap-2 text-sm text-gray-400">
+              <Clock className="w-3.5 h-3.5" />
+              5 free minutes every hour · no card required
+            </div>
+          </div>
+
+          <div className="mt-12 flex items-center gap-8 justify-center lg:justify-start">
+            {[["10K+", "Active users"], ["<2s", "Avg response"], ["100%", "Invisible"]].map(([val, label]) => (
+              <div key={label}>
+                <p className="text-2xl font-black text-gray-900">{val}</p>
+                <p className="text-xs text-gray-400 mt-0.5">{label}</p>
+              </div>
+            ))}
+          </div>
         </motion.div>
 
         <motion.div
-          initial={{ opacity: 0, y: 60 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.8, delay: 0.4 }}
-          className="mt-16 max-w-5xl mx-auto"
+          initial={{ opacity: 0, x: 60 }}
+          animate={{ opacity: 1, x: 0 }}
+          transition={{ duration: 1, delay: 0.2, ease: [0.16, 1, 0.3, 1] }}
+          className="flex-1 flex justify-center lg:justify-end w-full"
         >
-          <div className="rounded-xl border bg-gradient-to-b from-primary/20 to-transparent p-1">
-            <div className="bg-card rounded-md p-6 sm:p-8">
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                <div className="flex flex-col items-center text-center p-4" data-testid="card-feature-listening">
-                  <div className="w-12 h-12 rounded-md bg-primary/10 flex items-center justify-center mb-3">
-                    <Mic className="w-6 h-6 text-primary" />
-                  </div>
-                  <h3 className="font-semibold text-sm">Real-time Listening</h3>
-                  <p className="text-xs text-muted-foreground mt-1">Captures every word in your conversation</p>
-                </div>
-                <div className="flex flex-col items-center text-center p-4" data-testid="card-feature-screen">
-                  <div className="w-12 h-12 rounded-md bg-chart-2/10 flex items-center justify-center mb-3">
-                    <Monitor className="w-6 h-6 text-chart-2" />
-                  </div>
-                  <h3 className="font-semibold text-sm">Screen Analysis</h3>
-                  <p className="text-xs text-muted-foreground mt-1">Sees what you see for context-aware answers</p>
-                </div>
-                <div className="flex flex-col items-center text-center p-4" data-testid="card-feature-responses">
-                  <div className="w-12 h-12 rounded-md bg-chart-3/10 flex items-center justify-center mb-3">
-                    <Zap className="w-6 h-6 text-chart-3" />
-                  </div>
-                  <h3 className="font-semibold text-sm">Instant Responses</h3>
-                  <p className="text-xs text-muted-foreground mt-1">Get perfect answers exactly when needed</p>
-                </div>
-              </div>
-            </div>
-          </div>
+          <HeroMockup />
         </motion.div>
       </div>
     </section>
   );
 }
 
-function PainPointsSection() {
-  const painPoints = [
-    { num: "01", title: "Your Mind Goes Blank", desc: "Someone asks a tough question and suddenly you can't think. You freeze. You stutter.", icon: AlertCircle },
-    { num: "02", title: "You Ramble and Ramble", desc: "You start answering but can't find the point. Three minutes later, everyone looks confused.", icon: MessageSquare },
-    { num: "03", title: "You Forget Important Details", desc: "The interviewer asks for that one metric. You know you prepared it. But right now? Gone.", icon: BookOpen },
-    { num: "04", title: "You Waste Time Searching", desc: "While everyone waits, you're frantically searching your documents. The moment passes.", icon: Search },
+// ─── Marquee ─────────────────────────────────────────────────────────────────
+function Marquee() {
+  const items = [
+    "Real-time transcription", "Screen analysis", "Invisible overlay",
+    "Custom knowledge", "STAR format", "Instant responses",
+    "Sales calls", "Client demos", "Team standups", "Strategy sessions",
   ];
-
+  const doubled = [...items, ...items];
   return (
-    <section className="py-20">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+    <div className="bg-gray-50 border-y border-gray-200 py-4 overflow-hidden">
+      <motion.div
+        animate={{ x: ["0%", "-50%"] }}
+        transition={{ duration: 30, ease: "linear", repeat: Infinity }}
+        className="flex gap-10 whitespace-nowrap"
+      >
+        {doubled.map((item, i) => (
+          <span key={i} className="flex items-center gap-3 text-sm text-gray-400 font-medium shrink-0">
+            <span className="w-1 h-1 rounded-full bg-violet-400" />
+            {item}
+          </span>
+        ))}
+      </motion.div>
+    </div>
+  );
+}
+
+// ─── Features bento ──────────────────────────────────────────────────────────
+function FeaturesSection() {
+  return (
+    <section id="features" className={`${SECTION} bg-white`}>
+      <div className={MAX}>
         <motion.div
-          initial="hidden"
-          whileInView="visible"
-          viewport={{ once: true, margin: "-100px" }}
-          variants={stagger}
+          initial={{ opacity: 0, y: 30 }}
+          whileInView={{ opacity: 1, y: 0 }}
+          viewport={{ once: true }}
           className="text-center mb-16"
         >
-          <motion.h2 variants={fadeUp} className="text-3xl sm:text-4xl font-bold" data-testid="text-pain-title">
-            We've All Been There...
-          </motion.h2>
-          <motion.p variants={fadeUp} className="mt-4 text-muted-foreground text-lg max-w-2xl mx-auto">
-            Your mind goes blank. You forget what you wanted to say. Everyone's waiting for your answer.
-          </motion.p>
+          <p className="text-xs font-bold uppercase tracking-[0.2em] text-violet-600 mb-4">Features</p>
+          <h2 className="text-4xl sm:text-5xl font-black tracking-[-0.03em] text-gray-900" data-testid="text-features-title">
+            Built for the moments
+            <br />
+            <span className="text-gray-400">that actually matter</span>
+          </h2>
         </motion.div>
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-          {painPoints.map((point, i) => (
-            <motion.div
-              key={i}
-              initial={{ opacity: 0, y: 20 }}
-              whileInView={{ opacity: 1, y: 0 }}
-              viewport={{ once: true }}
-              transition={{ delay: i * 0.1 }}
-            >
-              <Card className="p-6 h-full hover-elevate" data-testid={`card-pain-${i}`}>
-                <span className="text-4xl font-bold text-primary/20">{point.num}</span>
-                <point.icon className="w-5 h-5 text-muted-foreground mt-2 mb-1" />
-                <h3 className="font-semibold mt-2 mb-2">{point.title}</h3>
-                <p className="text-sm text-muted-foreground">{point.desc}</p>
-              </Card>
-            </motion.div>
-          ))}
+
+        <div className="grid grid-cols-1 md:grid-cols-6 gap-4 auto-rows-[200px]">
+
+          {/* Large — Screen awareness */}
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true }}
+            className={`md:col-span-4 md:row-span-2 ${CARD} ${CARD_HOVER} p-8 flex flex-col justify-between relative overflow-hidden`}
+          >
+            <Glow className="w-64 h-64 bg-violet-100 -bottom-20 -right-20 opacity-60" />
+            <div>
+              <div className="w-12 h-12 rounded-2xl bg-violet-50 border border-violet-100 flex items-center justify-center mb-5">
+                <Monitor className="w-6 h-6 text-violet-600" />
+              </div>
+              <h3 className="text-2xl font-bold text-gray-900 mb-3">Full Screen Awareness</h3>
+              <p className="text-gray-500 leading-relaxed max-w-sm">
+                Zoom Mate sees exactly what's on your screen — shared slides, code, documents — and factors it all into every response. Context-perfect, every time.
+              </p>
+            </div>
+            <div className="flex gap-2 mt-4">
+              {["Slide deck", "Code review", "Data report"].map((t) => (
+                <span key={t} className="text-xs px-3 py-1.5 rounded-lg bg-gray-100 text-gray-500 border border-gray-200 font-medium">{t}</span>
+              ))}
+            </div>
+          </motion.div>
+
+          {/* Small — Invisible */}
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true }}
+            transition={{ delay: 0.1 }}
+            className={`md:col-span-2 ${CARD} ${CARD_HOVER} p-6 flex flex-col justify-between`}
+          >
+            <div className="w-11 h-11 rounded-xl bg-cyan-50 border border-cyan-100 flex items-center justify-center">
+              <Eye className="w-5 h-5 text-cyan-600" />
+            </div>
+            <div>
+              <h3 className="text-lg font-bold text-gray-900 mb-1.5">Completely Invisible</h3>
+              <p className="text-sm text-gray-500">Hidden during screen sharing. Nobody knows it's there.</p>
+            </div>
+          </motion.div>
+
+          {/* Small — Real-time */}
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true }}
+            transition={{ delay: 0.2 }}
+            className={`md:col-span-2 ${CARD} ${CARD_HOVER} p-6 flex flex-col justify-between`}
+          >
+            <div className="w-11 h-11 rounded-xl bg-emerald-50 border border-emerald-100 flex items-center justify-center">
+              <Mic className="w-5 h-5 text-emerald-600" />
+            </div>
+            <div>
+              <h3 className="text-lg font-bold text-gray-900 mb-1.5">Real-time Listening</h3>
+              <p className="text-sm text-gray-500">Captures both sides of every conversation as it happens.</p>
+            </div>
+          </motion.div>
+
+          {/* Large — Custom knowledge */}
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true }}
+            transition={{ delay: 0.15 }}
+            className={`md:col-span-3 ${CARD} ${CARD_HOVER} p-8 flex flex-col justify-between relative overflow-hidden`}
+          >
+            <Glow className="w-48 h-48 bg-fuchsia-100 -top-10 -right-10 opacity-50" />
+            <div>
+              <div className="w-12 h-12 rounded-2xl bg-fuchsia-50 border border-fuchsia-100 flex items-center justify-center mb-5">
+                <Brain className="w-6 h-6 text-fuchsia-600" />
+              </div>
+              <h3 className="text-xl font-bold text-gray-900 mb-3">Trained on Your Story</h3>
+              <p className="text-gray-500 text-sm leading-relaxed">
+                Upload your background materials and notes. Zoom Mate speaks in your voice with your specific details — never generic answers.
+              </p>
+            </div>
+            <div className="flex items-center gap-2 mt-4">
+              <FileText className="w-4 h-4 text-gray-300" />
+              <span className="text-xs text-gray-400">Supports PDFs, DOCX, plain text &amp; more</span>
+            </div>
+          </motion.div>
+
+          {/* Large — Flexible formats */}
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true }}
+            transition={{ delay: 0.2 }}
+            className={`md:col-span-3 ${CARD} ${CARD_HOVER} p-8 flex flex-col justify-between relative overflow-hidden`}
+          >
+            <Glow className="w-48 h-48 bg-orange-100 -bottom-10 -left-10 opacity-50" />
+            <div>
+              <div className="w-12 h-12 rounded-2xl bg-orange-50 border border-orange-100 flex items-center justify-center mb-5">
+                <Layers className="w-6 h-6 text-orange-500" />
+              </div>
+              <h3 className="text-xl font-bold text-gray-900 mb-3">Flexible Response Styles</h3>
+              <p className="text-gray-500 text-sm leading-relaxed">
+                Concise for quick facts. STAR for structured stories. Detailed for deep dives. Switch formats mid-session without breaking flow.
+              </p>
+            </div>
+            <div className="flex gap-2 mt-4">
+              {["Concise", "STAR", "Detailed", "Bullet"].map((f) => (
+                <span key={f} className="text-xs px-2.5 py-1 rounded-lg bg-orange-50 text-orange-500 border border-orange-100 font-medium">{f}</span>
+              ))}
+            </div>
+          </motion.div>
+
+          {/* Wide — Pay per use */}
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true }}
+            transition={{ delay: 0.25 }}
+            className={`md:col-span-6 ${CARD} ${CARD_HOVER} p-7 flex flex-col sm:flex-row items-center justify-between gap-6`}
+          >
+            <div className="flex items-center gap-5">
+              <div className="w-12 h-12 rounded-2xl bg-violet-50 border border-violet-100 flex items-center justify-center shrink-0">
+                <CreditCard className="w-6 h-6 text-violet-600" />
+              </div>
+              <div>
+                <h3 className="text-xl font-bold text-gray-900">Pay Only for What You Use</h3>
+                <p className="text-gray-500 text-sm mt-1">No wasted credits. No monthly minimums. Minutes never expire. Zoom Mate only bills when it's actively helping you.</p>
+              </div>
+            </div>
+            <Link href="/signup">
+              <button className="shrink-0 flex items-center gap-2 px-5 py-2.5 rounded-xl bg-gray-900 hover:bg-gray-800 text-white text-sm font-semibold transition-all">
+                View Pricing <ArrowRight className="w-4 h-4" />
+              </button>
+            </Link>
+          </motion.div>
         </div>
       </div>
     </section>
   );
 }
 
+// ─── How it works ────────────────────────────────────────────────────────────
 function HowItWorksSection() {
   const steps = [
-    { icon: Target, title: "Pick Your Copilot", desc: "Choose the type of assistance you need -- interview prep, sales call support, or general meeting help. Zoom Mate adapts to your scenario.", color: "text-primary", bg: "bg-primary/10" },
-    { icon: Upload, title: "Add Meeting Data", desc: "Upload your resume, job descriptions, product docs, or talking points. Zoom Mate learns your story so it can give you personalized answers.", color: "text-chart-2", bg: "bg-chart-2/10" },
-    { icon: Play, title: "Launch and Go", desc: "Start your session and Zoom Mate runs invisibly in the background. It listens, analyzes, and delivers the perfect response in real time.", color: "text-chart-3", bg: "bg-chart-3/10" },
+    { n: "01", icon: Target, title: "Choose your setup", desc: "Pick the type of copilot — sales call, client demo, team standup, or custom. Zoom Mate adapts its behaviour to your scenario.", color: "text-violet-600", bg: "bg-violet-50", border: "border-violet-100" },
+    { n: "02", icon: Upload, title: "Add your context", desc: "Upload documents, talking points, or background materials. The more context you give, the more personalised every answer becomes.", color: "text-cyan-600", bg: "bg-cyan-50", border: "border-cyan-100" },
+    { n: "03", icon: Zap, title: "Perform with confidence", desc: "Launch your session. Zoom Mate runs silently, listens to everything, reads your screen, and surfaces the right answer exactly when you need it.", color: "text-fuchsia-600", bg: "bg-fuchsia-50", border: "border-fuchsia-100" },
   ];
 
   return (
-    <section id="how-it-works" className="py-20 bg-card/50">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+    <section id="how-it-works" className={`${SECTION} bg-gray-50`}>
+      <div className={MAX}>
         <motion.div
-          initial="hidden"
-          whileInView="visible"
-          viewport={{ once: true, margin: "-100px" }}
-          variants={stagger}
-          className="text-center mb-16"
+          initial={{ opacity: 0, y: 30 }}
+          whileInView={{ opacity: 1, y: 0 }}
+          viewport={{ once: true }}
+          className="text-center mb-20"
         >
-          <motion.h2 variants={fadeUp} className="text-3xl sm:text-4xl font-bold" data-testid="text-how-title">
-            How It Works
-          </motion.h2>
-          <motion.p variants={fadeUp} className="mt-4 text-muted-foreground text-lg">
-            Get started in three simple steps. No complicated setup required.
-          </motion.p>
+          <p className="text-xs font-bold uppercase tracking-[0.2em] text-violet-600 mb-4">How it works</p>
+          <h2 className="text-4xl sm:text-5xl font-black tracking-[-0.03em] text-gray-900" data-testid="text-how-title">
+            Three steps to never
+            <br />
+            <span className="text-gray-400">lose the room again</span>
+          </h2>
         </motion.div>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 relative">
+          <div className="hidden md:block absolute top-12 left-[calc(16.67%+2rem)] right-[calc(16.67%+2rem)] h-px bg-gradient-to-r from-transparent via-violet-200 to-transparent" />
           {steps.map((step, i) => (
             <motion.div
               key={i}
@@ -233,17 +458,16 @@ function HowItWorksSection() {
               whileInView={{ opacity: 1, y: 0 }}
               viewport={{ once: true }}
               transition={{ delay: i * 0.15 }}
+              className={`${CARD} p-8 flex flex-col`}
             >
-              <Card className="p-8 text-center h-full" data-testid={`card-step-${i}`}>
-                <div className="flex justify-center mb-6">
-                  <Badge variant="outline" className="text-xs px-3">Step {i + 1}</Badge>
+              <div className="flex items-center justify-between mb-8">
+                <div className={`w-12 h-12 rounded-2xl ${step.bg} border ${step.border} flex items-center justify-center`}>
+                  <step.icon className={`w-5 h-5 ${step.color}`} />
                 </div>
-                <div className={`w-16 h-16 rounded-md ${step.bg} flex items-center justify-center mx-auto mb-4`}>
-                  <step.icon className={`w-8 h-8 ${step.color}`} />
-                </div>
-                <h3 className="text-xl font-semibold mb-3">{step.title}</h3>
-                <p className="text-muted-foreground text-sm leading-relaxed">{step.desc}</p>
-              </Card>
+                <span className="text-5xl font-black text-gray-100">{step.n}</span>
+              </div>
+              <h3 className="text-xl font-bold text-gray-900 mb-3">{step.title}</h3>
+              <p className="text-sm text-gray-500 leading-relaxed">{step.desc}</p>
             </motion.div>
           ))}
         </div>
@@ -252,259 +476,378 @@ function HowItWorksSection() {
   );
 }
 
-function SolutionSection() {
-  return (
-    <section className="py-20">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <motion.div
-          initial="hidden"
-          whileInView="visible"
-          viewport={{ once: true, margin: "-100px" }}
-          variants={stagger}
-          className="text-center max-w-3xl mx-auto"
-        >
-          <motion.h2 variants={fadeUp} className="text-3xl sm:text-4xl font-bold" data-testid="text-solution-title">
-            Zoom Mate Gives You The Perfect Answer
-          </motion.h2>
-          <motion.p variants={fadeUp} className="mt-4 text-muted-foreground text-lg leading-relaxed">
-            Zoom Mate listens to your conversation, analyzes your screen, and tells you exactly what to say. No more freezing, no more rambling, no more missed opportunities.
-          </motion.p>
-          <motion.div variants={fadeUp} className="mt-8 flex flex-col sm:flex-row items-center justify-center gap-4">
-            <Link href="/signup">
-              <Button size="lg" data-testid="button-solution-cta">
-                Get Started Now
-                <ArrowRight className="w-4 h-4 ml-2" />
-              </Button>
-            </Link>
-          </motion.div>
-        </motion.div>
-      </div>
-    </section>
-  );
+// ─── Code auto-type demo ─────────────────────────────────────────────────────
+const CODE_TARGET = `def two_sum(nums, target):
+    seen = {}
+    for i, num in enumerate(nums):
+        complement = target - num
+        if complement in seen:
+            return [seen[complement], i]
+        seen[num] = i
+    return []`;
+
+// Sequence: [char, delay_ms] — negative char = backspace that many times
+type Step = [string, number];
+
+function buildHumanSteps(target: string): Step[] {
+  const steps: Step[] = [];
+  let i = 0;
+  while (i < target.length) {
+    const ch = target[i];
+    // Occasionally insert a typo then backspace
+    if (Math.random() < 0.06 && ch !== "\n" && ch !== " ") {
+      const typos = "qwryuopsdfghjklzxcvbnm";
+      const wrong = typos[Math.floor(Math.random() * typos.length)];
+      steps.push([wrong, 60 + Math.random() * 60]);
+      steps.push(["\b", 80 + Math.random() * 80]);
+    }
+    // Vary speed: fast on common chars, slower on special
+    const base = ch === "\n" ? 120 : ch === " " ? 40 : 55;
+    steps.push([ch, base + Math.random() * base * 0.8]);
+    i++;
+  }
+  return steps;
 }
 
-function FeaturesSection() {
-  const features = [
-    { icon: Monitor, title: "Sees Your Screen", desc: "It analyzes everything on your screen so you get answers based on what you're both looking at.", color: "text-primary" },
-    { icon: Shuffle, title: "Switch Styles Anytime", desc: "Need a quick answer? Use short mode. Want a detailed story? Switch to STAR format.", color: "text-chart-4" },
-    { icon: Mic, title: "Listens Everything", desc: "Zoom Mate listens to the entire conversation -- your answers, their follow-ups, all the context.", color: "text-chart-2" },
-    { icon: CreditCard, title: "Pay for What You Use", desc: "No expensive monthly subscriptions. No wasted credits. Pay only for the minutes you actually use.", color: "text-chart-3" },
-    { icon: Shield, title: "Invisible to Everyone", desc: "Completely hidden when you share your screen. Nobody sees it, nobody knows you're using it.", color: "text-chart-5" },
-    { icon: FileText, title: "Custom Knowledge", desc: "Upload your resume, job descriptions, notes, or any information. It learns YOUR story.", color: "text-primary" },
-  ];
+function CodeAutoTypeDemo() {
+  const [displayed, setDisplayed] = useState("");
+  const [phase, setPhase] = useState<"typing" | "done" | "pausing">("typing");
+  const stepsRef = useRef<Step[]>([]);
+  const idxRef = useRef(0);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const runNext = () => {
+    if (idxRef.current >= stepsRef.current.length) {
+      setPhase("pausing");
+      timerRef.current = setTimeout(() => {
+        setDisplayed("");
+        idxRef.current = 0;
+        stepsRef.current = buildHumanSteps(CODE_TARGET);
+        setPhase("typing");
+        scheduleNext();
+      }, 3000);
+      return;
+    }
+    const [ch, delay] = stepsRef.current[idxRef.current++];
+    timerRef.current = setTimeout(() => {
+      setDisplayed((prev) => ch === "\b" ? prev.slice(0, -1) : prev + ch);
+      runNext();
+    }, delay);
+  };
+
+  const scheduleNext = () => {
+    timerRef.current = setTimeout(runNext, 50);
+  };
+
+  useEffect(() => {
+    stepsRef.current = buildHumanSteps(CODE_TARGET);
+    scheduleNext();
+    return () => { if (timerRef.current) clearTimeout(timerRef.current); };
+  }, []);
+
+  // Syntax highlight helpers
+  const keywords = /\b(def|return|for|in|if)\b/g;
+  const strings = /(["'])(?:(?=(\\?))\2.)*?\1/g;
+  const comments = /#.*/g;
+  const numbers = /\b\d+\b/g;
+
+  const highlight = (code: string) => {
+    return code
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(comments, (m) => `<span style="color:#6a9955">${m}</span>`)
+      .replace(strings, (m) => `<span style="color:#ce9178">${m}</span>`)
+      .replace(keywords, (m) => `<span style="color:#c586c0">${m}</span>`)
+      .replace(numbers, (m) => `<span style="color:#b5cea8">${m}</span>`);
+  };
+
+  const lines = displayed.split("\n");
 
   return (
-    <section id="features" className="py-20 bg-card/50">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+    <section className={`${SECTION} bg-white`}>
+      <div className={MAX}>
         <motion.div
-          initial="hidden"
-          whileInView="visible"
-          viewport={{ once: true, margin: "-100px" }}
-          variants={stagger}
-          className="text-center mb-16"
-        >
-          <motion.h2 variants={fadeUp} className="text-3xl sm:text-4xl font-bold" data-testid="text-features-title">
-            Why You'll Never Go Back
-          </motion.h2>
-          <motion.p variants={fadeUp} className="mt-4 text-muted-foreground text-lg">
-            Zoom Mate works differently than every other tool -- and that's the point.
-          </motion.p>
-        </motion.div>
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-          {features.map((feature, i) => (
-            <motion.div
-              key={i}
-              initial={{ opacity: 0, y: 20 }}
-              whileInView={{ opacity: 1, y: 0 }}
-              viewport={{ once: true }}
-              transition={{ delay: i * 0.08 }}
-            >
-              <Card className="p-6 h-full hover-elevate" data-testid={`card-feature-${i}`}>
-                <feature.icon className={`w-8 h-8 ${feature.color} mb-4`} />
-                <h3 className="font-semibold mb-2">{feature.title}</h3>
-                <p className="text-sm text-muted-foreground">{feature.desc}</p>
-              </Card>
-            </motion.div>
-          ))}
-        </div>
-      </div>
-    </section>
-  );
-}
-
-function ComparisonSection() {
-  const featureList = [
-    "Listens to entire conversation",
-    "Multiple response types",
-    "Pay only for what you use",
-    "Custom knowledge",
-    "Structured templates (STAR)",
-    "Works for interviews/sales/meetings",
-    "Invisible to screen sharing",
-    "Screen analyzer for coding",
-    "Works on mobile",
-    "Free to start",
-  ];
-
-  const competitors = [
-    { name: "Zoom Mate", checks: [true, true, true, true, true, true, true, true, true, true] },
-    { name: "Final Round AI", checks: [false, false, false, true, true, true, true, false, false, false] },
-    { name: "Cluely", checks: [true, false, false, true, false, true, true, true, false, false] },
-    { name: "Parakeet AI", checks: [false, false, false, true, false, true, true, false, true, false] },
-  ];
-
-  return (
-    <section id="comparison" className="py-20">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <motion.div
-          initial="hidden"
-          whileInView="visible"
-          viewport={{ once: true, margin: "-100px" }}
-          variants={stagger}
-          className="text-center mb-16"
-        >
-          <motion.h2 variants={fadeUp} className="text-3xl sm:text-4xl font-bold" data-testid="text-comparison-title">
-            How We Compare
-          </motion.h2>
-          <motion.p variants={fadeUp} className="mt-4 text-muted-foreground text-lg">
-            See why smart people choose Zoom Mate over everything else.
-          </motion.p>
-        </motion.div>
-        <motion.div
-          initial={{ opacity: 0, y: 20 }}
+          initial={{ opacity: 0, y: 30 }}
           whileInView={{ opacity: 1, y: 0 }}
           viewport={{ once: true }}
+          className="text-center mb-16"
         >
-          <Card className="overflow-x-auto">
+          <p className="text-xs font-bold uppercase tracking-[0.2em] text-violet-600 mb-4">Desktop App</p>
+          <h2 className="text-4xl sm:text-5xl font-black tracking-[-0.03em] text-gray-900">
+            Types code for you.
+            <br />
+            <span className="text-gray-400">Looks completely human.</span>
+          </h2>
+          <p className="mt-5 text-gray-500 text-lg max-w-xl mx-auto leading-relaxed">
+            The desktop app reads the question, generates the solution, then types it into any coding assessment — with natural speed variation, pauses, and corrections. Proctoring software sees a human.
+          </p>
+        </motion.div>
+
+        <motion.div
+          initial={{ opacity: 0, y: 40 }}
+          whileInView={{ opacity: 1, y: 0 }}
+          viewport={{ once: true }}
+          transition={{ delay: 0.15 }}
+          className="max-w-3xl mx-auto"
+        >
+          {/* Outer card — looks like a browser/app window */}
+          <div className="rounded-2xl border border-gray-200 shadow-xl shadow-gray-200/60 overflow-hidden">
+            {/* Title bar */}
+            <div className="flex items-center gap-2 px-4 py-3 bg-gray-100 border-b border-gray-200">
+              <div className="flex gap-1.5">
+                <span className="w-3 h-3 rounded-full bg-red-400" />
+                <span className="w-3 h-3 rounded-full bg-yellow-400" />
+                <span className="w-3 h-3 rounded-full bg-green-400" />
+              </div>
+              <span className="flex-1 text-center text-xs text-gray-400 font-mono">Assessment · Python · Two Sum</span>
+              {/* Zoom Mate status pill */}
+              <span className="flex items-center gap-1.5 text-[10px] font-bold text-violet-600 bg-violet-50 border border-violet-200 px-2 py-0.5 rounded-full">
+                <span className="w-1.5 h-1.5 rounded-full bg-violet-500 animate-pulse" />
+                ZM typing
+              </span>
+            </div>
+
+            {/* Editor area */}
+            <div className="bg-[#1e1e1e] p-5 min-h-[280px] font-mono text-sm leading-6">
+              {/* Line numbers + code */}
+              <div className="flex gap-4">
+                <div className="select-none text-right" style={{ color: "#858585", minWidth: 24 }}>
+                  {lines.map((_, i) => (
+                    <div key={i}>{i + 1}</div>
+                  ))}
+                </div>
+                <div className="flex-1 overflow-x-auto">
+                  {lines.map((line, i) => (
+                    <div key={i}>
+                      <span
+                        dangerouslySetInnerHTML={{ __html: highlight(line) || "&nbsp;" }}
+                        style={{ color: "#d4d4d4" }}
+                      />
+                      {/* Blinking cursor on last line */}
+                      {i === lines.length - 1 && phase !== "pausing" && (
+                        <span
+                          className="inline-block w-[2px] h-[1em] align-middle ml-px animate-pulse"
+                          style={{ backgroundColor: "#aeafad" }}
+                        />
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {/* Status bar */}
+            <div className="flex items-center justify-between px-4 py-2 bg-[#007acc] text-white text-[10px] font-medium">
+              <span>Python 3.11</span>
+              <span className="flex items-center gap-2">
+                <span className="opacity-70">Ln {lines.length}, Col {(lines[lines.length - 1]?.length ?? 0) + 1}</span>
+                {phase === "typing" && (
+                  <span className="flex items-center gap-1 bg-white/20 px-2 py-0.5 rounded-full">
+                    <Zap className="w-2.5 h-2.5" /> Zoom Mate active
+                  </span>
+                )}
+                {phase === "pausing" && (
+                  <span className="bg-white/20 px-2 py-0.5 rounded-full">Solution complete ✓</span>
+                )}
+              </span>
+            </div>
+          </div>
+
+          {/* Caption pills */}
+          <div className="flex flex-wrap justify-center gap-3 mt-6">
+            {[
+              "Variable typing speed",
+              "Natural typos & corrections",
+              "Bypasses keystroke analysis",
+              "Works on HackerRank, LeetCode & more",
+            ].map((label) => (
+              <span key={label} className="text-xs px-3 py-1.5 rounded-full bg-gray-100 text-gray-500 border border-gray-200 font-medium">
+                {label}
+              </span>
+            ))}
+          </div>
+        </motion.div>
+      </div>
+    </section>
+  );
+}
+
+// ─── Stats ────────────────────────────────────────────────────────────────────
+function StatsSection() {
+  const stats = [
+    { val: "10,000+", label: "Sessions completed" },
+    { val: "<2s", label: "Average response time" },
+    { val: "6+", label: "Response formats" },
+    { val: "100%", label: "Invisible to others" },
+  ];
+  return (
+    <div className="bg-white border-y border-gray-200">
+      <div className={`${MAX} px-4 sm:px-6 lg:px-8 py-12 grid grid-cols-2 md:grid-cols-4 gap-8`}>
+        {stats.map((s, i) => (
+          <motion.div
+            key={i}
+            initial={{ opacity: 0, y: 20 }}
+            whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true }}
+            transition={{ delay: i * 0.1 }}
+            className="text-center"
+          >
+            <p className="text-3xl sm:text-4xl font-black text-gray-900 mb-1">{s.val}</p>
+            <p className="text-sm text-gray-400">{s.label}</p>
+          </motion.div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── Comparison ───────────────────────────────────────────────────────────────
+function ComparisonSection() {
+  const rows = [
+    { feature: "Real-time AI responses",          web: true,  desktop: true  },
+    { feature: "Live conversation transcript",    web: true,  desktop: true  },
+    { feature: "Custom knowledge upload",         web: true,  desktop: true  },
+    { feature: "Multiple response formats",       web: true,  desktop: true  },
+    { feature: "Screen analyzer",                 web: true,  desktop: true  },
+    { feature: "Works on mobile",                 web: true,  desktop: false },
+    { feature: "No install required",             web: true,  desktop: false },
+    { feature: "Auto-types answers into any app", web: false, desktop: true  },
+    { feature: "Captures system audio",           web: false, desktop: true  },
+    { feature: "Invisible overlay (OS level)",    web: false, desktop: true  },
+    { feature: "Live code editor & auto-type",    web: false, desktop: true  },
+    { feature: "Keyboard shortcuts",              web: false, desktop: true  },
+  ];
+
+  return (
+    <section id="comparison" className={`${SECTION} bg-gray-50`}>
+      <div className={MAX}>
+        <motion.div
+          initial={{ opacity: 0, y: 30 }}
+          whileInView={{ opacity: 1, y: 0 }}
+          viewport={{ once: true }}
+          className="text-center mb-16"
+        >
+          <p className="text-xs font-bold uppercase tracking-[0.2em] text-violet-600 mb-4">Web vs Desktop</p>
+          <h2 className="text-4xl sm:text-5xl font-black tracking-[-0.03em] text-gray-900" data-testid="text-comparison-title">
+            Pick the right tool
+            <br />
+            <span className="text-gray-400">for your situation</span>
+          </h2>
+        </motion.div>
+
+        <motion.div initial={{ opacity: 0, y: 20 }} whileInView={{ opacity: 1, y: 0 }} viewport={{ once: true }}>
+          <div className={`${CARD} overflow-x-auto`}>
             <table className="w-full text-sm" data-testid="table-comparison">
               <thead>
-                <tr className="border-b">
-                  <th className="text-left p-4 font-semibold">Features</th>
-                  {competitors.map((c) => (
-                    <th key={c.name} className={`p-4 font-semibold text-center ${c.name === "Zoom Mate" ? "text-primary" : "text-muted-foreground"}`}>
-                      {c.name}
-                    </th>
-                  ))}
+                <tr className="border-b border-gray-100">
+                  <th className="text-left p-5 text-gray-400 font-medium w-1/2">Feature</th>
+                  <th className="p-5 font-bold text-center text-violet-600">
+                    <span className="inline-flex flex-col items-center gap-1">
+                      <Monitor className="w-4 h-4" />
+                      Web App
+                    </span>
+                  </th>
+                  <th className="p-5 font-bold text-center text-gray-700">
+                    <span className="inline-flex flex-col items-center gap-1">
+                      <Download className="w-4 h-4" />
+                      Desktop App
+                    </span>
+                  </th>
                 </tr>
               </thead>
               <tbody>
-                {featureList.map((feature, fi) => (
-                  <tr key={fi} className="border-b last:border-b-0">
-                    <td className="p-4 text-muted-foreground">{feature}</td>
-                    {competitors.map((c) => (
-                      <td key={c.name} className="p-4 text-center">
-                        {c.checks[fi] ? (
-                          <Check className={`w-5 h-5 mx-auto ${c.name === "Zoom Mate" ? "text-primary" : "text-chart-3"}`} />
-                        ) : (
-                          <X className="w-5 h-5 mx-auto text-muted-foreground/30" />
-                        )}
-                      </td>
-                    ))}
+                {rows.map((row, i) => (
+                  <tr key={i} className="border-b border-gray-50 last:border-b-0 hover:bg-gray-50/60 transition-colors">
+                    <td className="p-5 text-gray-600">{row.feature}</td>
+                    <td className="p-5 text-center">
+                      {row.web
+                        ? <Check className="w-5 h-5 mx-auto text-violet-500" />
+                        : <X className="w-5 h-5 mx-auto text-gray-200" />}
+                    </td>
+                    <td className="p-5 text-center">
+                      {row.desktop
+                        ? <Check className="w-5 h-5 mx-auto text-gray-700" />
+                        : <X className="w-5 h-5 mx-auto text-gray-200" />}
+                    </td>
                   </tr>
                 ))}
               </tbody>
             </table>
-          </Card>
+          </div>
+
+          <p className="text-center text-xs text-gray-400 mt-4">
+            Desktop app coming soon · <Link href="/signup" className="text-violet-600 hover:underline">Use the web app now for free</Link>
+          </p>
         </motion.div>
       </div>
     </section>
   );
 }
 
+// ─── Pricing ─────────────────────────────────────────────────────────────────
 function PricingSection() {
   const [loadingPlan, setLoadingPlan] = useState<string | null>(null);
-  const { data: products = [] } = useQuery<any[]>({
-    queryKey: ["/api/stripe/products"],
-  });
+  const { data: products = [] } = useQuery<any[]>({ queryKey: ["/api/stripe/products"] });
 
   const plans = [
     {
       name: "Free",
       price: "$0",
-      period: "Free 5 Min Per Hour",
-      desc: "Perfect for testing or quick help.",
-      cta: "Get Started",
-      features: ["Real-time Transcription", "Instant AI Responses", "Invisible to screen sharing", "Screen Analyzer", "Custom Knowledge Support", "Customized Response Formats"],
+      period: "5 min/hr · forever",
+      desc: "Try it out. No commitment.",
+      cta: "Get Started Free",
+      features: ["Real-time transcription", "Instant AI responses", "Invisible overlay", "Screen analyzer", "Custom knowledge", "Multiple formats"],
       popular: false,
       stripePlan: "free",
     },
     {
       name: "Standard",
       price: "$14.99",
-      period: "Per Month",
-      desc: "Best for interviews and important calls.",
+      period: "per month",
+      desc: "For professionals who need an edge.",
       cta: "Subscribe Now",
-      features: ["Real-time Transcription", "Instant AI Responses", "Invisible to screen sharing", "Screen Analyzer", "Custom Knowledge Support", "Customized Response Formats", "Priority Support", "Minutes never expire"],
+      features: ["Everything in Free", "Priority response speed", "Minutes never expire", "Priority support", "Unlimited sessions", "Advanced formats"],
       popular: true,
       stripePlan: "standard",
     },
     {
       name: "Enterprise",
       price: "$49.99",
-      period: "Per Month",
-      desc: "Built for teams and high-volume users.",
+      period: "per month",
+      desc: "For teams at scale.",
       cta: "Subscribe Now",
-      features: ["All Professional Features", "Custom Integrations", "Enterprise-grade Security", "Invite team members", "Dedicated Account Manager", "Minutes never expire"],
+      features: ["Everything in Standard", "Custom integrations", "Enterprise security", "Team management", "Dedicated manager", "SLA guarantee"],
       popular: false,
       stripePlan: "enterprise",
     },
   ];
 
   const handleSubscribe = async (stripePlan: string) => {
-    if (stripePlan === "free") {
-      window.location.href = "/signup";
-      return;
-    }
-
-    const product = products.find((p: any) =>
-      p.metadata && typeof p.metadata === 'object' && (p.metadata as any).plan === stripePlan
-    );
-    if (!product || !product.prices || product.prices.length === 0) {
-      window.location.href = "/signup";
-      return;
-    }
-
+    if (stripePlan === "free") { window.location.href = "/signup"; return; }
+    const product = products.find((p: any) => p.metadata?.plan === stripePlan);
+    if (!product?.prices?.length) { window.location.href = "/signup"; return; }
     setLoadingPlan(stripePlan);
     try {
-      const res = await fetch("/api/stripe/checkout", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ priceId: product.prices[0].id }),
-      });
-      if (res.status === 401) {
-        window.location.href = "/signup";
-        return;
-      }
+      const res = await fetch("/api/stripe/checkout", { method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include", body: JSON.stringify({ priceId: product.prices[0].id }) });
+      if (res.status === 401) { window.location.href = "/signup"; return; }
       const data = await res.json();
-      if (data.url) {
-        window.location.href = data.url;
-      }
-    } catch {
-      window.location.href = "/signup";
-    } finally {
-      setLoadingPlan(null);
-    }
+      if (data.url) window.location.href = data.url;
+    } catch { window.location.href = "/signup"; }
+    finally { setLoadingPlan(null); }
   };
 
   return (
-    <section id="pricing" className="py-20 bg-card/50">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <motion.div
-          initial="hidden"
-          whileInView="visible"
-          viewport={{ once: true, margin: "-100px" }}
-          variants={stagger}
-          className="text-center mb-16"
-        >
-          <motion.h2 variants={fadeUp} className="text-3xl sm:text-4xl font-bold" data-testid="text-pricing-title">
-            Simple Usage Pricing
-          </motion.h2>
-          <motion.p variants={fadeUp} className="mt-4 text-muted-foreground text-lg">
-            Pay only for active assist minutes. Purchased minutes never expire. No lock-in.
-          </motion.p>
+    <section id="pricing" className={`${SECTION} bg-white`}>
+      <div className={MAX}>
+        <motion.div initial={{ opacity: 0, y: 30 }} whileInView={{ opacity: 1, y: 0 }} viewport={{ once: true }} className="text-center mb-16">
+          <p className="text-xs font-bold uppercase tracking-[0.2em] text-violet-600 mb-4">Pricing</p>
+          <h2 className="text-4xl sm:text-5xl font-black tracking-[-0.03em] text-gray-900" data-testid="text-pricing-title">
+            Simple pricing.
+            <br /><span className="text-gray-400">No surprises.</span>
+          </h2>
+          <p className="mt-4 text-gray-400 text-lg">Minutes never expire. Pay only when Zoom Mate is actively helping you.</p>
         </motion.div>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 max-w-5xl mx-auto">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-5 max-w-5xl mx-auto">
           {plans.map((plan, i) => (
             <motion.div
               key={i}
@@ -512,42 +855,44 @@ function PricingSection() {
               whileInView={{ opacity: 1, y: 0 }}
               viewport={{ once: true }}
               transition={{ delay: i * 0.1 }}
+              className="relative"
             >
-              <Card className={`p-6 h-full flex flex-col relative ${plan.popular ? "border-primary" : ""}`} data-testid={`card-pricing-${plan.name.toLowerCase()}`}>
-                {plan.popular && (
-                  <Badge className="absolute -top-3 left-1/2 -translate-x-1/2">Most Popular</Badge>
-                )}
-                <div className="mb-6">
-                  <h3 className="text-lg font-semibold">{plan.name}</h3>
-                  <div className="mt-3 flex items-baseline gap-1 flex-wrap">
-                    <span className="text-4xl font-bold">{plan.price}</span>
-                    {plan.price !== "$0" && (
-                      <span className="text-sm text-muted-foreground">/ {plan.period}</span>
-                    )}
-                    {plan.price === "$0" && (
-                      <span className="text-sm text-muted-foreground">{plan.period}</span>
-                    )}
-                  </div>
-                  <p className="text-sm text-muted-foreground mt-2">{plan.desc}</p>
+              {plan.popular && (
+                <div className="absolute -top-3.5 left-1/2 -translate-x-1/2 z-10">
+                  <span className="px-4 py-1.5 rounded-full bg-gradient-to-r from-violet-600 to-fuchsia-500 text-xs font-bold text-white shadow-md shadow-violet-200 whitespace-nowrap">
+                    Most Popular
+                  </span>
                 </div>
-                <Button
-                  className="w-full"
-                  variant={plan.popular ? "default" : "outline"}
+              )}
+              <div
+                className={`bg-white rounded-2xl p-7 h-full flex flex-col border transition-all ${plan.popular ? "border-violet-300 shadow-lg shadow-violet-100" : "border-gray-200 hover:border-violet-200 shadow-sm"}`}
+                data-testid={`card-pricing-${plan.name.toLowerCase()}`}
+              >
+                <div className="mb-7">
+                  <h3 className="text-xs font-bold text-gray-400 uppercase tracking-widest mb-4">{plan.name}</h3>
+                  <div className="flex items-baseline gap-2">
+                    <span className="text-5xl font-black text-gray-900">{plan.price}</span>
+                    <span className="text-gray-400 text-sm">{plan.period}</span>
+                  </div>
+                  <p className="text-sm text-gray-400 mt-2">{plan.desc}</p>
+                </div>
+                <button
                   onClick={() => handleSubscribe(plan.stripePlan)}
                   disabled={loadingPlan === plan.stripePlan}
+                  className={`w-full py-3 rounded-2xl text-sm font-bold transition-all duration-200 mb-7 ${plan.popular ? "bg-gray-900 hover:bg-gray-800 text-white shadow-sm" : "bg-gray-100 hover:bg-gray-200 text-gray-700"}`}
                   data-testid={`button-pricing-${plan.name.toLowerCase()}`}
                 >
                   {loadingPlan === plan.stripePlan ? "Loading..." : plan.cta}
-                </Button>
-                <ul className="mt-6 space-y-3 flex-1">
-                  {plan.features.map((feature, fi) => (
-                    <li key={fi} className="flex items-start gap-2 text-sm">
-                      <Check className="w-4 h-4 text-primary mt-0.5 shrink-0" />
-                      <span className="text-muted-foreground">{feature}</span>
+                </button>
+                <ul className="space-y-3 flex-1">
+                  {plan.features.map((f, fi) => (
+                    <li key={fi} className="flex items-center gap-2.5 text-sm">
+                      <Check className="w-4 h-4 text-violet-500 shrink-0" />
+                      <span className="text-gray-500">{f}</span>
                     </li>
                   ))}
                 </ul>
-              </Card>
+              </div>
             </motion.div>
           ))}
         </div>
@@ -556,28 +901,24 @@ function PricingSection() {
   );
 }
 
+// ─── Testimonials ─────────────────────────────────────────────────────────────
 function TestimonialsSection() {
   const testimonials = [
-    { quote: "In my interview I got two questions I hadn't prepped for. Zoom Mate surfaced a clear outline in seconds so I stayed calm. I got the offer.", name: "Sarah M.", role: "Software Engineer" },
-    { quote: "During a sales demo, I forgot the specific numbers the client asked about. Zoom Mate pulled up the right stats instantly. We closed the deal.", name: "James K.", role: "Sales Director" },
-    { quote: "I used to spend 30 minutes prepping for every standup. Now I just upload my notes and Zoom Mate handles the rest perfectly.", name: "Priya R.", role: "Product Manager" },
+    { quote: "A tough question came out of nowhere. Zoom Mate had a clear, structured answer on my screen in under two seconds. I nailed it. Got the offer.", name: "Sarah M.", role: "Software Engineer · Series B startup" },
+    { quote: "Mid-demo the client asked for a specific metric I hadn't memorised. Zoom Mate pulled the right number instantly. We closed a $200K deal that day.", name: "James K.", role: "Sales Director · Enterprise SaaS" },
+    { quote: "I upload my weekly notes before every standup. Zoom Mate turns them into crisp talking points on the fly. It's become non-negotiable for me.", name: "Priya R.", role: "Product Manager · Fortune 500" },
   ];
-
   return (
-    <section className="py-20">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <motion.div
-          initial="hidden"
-          whileInView="visible"
-          viewport={{ once: true, margin: "-100px" }}
-          variants={stagger}
-          className="text-center mb-16"
-        >
-          <motion.h2 variants={fadeUp} className="text-3xl sm:text-4xl font-bold" data-testid="text-testimonials-title">
-            What Our Users Say
-          </motion.h2>
+    <section className={`${SECTION} bg-gray-50`}>
+      <div className={MAX}>
+        <motion.div initial={{ opacity: 0, y: 30 }} whileInView={{ opacity: 1, y: 0 }} viewport={{ once: true }} className="text-center mb-16">
+          <p className="text-xs font-bold uppercase tracking-[0.2em] text-violet-600 mb-4">Testimonials</p>
+          <h2 className="text-4xl sm:text-5xl font-black tracking-[-0.03em] text-gray-900" data-testid="text-testimonials-title">
+            Trusted by people
+            <br /><span className="text-gray-400">who perform under pressure</span>
+          </h2>
         </motion.div>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
           {testimonials.map((t, i) => (
             <motion.div
               key={i}
@@ -585,19 +926,17 @@ function TestimonialsSection() {
               whileInView={{ opacity: 1, y: 0 }}
               viewport={{ once: true }}
               transition={{ delay: i * 0.1 }}
+              className={`${CARD} ${CARD_HOVER} p-7 flex flex-col`}
+              data-testid={`card-testimonial-${i}`}
             >
-              <Card className="p-6 h-full flex flex-col" data-testid={`card-testimonial-${i}`}>
-                <div className="flex gap-1 mb-4">
-                  {[...Array(5)].map((_, si) => (
-                    <Star key={si} className="w-4 h-4 text-chart-4 fill-chart-4" />
-                  ))}
-                </div>
-                <p className="text-sm leading-relaxed flex-1 italic text-muted-foreground">"{t.quote}"</p>
-                <div className="mt-4 pt-4 border-t">
-                  <p className="font-semibold text-sm">{t.name}</p>
-                  <p className="text-xs text-muted-foreground">{t.role}</p>
-                </div>
-              </Card>
+              <div className="flex gap-1 mb-5">
+                {[...Array(5)].map((_, si) => <Star key={si} className="w-4 h-4 text-yellow-400 fill-yellow-400" />)}
+              </div>
+              <p className="text-gray-600 text-sm leading-relaxed flex-1">"{t.quote}"</p>
+              <div className="mt-5 pt-5 border-t border-gray-100">
+                <p className="font-bold text-gray-900 text-sm">{t.name}</p>
+                <p className="text-xs text-gray-400 mt-0.5">{t.role}</p>
+              </div>
             </motion.div>
           ))}
         </div>
@@ -606,81 +945,44 @@ function TestimonialsSection() {
   );
 }
 
+// ─── FAQ ──────────────────────────────────────────────────────────────────────
 function FAQSection() {
   const [openIndex, setOpenIndex] = useState<number | null>(null);
-
   const faqs = [
-    {
-      question: "How does Zoom Mate work during an interview?",
-      answer: "Zoom Mate runs invisibly on your desktop. It listens to the conversation in real time, analyzes your screen for context, and provides instant suggested responses that appear on your screen. You simply read or adapt the suggestions as you speak.",
-    },
-    {
-      question: "Is Zoom Mate detectable during screen sharing?",
-      answer: "No. Zoom Mate is designed to be completely invisible during screen sharing. It uses a special overlay that is not captured by screen sharing software, so your interviewer or meeting participants will never see it.",
-    },
-    {
-      question: "What platforms does Zoom Mate support?",
-      answer: "Zoom Mate works on Windows and macOS as a desktop application. It is compatible with all major meeting platforms including Zoom, Google Meet, Microsoft Teams, and more. A mobile version is also available for on-the-go use.",
-    },
-    {
-      question: "How is pricing calculated?",
-      answer: "You only pay for active assist minutes. The free tier gives you 5 minutes per hour at no cost. The Standard plan is $14.99 per hour of active usage, and purchased minutes never expire. There are no monthly subscriptions or hidden fees.",
-    },
-    {
-      question: "Can I upload my own documents and knowledge?",
-      answer: "Yes. You can upload your resume, job descriptions, product documentation, talking points, and any other materials. Zoom Mate uses this custom knowledge to provide personalized, contextually relevant answers during your sessions.",
-    },
+    { question: "How does Zoom Mate work during a meeting?", answer: "Zoom Mate runs as an invisible overlay on your desktop. It captures the audio from your conversation in real time and analyses your screen for context. When you need an answer, it appears on your screen instantly — your call participants never see it." },
+    { question: "Is it detectable during screen sharing?", answer: "No. Zoom Mate uses a special overlay that is not captured by Zoom, Google Meet, Teams, or any other screen sharing software." },
+    { question: "What platforms does it support?", answer: "Zoom Mate works on Windows and macOS. It is compatible with any meeting software including Zoom, Google Meet, Microsoft Teams, Webex, and even phone calls." },
+    { question: "How does pricing work?", answer: "You only pay for active assist minutes. The free tier gives you 5 minutes every hour at no cost. Purchased minutes never expire and there are no subscriptions that bill you when you're not using it." },
+    { question: "Can I upload my own materials?", answer: "Yes. Upload PDFs, documents, plain text, and more. Zoom Mate uses this as context for every response — so answers reference your actual background and materials, not generic information." },
   ];
 
-  const toggle = (index: number) => {
-    setOpenIndex(openIndex === index ? null : index);
-  };
-
   return (
-    <section id="faq" className="py-20 bg-card/50">
+    <section id="faq" className={`${SECTION} bg-white`}>
       <div className="max-w-3xl mx-auto px-4 sm:px-6 lg:px-8">
-        <motion.div
-          initial="hidden"
-          whileInView="visible"
-          viewport={{ once: true, margin: "-100px" }}
-          variants={stagger}
-          className="text-center mb-16"
-        >
-          <motion.h2 variants={fadeUp} className="text-3xl sm:text-4xl font-bold" data-testid="text-faq-title">
-            Frequently Asked Questions
-          </motion.h2>
-          <motion.p variants={fadeUp} className="mt-4 text-muted-foreground text-lg">
-            Everything you need to know about Zoom Mate.
-          </motion.p>
+        <motion.div initial={{ opacity: 0, y: 30 }} whileInView={{ opacity: 1, y: 0 }} viewport={{ once: true }} className="text-center mb-16">
+          <p className="text-xs font-bold uppercase tracking-[0.2em] text-violet-600 mb-4">FAQ</p>
+          <h2 className="text-4xl sm:text-5xl font-black tracking-[-0.03em] text-gray-900" data-testid="text-faq-title">Questions answered</h2>
         </motion.div>
         <div className="space-y-3">
           {faqs.map((faq, i) => (
-            <motion.div
-              key={i}
-              initial={{ opacity: 0, y: 10 }}
-              whileInView={{ opacity: 1, y: 0 }}
-              viewport={{ once: true }}
-              transition={{ delay: i * 0.05 }}
-            >
-              <Card className="overflow-visible">
+            <motion.div key={i} initial={{ opacity: 0, y: 10 }} whileInView={{ opacity: 1, y: 0 }} viewport={{ once: true }} transition={{ delay: i * 0.05 }}>
+              <div className={`${CARD} overflow-hidden`}>
                 <button
-                  onClick={() => toggle(i)}
-                  className="w-full flex items-center justify-between gap-4 p-5 text-left"
+                  onClick={() => setOpenIndex(openIndex === i ? null : i)}
+                  className="w-full flex items-center justify-between gap-4 p-5 text-left hover:bg-gray-50 transition-colors"
                   data-testid={`button-faq-${i}`}
                 >
-                  <span className="font-medium text-sm">{faq.question}</span>
-                  {openIndex === i ? (
-                    <ChevronUp className="w-4 h-4 text-muted-foreground shrink-0" />
-                  ) : (
-                    <ChevronDown className="w-4 h-4 text-muted-foreground shrink-0" />
-                  )}
+                  <span className="font-semibold text-sm text-gray-800">{faq.question}</span>
+                  {openIndex === i ? <ChevronUp className="w-4 h-4 text-gray-400 shrink-0" /> : <ChevronDown className="w-4 h-4 text-gray-400 shrink-0" />}
                 </button>
-                {openIndex === i && (
-                  <div className="px-5 pb-5">
-                    <p className="text-sm text-muted-foreground leading-relaxed">{faq.answer}</p>
-                  </div>
-                )}
-              </Card>
+                <AnimatePresence>
+                  {openIndex === i && (
+                    <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: "auto", opacity: 1 }} exit={{ height: 0, opacity: 0 }} transition={{ duration: 0.25 }} className="overflow-hidden">
+                      <p className="px-5 pb-5 text-sm text-gray-500 leading-relaxed border-t border-gray-100 pt-4">{faq.answer}</p>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </div>
             </motion.div>
           ))}
         </div>
@@ -689,117 +991,111 @@ function FAQSection() {
   );
 }
 
-function DownloadCTASection() {
+// ─── CTA ─────────────────────────────────────────────────────────────────────
+function CTASection() {
   return (
-    <section id="download" className="py-20">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <motion.div
-          initial="hidden"
-          whileInView="visible"
-          viewport={{ once: true, margin: "-100px" }}
-          variants={stagger}
-          className="text-center"
-        >
-          <motion.div variants={fadeUp}>
-            <div className="rounded-xl border bg-gradient-to-br from-primary/10 via-chart-2/5 to-chart-5/10 p-10 sm:p-16">
-              <div className="w-16 h-16 rounded-md bg-primary/10 flex items-center justify-center mx-auto mb-6">
-                <Download className="w-8 h-8 text-primary" />
+    <section id="download" className={`${SECTION} bg-gray-50`}>
+      <div className={MAX}>
+        <motion.div initial={{ opacity: 0, y: 30 }} whileInView={{ opacity: 1, y: 0 }} viewport={{ once: true }}>
+          <div className="relative rounded-3xl overflow-hidden border border-violet-100 bg-gradient-to-br from-violet-50 via-white to-fuchsia-50 p-12 sm:p-20 text-center">
+            <Glow className="w-[500px] h-[200px] bg-violet-200 top-0 left-1/2 -translate-x-1/2 -translate-y-1/2 opacity-40" />
+            <div className="relative z-10">
+              <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-violet-100 border border-violet-200 text-violet-700 text-xs font-bold mb-8 uppercase tracking-widest">
+                🚀 Desktop App Coming Soon
               </div>
-              <div className="inline-flex items-center gap-2 bg-primary/10 text-primary text-sm font-semibold px-4 py-1.5 rounded-full mb-4">
-                🚀 Coming Soon
-              </div>
-              <h2 className="text-3xl sm:text-4xl font-bold mb-4" data-testid="text-download-title">
-                Desktop App Coming Soon
+              <h2 className="text-4xl sm:text-5xl lg:text-6xl font-black tracking-[-0.03em] text-gray-900 mb-5" data-testid="text-download-title">
+                Start performing
+                <br />at your best — today
               </h2>
-              <p className="text-muted-foreground text-lg max-w-xl mx-auto mb-8">
-                The Zoom Mate desktop app is under development. Use Zoom Mate in your browser right now while we finish the desktop experience.
+              <p className="text-gray-500 text-lg max-w-xl mx-auto mb-10 leading-relaxed">
+                The desktop app is on the way. Until then, Zoom Mate is fully available in your browser. No install. No setup. Just results.
               </p>
               <div className="flex flex-col sm:flex-row items-center justify-center gap-4">
-                <Button size="lg" className="text-base px-8 opacity-50 cursor-not-allowed" disabled data-testid="button-download-cta">
-                  <Download className="w-4 h-4 mr-2" />
-                  Download for Desktop
-                </Button>
                 <Link href="/signup">
-                  <Button size="lg" variant="outline" data-testid="button-download-web">
-                    Try in Browser
-                    <ArrowRight className="w-4 h-4 ml-2" />
-                  </Button>
+                  <button className="group flex items-center gap-2 px-8 py-4 rounded-2xl bg-gray-900 text-white font-bold text-sm hover:bg-gray-800 transition-all shadow-lg shadow-gray-900/10" data-testid="button-download-web">
+                    Try in Browser — It's Free
+                    <ArrowRight className="w-4 h-4 group-hover:translate-x-0.5 transition-transform" />
+                  </button>
                 </Link>
+                <button disabled className="flex items-center gap-2 px-8 py-4 rounded-2xl bg-white text-gray-300 border border-gray-200 font-semibold text-sm cursor-not-allowed" data-testid="button-download-cta">
+                  <Download className="w-4 h-4" />
+                  Download Desktop
+                </button>
               </div>
             </div>
-          </motion.div>
+          </div>
         </motion.div>
       </div>
     </section>
   );
 }
 
+// ─── Footer ──────────────────────────────────────────────────────────────────
 function Footer() {
+  const scrollTo = (id: string) => document.getElementById(id)?.scrollIntoView({ behavior: "smooth" });
   return (
-    <footer className="border-t py-16 bg-card/50">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-8">
-          <div>
-            <div className="flex items-center gap-2 mb-4">
-              <div className="w-7 h-7 rounded-md bg-primary flex items-center justify-center">
-                <Zap className="w-4 h-4 text-primary-foreground" />
+    <footer className="bg-white border-t border-gray-200 py-16 px-4 sm:px-6 lg:px-8">
+      <div className={MAX}>
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-10 mb-14">
+          <div className="col-span-2 md:col-span-1">
+            <div className="flex items-center gap-2.5 mb-5">
+              <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-violet-500 to-violet-700 flex items-center justify-center shadow-sm shadow-violet-200">
+                <Zap className="w-4 h-4 text-white" />
               </div>
-              <span className="font-bold" data-testid="text-footer-logo">Zoom Mate</span>
+              <span className="font-bold text-gray-900 text-lg tracking-tight" data-testid="text-footer-logo">Zoom Mate</span>
             </div>
-            <p className="text-xs text-muted-foreground leading-relaxed">
-              AI-powered interview assistant that helps you answer every question with confidence.
-            </p>
+            <p className="text-xs text-gray-400 leading-relaxed max-w-[200px]">AI-powered meeting copilot. Say the right thing, every time.</p>
           </div>
           <div>
-            <h4 className="font-semibold text-sm mb-3">Product</h4>
-            <ul className="space-y-2">
-              <li><button onClick={() => document.getElementById("features")?.scrollIntoView({ behavior: "smooth" })} className="text-xs text-muted-foreground hover:text-foreground transition-colors" data-testid="link-footer-features">Features</button></li>
-              <li><button onClick={() => document.getElementById("pricing")?.scrollIntoView({ behavior: "smooth" })} className="text-xs text-muted-foreground hover:text-foreground transition-colors" data-testid="link-footer-pricing">Pricing</button></li>
-              <li><button onClick={() => document.getElementById("faq")?.scrollIntoView({ behavior: "smooth" })} className="text-xs text-muted-foreground hover:text-foreground transition-colors" data-testid="link-footer-faq">FAQ</button></li>
-              <li><Link href="/download" className="text-xs text-muted-foreground hover:text-foreground transition-colors" data-testid="link-footer-download">Download</Link></li>
+            <h4 className="text-xs font-bold text-gray-400 uppercase tracking-widest mb-5">Product</h4>
+            <ul className="space-y-3">
+              {[["Features", "features"], ["Pricing", "pricing"], ["FAQ", "faq"], ["Download", "download"]].map(([label, id]) => (
+                <li key={id}><button onClick={() => scrollTo(id)} className="text-sm text-gray-400 hover:text-gray-900 transition-colors" data-testid={`link-footer-${id}`}>{label}</button></li>
+              ))}
             </ul>
           </div>
           <div>
-            <h4 className="font-semibold text-sm mb-3">Legal</h4>
-            <ul className="space-y-2">
-              <li><Link href="/privacy" className="text-xs text-muted-foreground hover:text-foreground transition-colors" data-testid="link-footer-privacy">Privacy Policy</Link></li>
-              <li><Link href="/terms" className="text-xs text-muted-foreground hover:text-foreground transition-colors" data-testid="link-footer-terms">Terms of Service</Link></li>
-              <li><Link href="/refund" className="text-xs text-muted-foreground hover:text-foreground transition-colors" data-testid="link-footer-refund">Refund Policy</Link></li>
+            <h4 className="text-xs font-bold text-gray-400 uppercase tracking-widest mb-5">Legal</h4>
+            <ul className="space-y-3">
+              {[["Privacy Policy", "/privacy"], ["Terms of Service", "/terms"], ["Refund Policy", "/refund"]].map(([label, href]) => (
+                <li key={href}><Link href={href} className="text-sm text-gray-400 hover:text-gray-900 transition-colors">{label}</Link></li>
+              ))}
             </ul>
           </div>
           <div>
-            <h4 className="font-semibold text-sm mb-3">Compare</h4>
-            <ul className="space-y-2">
-              <li><span className="text-xs text-muted-foreground">vs Final Round AI</span></li>
-              <li><span className="text-xs text-muted-foreground">vs Cluely</span></li>
-              <li><span className="text-xs text-muted-foreground">vs Parakeet AI</span></li>
+            <h4 className="text-xs font-bold text-gray-400 uppercase tracking-widest mb-5">Compare</h4>
+            <ul className="space-y-3">
+              {["vs Final Round AI", "vs Cluely", "vs Parakeet AI"].map((item) => (
+                <li key={item}><span className="text-sm text-gray-300">{item}</span></li>
+              ))}
             </ul>
           </div>
         </div>
-        <div className="mt-12 pt-8 border-t text-center">
-          <p className="text-xs text-muted-foreground" data-testid="text-copyright">
-            2025 Zoom Mate. All rights reserved.
-          </p>
+        <div className="pt-8 border-t border-gray-100 flex flex-col sm:flex-row items-center justify-between gap-4">
+          <p className="text-xs text-gray-300" data-testid="text-copyright">© 2025 Zoom Mate. All rights reserved.</p>
+          <p className="text-xs text-gray-300">Built for people who can't afford to lose the room.</p>
         </div>
       </div>
     </footer>
   );
 }
 
+// ─── Page ─────────────────────────────────────────────────────────────────────
 export default function LandingPage() {
   return (
-    <div className="min-h-screen">
+    <div className="min-h-screen bg-white">
       <Navbar />
       <HeroSection />
-      <PainPointsSection />
-      <HowItWorksSection />
-      <SolutionSection />
+      <Marquee />
       <FeaturesSection />
+      <CodeAutoTypeDemo />
+      <StatsSection />
+      <HowItWorksSection />
       <ComparisonSection />
       <PricingSection />
       <TestimonialsSection />
       <FAQSection />
-      <DownloadCTASection />
+      <CTASection />
       <Footer />
     </div>
   );

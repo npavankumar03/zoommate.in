@@ -18,8 +18,11 @@ const EXPERIENCE_RE = /\b(your experience|how long|years of|background in|backgr
 // Company-specific intent — need company notes if uploaded
 const COMPANY_RE = /\b(why (do you want|this company|us|here|join)|what (attracts|drew|interests) you|why (apply|applied)|excited about (this|the) (role|company|team|position))\b/i;
 
-// Pure theory — never needs personal context
-const PURE_THEORY_RE = /\b(what is|what's|how does|difference between|compare|define|algorithm|big ?o|time complexity)\b/i;
+// Pure theory — never needs personal context (only matched when NOT about self)
+const PURE_THEORY_RE = /\b(how does|difference between|compare|define|algorithm|big ?o|time complexity)\b/i;
+
+// Personal identity / contact info — always retrieve
+const PERSONAL_INFO_RE = /\b(my name|your name|who (are|am) (you|i)|what('s| is) (your|my) name|call you|contact|email|phone|linkedin|github|address|location|based in|from|nationality|introduce (your|my)self|about (your|my)self|tell (me about your|us about your|about yourself))\b/i;
 
 const SHORT_FOLLOW_UP_RE = /^(why|how|which one|how so|what now)\??$/i;
 
@@ -35,6 +38,7 @@ export function shouldRetrieveDocs(questionSpan: string, mode: DocsRetrievalMode
   if (words.length <= 3 && SHORT_FOLLOW_UP_RE.test(lower)) return false;
 
   // Hard retrieval triggers
+  if (PERSONAL_INFO_RE.test(lower)) return true;   // name, contact, intro
   if (DOC_REFERENCE_RE.test(lower)) return true;
   if (FACT_HEAVY_RE.test(lower)) return true;
   if (RESUME_STYLE_RE.test(lower)) return true;

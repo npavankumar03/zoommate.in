@@ -3,34 +3,54 @@ import type { Server, IncomingMessage } from "http";
 import { URL } from "url";
 import { storage } from "../storage";
 import { streamAssistantAnswer, abortSessionStream, hasActiveStream } from "../assist/streamAssistantAnswer";
-import { markInterviewerQuestionAnswered, recordUserQuestion, getCodingProblemState, buildInterviewerIntelligenceBlock } from "../assist/sessionState";
-import {
-  getState as getMeetingState,
-  getSnapshotFromCursor,
-  advanceCursor,
-  markAnswered as markAnsweredInStore,
-  markGeneratedTopic,
-  getLastGeneratedTopic,
-  getActiveQuestion,
-  setActiveQuestion,
-  setLastAnsweredWindowHash,
-} from "./meetingStore";
-import {
-  detectQuestion,
-  extractQuestionFromSegment,
-  buildQuestionWindowHash,
-  likelyContainsQuestion,
-  levenshteinSimilarity,
-  normalizeQuestionForSimilarity,
-  normalizeText,
-  questionSupersedes,
-  resolveActiveQuestionWindow,
-} from "@shared/questionDetection";
+import { getLastUnansweredInterviewerQuestion, getLatestSpokenReply, recordUserQuestion, getCodingProblemState, buildInterviewerIntelligenceBlock } from "../assist/sessionState";
+import { levenshteinSimilarity, normalizeQuestionForSimilarity } from "@shared/questionDetection";
 import { getRefineConfig, buildRefineContext } from "../assist/refinePass";
 import { parseResponse } from "../assist/responseParser";
 import { streamLLM, resolveAutomaticInterviewModel } from "../llmRouter2";
 import { buildTier0Prompt } from "../prompt";
 import type { Meeting } from "@shared/schema";
+import { warmHeuristicAnswers, clearHeuristicCache } from "../assist/heuristicAnswerCache";
+import { formatMemorySlotsForPrompt } from "../memoryExtractor";
+
+// ── Module-level memory cache for speculative prompt (shared across sockets) ──
+const speculativeMemoryCache = new Map<string, { value: string; expiresAt: number }>();
+const SPECULATIVE_MEMORY_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+function getCachedMemory(userId: string): string | null {
+  const hit = speculativeMemoryCache.get(userId);
+  if (!hit) return null;
+  if (Date.now() > hit.expiresAt) { speculativeMemoryCache.delete(userId); return null; }
+  return hit.value;
+}
+
+function setCachedMemory(userId: string, value: string): void {
+  speculativeMemoryCache.set(userId, { value, expiresAt: Date.now() + SPECULATIVE_MEMORY_TTL_MS });
+}
+
+// Extract resume and JD from the raw customInstructions blob
+function extractProfileContext(raw: string): { resume: string; jobDescription: string } {
+  const text = String(raw || "").replace(/\r\n/g, "\n");
+  if (!text.trim()) return { resume: "", jobDescription: "" };
+  const lines = text.split("\n");
+  const jdLines: string[] = [];
+  const resumeLines: string[] = [];
+  let current: "jd" | "resume" | null = null;
+  const jdHeader = /^\s*(?:the following is\s+)?(?:job\s*description|jd)\s*[:\-]?\s*(.*)$/i;
+  const resumeHeader = /^\s*(?:below is my\s+)?resume\s*[:\-]?\s*(.*)$/i;
+  const stopHeader = /^\s*(?:instructions?|rules?|important|note|example|context|enhanced prompt|final key points|your response should)\b/i;
+  for (const line of lines) {
+    const jdMatch = line.match(jdHeader);
+    if (jdMatch) { current = "jd"; const tail = (jdMatch[1] || "").trim(); if (tail) jdLines.push(tail); continue; }
+    const resumeMatch = line.match(resumeHeader);
+    if (resumeMatch) { current = "resume"; const tail = (resumeMatch[1] || "").trim(); if (tail) resumeLines.push(tail); continue; }
+    if (stopHeader.test(line)) { current = null; continue; }
+    if (current === "jd") jdLines.push(line);
+    if (current === "resume") resumeLines.push(line);
+  }
+  const norm = (v: string) => v.replace(/[{}]/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+  return { resume: norm(resumeLines.join("\n")), jobDescription: norm(jdLines.join("\n")) };
+}
 
 // ── Speculative answer buffer ─────────────────────────────────────────────────
 interface SpeculativeEntry {
@@ -40,21 +60,64 @@ interface SpeculativeEntry {
   done: boolean;
   ts: number;
   abortCtrl: AbortController;
+  // true when replaced by a NEWER speculative (not adopted) — loop must stop, onDone must NOT fire
+  evicted: boolean;
   // Set when a question handler adopts an in-progress stream
   onChunk?: (chunk: string) => void;
   onDone?: () => void;
 }
 const speculativeStreams = new Map<string, SpeculativeEntry>();
 
-function buildSpeculativePrompt(question: string, meeting: Meeting | null, sessionId: string): string {
+// Periodic cleanup of stale entries (e.g. user never pressed Enter)
+setInterval(() => {
+  const now = Date.now();
+  for (const [sid, entry] of speculativeStreams) {
+    if (now - entry.ts > 30_000) {
+      entry.abortCtrl.abort();
+      speculativeStreams.delete(sid);
+    }
+  }
+}, 30_000).unref();
+
+// Scenario/system-design questions are identified by long combined transcript text
+// or by system-design keywords. These questions don't need resume context — the answer
+// is based on the scenario itself. Adding resume/JD only increases TTFT with no benefit.
+function isScenarioQuestion(question: string): boolean {
+  if (question.length > 300) return true;
+  return /\b(design|architect|system|scale|distributed|microservice|payment|concurrent|schema|pipeline|idempotent|infrastructure|deploy|kubernetes|docker|redis|kafka|throughput|latency|availability|consistency|partition|sharding|load balanc|rate limit|circuit breaker|fault toleran|event.driven|message queue|pub.sub|caching|cdn|api gateway)\b/i.test(question);
+}
+
+function buildSpeculativePrompt(question: string, meeting: Meeting | null, sessionId: string, memoryContext?: string): string {
   const format = (meeting?.responseFormat === "custom" ? "concise" : meeting?.responseFormat) || "concise";
   const meetingType = meeting?.type || "interview";
   const tier0 = buildTier0Prompt(format, meetingType);
   const intel = buildInterviewerIntelligenceBlock(sessionId, question, 3);
-  const instructions = meeting?.customInstructions
-    ? `Custom instructions: ${String(meeting.customInstructions).slice(0, 800)}`
+  const rawInstructions = String(meeting?.customInstructions || "");
+
+  // Scenario/system-design: lean prompt — no resume/JD, answer is driven by the scenario itself.
+  // Resume context only adds TTFT without improving answer quality for these questions.
+  if (isScenarioQuestion(question)) {
+    const isShortInstructions = rawInstructions.trim().length < 1200;
+    const instructions = isShortInstructions && rawInstructions.trim()
+      ? `Custom instructions: ${rawInstructions.trim().slice(0, 400)}`
+      : "";
+    return [tier0, instructions, intel].filter(Boolean).join("\n\n");
+  }
+
+  // Behavioral/experience questions: include resume + JD so speculative answer is personalized.
+  const { resume, jobDescription } = extractProfileContext(rawInstructions);
+  const isShortInstructions = rawInstructions.trim().length < 1200;
+  const instructions = isShortInstructions && rawInstructions.trim()
+    ? `Custom instructions: ${rawInstructions.trim().slice(0, 800)}`
     : "";
-  return [tier0, instructions, intel].filter(Boolean).join("\n\n");
+  return [
+    tier0,
+    jobDescription ? `Job description:\n${jobDescription.slice(0, 4000)}` : "",
+    resume ? `Resume/Profile:\n${resume.slice(0, 8000)}` : "",
+    memoryContext ? `Key facts (use these when answering):\n${memoryContext.slice(0, 800)}` : "",
+    instructions,
+    intel,
+  ].filter(Boolean).join("\n\n");
 }
 
 async function runSpeculativeStream(sessionId: string, question: string, meeting: Meeting | null): Promise<void> {
@@ -62,31 +125,53 @@ async function runSpeculativeStream(sessionId: string, question: string, meeting
   if (existing) {
     const norm = normalizeQuestionForSimilarity(question);
     const existingSimilarity = norm ? levenshteinSimilarity(existing.norm, norm) : 0;
-    if (existingSimilarity >= 0.80 && !existing.done) {
+    // Detect if the actual question just arrived at the end of a long scenario:
+    // new combined text has a question signal but existing stream was started with
+    // pure scenario statements (no question). Always restart in this case so the
+    // LLM gets the full scenario + question context.
+    const lastLineOf = (q: string) => q.split(/\n/).filter(Boolean).pop()?.trim() || q.trim();
+    const hasQuestionSignal = (q: string) =>
+      /[?]/.test(q) || /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|tell|walk|explain|describe|design|implement)\b/i.test(lastLineOf(q));
+    const questionJustArrived = hasQuestionSignal(question) && !hasQuestionSignal(existing.question);
+    // For long scenario texts, Levenshtein similarity drops sharply as each new sentence is
+    // appended — even a small addition to a 200-word transcript can push similarity to 0.72.
+    // Use a lower reuse threshold for long texts so the stream keeps accumulating chunks
+    // instead of restarting on every new segment during a 2-minute scenario buildup.
+    const isLongText = existing.norm.length > 400 || (norm || "").length > 400;
+    const reuseThreshold = isLongText ? 0.65 : 0.80;
+    if (existingSimilarity >= reuseThreshold && !existing.done && !questionJustArrived) {
       // Close enough — keep the existing stream running so chunks keep accumulating.
-      // Do NOT update existing.norm: the Enter similarity check must compare against
-      // what speculative was actually generated for (the original fragment), not the
-      // final question. If the norm were updated to the final question, Enter would
-      // always get similarity≈1.0 and replay a wrong fragment-based answer.
-      console.log(`[speculative] reuse_existing sessionId=${sessionId} similarity=${existingSimilarity.toFixed(2)} chunks=${existing.chunks.length}`);
+      console.log(`[speculative] reuse_existing sessionId=${sessionId} similarity=${existingSimilarity.toFixed(2)} threshold=${reuseThreshold} chunks=${existing.chunks.length}`);
       return;
     }
+    existing.evicted = true;
     existing.abortCtrl.abort();
     speculativeStreams.delete(sessionId);
   }
   const norm = normalizeQuestionForSimilarity(question);
   if (!norm) return;
   const abortCtrl = new AbortController();
-  const entry: SpeculativeEntry = { question, norm, chunks: [], done: false, ts: Date.now(), abortCtrl };
+  const entry: SpeculativeEntry = { question, norm, chunks: [], done: false, ts: Date.now(), abortCtrl, evicted: false };
   speculativeStreams.set(sessionId, entry);
 
   try {
-    const systemPrompt = buildSpeculativePrompt(question, meeting, sessionId);
+    // Fetch memory from cache (warm) or DB (cold) — non-blocking relative to entry creation
+    const userId = meeting?.userId || "";
+    const cachedMem = userId ? getCachedMemory(userId) : null;
+    const memoryContext = cachedMem !== null
+      ? cachedMem
+      : userId
+        ? await formatMemorySlotsForPrompt(userId, sessionId).then((v) => { setCachedMemory(userId, v || ""); return v || ""; }).catch(() => "")
+        : "";
+    const systemPrompt = buildSpeculativePrompt(question, meeting, sessionId, memoryContext);
     const model = (meeting?.model && meeting.model !== "automatic")
       ? meeting.model
       : resolveAutomaticInterviewModel(question, { sessionMode: (meeting as any)?.sessionMode });
     const isCodeQuestion = /\b(write|implement|build|create|code|function|class|algorithm|program|script|def |solution)\b/i.test(question);
-    const speculativeMaxTokens = isCodeQuestion ? 1200 : 320;
+    // Scenario/system-design: 800 tokens — answers need 400-700 tokens to be complete.
+    // Code: 1500 tokens — full function/class can exceed 1000 tokens.
+    // Behavioral: 350 tokens — 3-5 sentence answers fit in 300 tokens.
+    const speculativeMaxTokens = isCodeQuestion ? 1500 : isScenarioQuestion(question) ? 800 : 350;
     const generator = streamLLM(
       "LIVE_INTERVIEW_ANSWER",
       systemPrompt,
@@ -97,14 +182,21 @@ async function runSpeculativeStream(sessionId: string, question: string, meeting
     );
     for await (const chunk of generator) {
       if (!chunk) continue;
-      if (speculativeStreams.get(sessionId) !== entry) break; // evicted
+      if (entry.evicted) break; // replaced by a newer speculative — stop immediately
       entry.chunks.push(chunk);
       entry.onChunk?.(chunk); // deliver live to adopted consumer if any
     }
-    entry.done = true;
-    entry.onDone?.(); // signal completion to adopted consumer
   } catch {
-    // best-effort only
+    // any error (memory fetch, prompt build, LLM error) — onDone fires in finally below
+  } finally {
+    // Always fires regardless of where the error occurred (outer or inner).
+    // Only signal completion if NOT evicted (replaced by a newer speculative).
+    // Adopted entries have evicted=false, so onDone fires correctly for them.
+    // Evicted entries must NOT fire onDone — the new speculative/full pipeline handles it.
+    if (!entry.evicted) {
+      entry.done = true;
+      entry.onDone?.();
+    }
   }
 }
 
@@ -115,13 +207,8 @@ interface AnswerSession {
   requestId: string;
 }
 
-// Known substantive follow-up phrases — keep these answerable/anchorable, but
-// do not treat generic acknowledgements like "okay" or "yeah" as follow-ups.
-const KNOWN_FOLLOWUP_RE = /^(why|how so|how come|how|what about(?:\s+\w.*)?|elaborate|explain|tell me more|go on|continue|and then|what next|what else|can you explain|can you elaborate|give me an example|show me|keep going|proceed|expand|clarify|summarize|repeat|example|further|detail|go ahead|dive deeper|dig deeper|break it down|zoom in|say more|one more|more detail)\??$/i;
-const STRICT_ANCHORABLE_FOLLOWUP_RE = /^(why|how so|how come|how|elaborate|explain|tell me more|go on|continue|expand|clarify|what next|what else|more detail|give me an example|show me|keep going|proceed|summarize|repeat|example|further|detail|go ahead|dive deeper|dig deeper|break it down|zoom in|say more|one more|what about(?:\s+\w.*)?|how about(?:\s+\w.*)?)\??$/i;
-const CONNECTOR_PREFIX_RE = /^(and\s+also|and|also|plus|as\s+well\s+as|or)\s+/i;
-const PERSONAL_OR_BEHAVIORAL_Q_RE = /\b(yourself|tell me about|time when|situation|challenge|strength|weakness|career|background|hobby)\b/i;
-const TOPIC_APPENDABLE_Q_RE = /\b(experience|worked with|worked on|used|use|familiar with|comfortable with|background in|knowledge of|exposure to|skills?|stack|technolog(?:y|ies)|tools?)\b/i;
+// Known follow-up words/phrases that are always valid — never treat as noise/vague
+const KNOWN_FOLLOWUP_RE = /^(why|how so|how|what about|elaborate|explain|tell me more|go on|continue|and then|what next|what else|can you explain|can you elaborate|give me an example|okay|ok|sure|interesting|really|seriously|and|so|then|next|more|again|wait|huh|show me|keep going|proceed|expand|clarify|summarize|repeat|example|further|detail|go ahead|dive deeper|dig deeper|break it down|zoom in|say more|one more)\??$/i;
 
 // Detects incomplete questions that end with a dangling preposition/article (sentence cut off mid-ask)
 function isDanglingStub(q: string): boolean {
@@ -131,44 +218,31 @@ function isDanglingStub(q: string): boolean {
   return /\b(in|with|at|for|on|about|of|from|to|by|and|or|the|a|an|any|some|your|our|their|its|this|that|these|those)\s*$/.test(q);
 }
 
-function extractSharedQuestionCandidate(text: string): string {
-  return extractQuestionFromSegment(String(text || "")) || "";
-}
-
-function hasSharedQuestionSignal(text: string): boolean {
-  const raw = String(text || "").trim();
-  if (!raw) return false;
-  return detectQuestion(raw) || likelyContainsQuestion(raw) || Boolean(extractSharedQuestionCandidate(raw));
-}
-
 function isVagueQuestion(text: string): boolean {
-  const q = normalizeText(String(text || ""));
+  const q = String(text || "").toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
   if (!q) return true;
   if (KNOWN_FOLLOWUP_RE.test(q)) return false;
-  const extracted = extractSharedQuestionCandidate(text);
-  if (extracted && !isDanglingStub(normalizeText(extracted))) return false;
   const words = q.split(" ").filter(Boolean);
   if (words.length <= 1 && !q.includes("?")) return true;
   // Partial/cut-off question stubs — interviewer didn't finish speaking
   if (isDanglingStub(q)) return true;
-  if (hasSharedQuestionSignal(text) && words.length >= 2) return false;
   if (/^(do you have experience|do you have experience in|have you worked on|tell me about)\??$/.test(q)) return true;
   return false;
 }
 
 function looksLikeInterviewNoise(text: string): boolean {
-  const q = normalizeText(String(text || ""));
+  const q = String(text || "").toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
   if (!q) return true;
   // Known follow-ups are never noise
   if (KNOWN_FOLLOWUP_RE.test(q)) return false;
-  if (KNOWN_TECH_TERM_RE.test(q.trim())) return false;
-  if (hasSharedQuestionSignal(text)) return false;
   const words = q.split(" ").filter(Boolean);
   if (words.length < 2 && !q.includes("?")) return true;
 
+  const hasQuestionCue = /\?|^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|tell|walk|explain|describe|share|give|talk|are you|have you|your experience|your background)\b/.test(q)
+    || /\b(tell me about|tell us about|walk me through|talk me through|describe a time|give me an example|have you worked|have you used|have you ever|are you familiar|are you comfortable with|your experience (with|in)|your background in)\b/.test(q);
   const hasInterviewCue = /\b(experience|project|api|apis|react|python|fastapi|fast api|fast apis|django|backend|frontend|system|design|challenge|work|role|aws|azure|gcp|cloud|kubernetes|docker|microservice|database|sql|nosql|java|typescript|golang|rust|spring|node|angular|vue)\b/.test(q);
   const hasFollowUpCue = /^(show me|keep going|one more|go on|go ahead|tell me more|explain more|elaborate more|more detail|what else|what next|and then|say more|dive deeper|dig deeper|expand on|break it down|walk me through that)\b/.test(q);
-  if (!hasInterviewCue && !hasFollowUpCue && words.length <= 12) return true;
+  if (!hasQuestionCue && !hasInterviewCue && !hasFollowUpCue && words.length <= 12) return true;
 
   const randomNoisePattern = /\b(call mum|road closed|downtown|island|laguna|nokia)\b/;
   if (randomNoisePattern.test(q) && !hasInterviewCue) return true;
@@ -180,15 +254,13 @@ function chooseBestQuestionSeed(candidates: Array<string | undefined | null>): s
   const cleaned = candidates
     .map((c) => String(c || "").trim())
     .filter(Boolean)
-    .map((text) => extractSharedQuestionCandidate(text) || text)
     .filter((text) => !looksLikeInterviewNoise(text));
   if (!cleaned.length) return "[Continue]";
 
   const scored = cleaned.map((text, idx) => {
     const vague = isVagueQuestion(text);
     const hasQuestionMark = text.includes("?");
-    const sharedSignal = hasSharedQuestionSignal(text);
-    const score = (vague ? 0 : 1000) + (sharedSignal ? 120 : 0) + (hasQuestionMark ? 80 : 0) + Math.min(text.length, 400) - idx;
+    const score = (vague ? 0 : 1000) + (hasQuestionMark ? 80 : 0) + Math.min(text.length, 400) - idx;
     return { text, score };
   });
   scored.sort((a, b) => b.score - a.score);
@@ -207,9 +279,7 @@ function extractLatestMergedSegment(raw: string): string {
   // Prefer last explicit question-like segment.
   for (let i = parts.length - 1; i >= 0; i--) {
     const p = parts[i];
-    const extracted = extractSharedQuestionCandidate(p);
-    if (extracted) return extracted;
-    if (hasSharedQuestionSignal(p)) {
+    if (/\?/.test(p) || /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|tell|walk|explain)\b/i.test(p)) {
       return p;
     }
   }
@@ -220,12 +290,11 @@ function extractLatestMergedSegment(raw: string): string {
 const KNOWN_TECH_TERM_RE = /^(flask|django|fastapi|react|angular|vue|python|java|javascript|typescript|nodejs|node\.?js|aws|azure|gcp|docker|kubernetes|redis|kafka|mongodb|postgres|postgresql|mysql|spring|terraform|ansible|graphql|microservices?|devops|git|linux|bash|celery|rabbitmq|elasticsearch|nginx|jenkins|airflow|spark|hadoop|pandas|numpy|pytorch|tensorflow|scikit|langchain|openai|llm|rag|pinecone|weaviate|next\.?js|tailwind|redux|webpack|vite|jest|pytest|junit|maven|gradle|intellij|pycharm|jupyter|postman|jira|confluence|bitbucket|github|gitlab|agile|scrum|kanban|ci.?cd|rest|soap|grpc|jwt|oauth|saml|ldap|ssl|tls|tcp|http|websocket|sql|nosql|orm|crud|solid|mvp|mvc|mvvm|tdd|bdd|ddd|design pattern|system design|data structure|algorithm|leetcode|hackerrank)s?\b$/i;
 
 function looksLikeNoiseSegment(text: string): boolean {
-  const q = normalizeText(String(text || ""));
+  const q = String(text || "").toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
   if (!q) return true;
   if (KNOWN_FOLLOWUP_RE.test(q)) return false;
   // Known tech terms alone are never noise — treat as implicit "do you have experience in X"
   if (KNOWN_TECH_TERM_RE.test(q.trim())) return false;
-  if (hasSharedQuestionSignal(text)) return false;
   const words = q.split(" ").filter(Boolean);
   if (words.length <= 1 && !q.includes("?")) return true;
 
@@ -240,42 +309,19 @@ function looksLikeNoiseSegment(text: string): boolean {
   const uniqueWords = new Set(words);
   if (uniqueWords.size === 1 && words.length > 1) return true;
 
+  const hasQuestionCue = /\?|^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|tell|walk|explain|describe|share|give|talk|are you|have you|your experience|your background)\b/.test(q)
+    || /\b(tell me about|tell us about|walk me through|talk me through|describe a time|give me an example|have you worked|have you used|have you ever|are you familiar|are you comfortable with|your experience with|your experience in|your background in)\b/.test(q);
+
   // Interview cue — must be a meaningful tech/interview term, not just any common word
   const hasInterviewCue = /\b(experience|react|python|fastapi|flask|django|api|apis|project|worked|aws|azure|gcp|cloud|kubernetes|docker|microservice|database|sql|nosql|java|typescript|golang|spring|node|angular|vue|devops|agile|scrum|architecture|system design|algorithm|data structure|machine learning|ci cd|deployment|testing|optimization)\b/.test(q);
 
   // Short segments (≤6 words) with no question cue AND no interview cue → noise
-  if (!hasInterviewCue && words.length <= 6) return true;
+  if (!hasQuestionCue && !hasInterviewCue && words.length <= 6) return true;
 
   // Medium segments (7–12 words) also need at least one signal
-  if (!hasInterviewCue && words.length <= 12) return true;
+  if (!hasQuestionCue && !hasInterviewCue && words.length <= 12) return true;
 
   return false;
-}
-
-function normalizeQuestionFragment(text: string): string {
-  return String(text || "").toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
-}
-
-function isBehavioralOrPersonalQuestion(question: string): boolean {
-  return PERSONAL_OR_BEHAVIORAL_Q_RE.test(question);
-}
-
-function isTopicAppendableQuestion(question: string): boolean {
-  if (!question) return false;
-  if (isBehavioralOrPersonalQuestion(question)) return false;
-  return TOPIC_APPENDABLE_Q_RE.test(question) || /\b(do|does|did|have|has|are|is|can|could|would)\s+you\b/i.test(question);
-}
-
-function isSafeTopicTail(fragment: string): boolean {
-  const normalized = normalizeQuestionFragment(fragment);
-  if (!normalized) return false;
-  if (looksLikeInterviewNoise(fragment) || isDanglingStub(normalized)) return false;
-
-  const words = normalized.split(/\s+/).filter(Boolean);
-  if (words.length < 1 || words.length > 5) return false;
-
-  if (KNOWN_TECH_TERM_RE.test(normalized)) return true;
-  return /\b(api|backend|frontend|cloud|database|sql|nosql|devops|microservices?|system design|project|architecture|testing|security|scalability|performance)\b/i.test(normalized);
 }
 
 function extractStrictInterviewerQuestion(raw: string): string {
@@ -300,20 +346,18 @@ function extractStrictInterviewerQuestion(raw: string): string {
     if (isCandidateLine) continue;
     s = s.replace(/^interviewer\s*:\s*/i, "").trim();
     if (!s) continue;
-    const extracted = extractSharedQuestionCandidate(s);
-    const candidate = extracted || s;
-    if (looksLikeNoiseSegment(candidate)) continue;
+    if (looksLikeNoiseSegment(s)) continue;
 
-    const q = normalizeText(candidate);
+    const q = s.toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
     const words = q.split(" ").filter(Boolean).length;
-    const hasQMark = candidate.includes("?");
-    const hasQuestionSignal = detectQuestion(candidate) || likelyContainsQuestion(candidate) || Boolean(extracted);
+    const hasQMark = s.includes("?");
+    const startsQuestion = /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|tell|walk|explain|describe|share|give|talk|are you|have you|your experience|your background)\b/.test(q);
     const directWhDefinition = /^(what is|what's|define|explain)\b/.test(q);
     const hasInterviewCue = /\b(experience|project|worked|role|responsibility|domain|process|stakeholder|analysis|business|technical|start date|end date|month|year)\b/.test(q);
     const qTokens = q.split(/\s+/).filter((w) => w.length >= 4);
     const uniqueTokenCount = new Set(qTokens).size;
     const hasCompoundJoiner = /\b(and|also|as well as)\b/.test(q);
-    const punctuationSplitCount = candidate.split(/[?,]/).map((p) => p.trim()).filter(Boolean).length;
+    const punctuationSplitCount = s.split(/[?,]/).map((p) => p.trim()).filter(Boolean).length;
     const multiClauseBonus = punctuationSplitCount >= 2 ? Math.min(40, (punctuationSplitCount - 1) * 12) : 0;
     const partialStub = /^(when did you|do you have|what was your|have you worked with|tell me about)\s*$/.test(q)
       || isDanglingStub(q);
@@ -321,13 +365,13 @@ function extractStrictInterviewerQuestion(raw: string): string {
     // #6: candidate self-talk penalty — these patterns are almost never interviewer questions
     const isCandidateSelfTalk = /^(i have|i worked|i built|i implemented|i used|i developed|i created|i led|i managed|in my experience|at my previous|at my last|we built|we used|we implemented|my role|my project|my team|my experience)\b/.test(q);
     // #8: cased tech term boost — post-ASR correction, cased terms signal real interview content
-    const hasCasedTechTerm = /\b(AWS|Azure|GCP|React|Python|Java|TypeScript|Docker|Kubernetes|Redis|Kafka|Flask|Django|FastAPI|GraphQL|PostgreSQL|MongoDB|Spring|Terraform|Ansible|Jenkins|Node\.?js|Angular|Vue)\b/.test(candidate);
+    const hasCasedTechTerm = /\b(AWS|Azure|GCP|React|Python|Java|TypeScript|Docker|Kubernetes|Redis|Kafka|Flask|Django|FastAPI|GraphQL|PostgreSQL|MongoDB|Spring|Terraform|Ansible|Jenkins|Node\.?js|Angular|Vue)\b/.test(s);
     // #3: standalone tech entity — 1-3 word segment with just a tech name = implicit "tell me about X"
     const isImplicitTechQuestion = words <= 3 && hasCasedTechTerm && !isCandidateSelfTalk;
 
     let score = 0;
     score += hasQMark ? 80 : 0;
-    score += hasQuestionSignal ? 60 : 0;
+    score += startsQuestion ? 50 : 0;
     score += (directWhDefinition && words >= 3 && words <= 8) ? 85 : 0;
     score += hasInterviewCue ? 35 : 0;
     score += Math.min(50, Math.floor(uniqueTokenCount / 2) * 6);
@@ -342,23 +386,23 @@ function extractStrictInterviewerQuestion(raw: string): string {
     score -= isCandidateSelfTalk ? 150 : 0; // #6: penalise candidate self-talk heavily
     // Keep short direct questions (e.g. "what is mvcc?") from getting buried.
     const isKnownFollowUpPhrase = KNOWN_FOLLOWUP_RE.test(q) || /^(elaborate|explain|show me|tell me more|go on|keep going|more detail|give an example|can you expand|can you clarify|walk me through that|break it down|expand on that|zoom in|dig deeper)\b/i.test(q);
-    if (words <= 3 && !(hasQMark || hasQuestionSignal) && !isKnownFollowUpPhrase && !isImplicitTechQuestion) score -= 80;
+    if (words <= 3 && !(hasQMark || startsQuestion) && !isKnownFollowUpPhrase && !isImplicitTechQuestion) score -= 80;
     if (words <= 2 && !hasQMark && !isKnownFollowUpPhrase && !isImplicitTechQuestion) score -= 50;
 
     if (score > bestScore) {
       bestScore = score;
-      best = candidate;
+      best = s;
     }
   }
 
   // Reject the best candidate if it's still a dangling stub — return "" so the caller
   // falls back to the last unanswered interviewer question instead.
-  if (best && isDanglingStub(normalizeText(best))) {
+  if (best && isDanglingStub(best.toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim())) {
     return "";
   }
   if (best) {
     // Expand standalone tech term to a full question so the LLM has clear intent
-    const bestNorm = normalizeText(best).replace(/\?/g, "").trim();
+    const bestNorm = best.toLowerCase().replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim();
     if (KNOWN_TECH_TERM_RE.test(bestNorm)) {
       return `Do you have experience in ${best}?`;
     }
@@ -368,21 +412,19 @@ function extractStrictInterviewerQuestion(raw: string): string {
   // Fallback 1: latest explicit question-like segment.
   for (let i = segments.length - 1; i >= 0; i--) {
     const s = segments[i].replace(/^interviewer\s*:\s*/i, "").trim();
-    const candidate = extractSharedQuestionCandidate(s) || s;
-    if (!candidate || looksLikeNoiseSegment(candidate)) continue;
-    const q = normalizeText(candidate);
+    if (!s || looksLikeNoiseSegment(s)) continue;
+    const q = s.toLowerCase().replace(/[^\w\s?]/g, " ").replace(/\s+/g, " ").trim();
     if (isDanglingStub(q)) continue; // skip dangling stubs in fallback too
-    if (hasSharedQuestionSignal(candidate)) {
-      return candidate;
+    if (s.includes("?") || /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|tell|walk|explain)\b/.test(q)) {
+      return s;
     }
   }
 
   // Fallback 2: latest non-noise segment.
   for (let i = segments.length - 1; i >= 0; i--) {
     const s = segments[i].replace(/^interviewer\s*:\s*/i, "").trim();
-    const candidate = extractSharedQuestionCandidate(s) || s;
-    if (!candidate || looksLikeNoiseSegment(candidate)) continue;
-    return candidate;
+    if (!s || looksLikeNoiseSegment(s)) continue;
+    return s;
   }
 
   return "";
@@ -395,191 +437,6 @@ function safeSend(ws: WebSocket, payload: unknown) {
   } catch (err: any) {
     console.error("[ws/answer] send failed:", err.message);
   }
-}
-
-function buildQueuedQuestionPrompt(questions: string[]): string {
-  if (questions.length <= 1) return questions[0] || "";
-  return `Answer these interviewer questions separately in order:\n${questions.map((question, index) => `${index + 1}. ${question}`).join("\n")}`;
-}
-
-type EnterWindowResolution = {
-  prompt: string;
-  displayQuestion: string;
-  answeredQuestions: string[];
-  questionNorms: string[];
-  advanceCursorOnSuccess: boolean;
-  windowHash: string;
-  reusedPreviousQuestion: boolean;
-  reason?: "cooldown" | "no_active_question" | "insufficient_context" | "nothing_new";
-};
-
-const GENERATE_COOLDOWN_MS = 5000;
-
-async function resolveEnterWindowQuestion(
-  sessionId: string,
-  audioMode: "mic" | "system",
-  fallbackText = "",
-  liveTranscript = "",
-): Promise<EnterWindowResolution> {
-  const state = getMeetingState(sessionId);
-  const lastGenerated = getLastGeneratedTopic(sessionId);
-  const activeQuestion = getActiveQuestion(sessionId);
-  const now = Date.now();
-  const hasPendingTranscript = state.finals.length > state.lastAnsweredFinalIndex || Boolean((state.partialText || "").trim());
-  const snapshotText = hasPendingTranscript ? getSnapshotFromCursor(sessionId, 3000, 0) : "";
-  const fallbackTranscript = String(liveTranscript || "").trim();
-  const windowSource = snapshotText || fallbackTranscript;
-  const currentWindowHash = buildQuestionWindowHash(windowSource);
-  const explicitFallback = String(fallbackText || "").trim();
-  const previousQuestion =
-    activeQuestion?.clean
-    || lastGenerated.question
-    || state.lastPrompt
-    || explicitFallback;
-
-  const buildResolutionFromFrame = (
-    framedWindow: ReturnType<typeof resolveActiveQuestionWindow>,
-    windowHash: string,
-  ): EnterWindowResolution => {
-    const activeSupersedesWindow = Boolean(
-      activeQuestion?.clean
-      && framedWindow.cleanQuestion
-      && questionSupersedes(activeQuestion.clean, framedWindow.cleanQuestion),
-    );
-    const answeredQuestions = activeSupersedesWindow
-      ? [String(activeQuestion?.clean || "").trim()].filter(Boolean)
-      : framedWindow.questions.map((item) => item.text).filter(Boolean);
-    const questionNorms = activeSupersedesWindow
-      ? [String(activeQuestion?.norm || "").trim()].filter(Boolean)
-      : framedWindow.questions.map((item) => item.norm).filter(Boolean);
-    const displayQuestion = answeredQuestions.length > 1
-      ? answeredQuestions.map((question, index) => `${index + 1}. ${question}`).join("\n")
-      : (answeredQuestions[0] || framedWindow.cleanQuestion);
-    const prompt = answeredQuestions.length > 1
-      ? buildQueuedQuestionPrompt(answeredQuestions)
-      : (answeredQuestions[0] || framedWindow.cleanQuestion);
-    const answeredWindowHash = activeSupersedesWindow
-      ? (activeQuestion?.windowHash || windowHash)
-      : (framedWindow.windowHash || windowHash);
-    const repeatedWindow = Boolean(
-      answeredWindowHash
-      && lastGenerated.windowHash
-      && answeredWindowHash === lastGenerated.windowHash,
-    );
-    if (repeatedWindow && state.lastAnswerAt && (now - state.lastAnswerAt) < GENERATE_COOLDOWN_MS) {
-      return {
-        prompt: "",
-        displayQuestion: "",
-        answeredQuestions: [],
-        questionNorms: [],
-        advanceCursorOnSuccess: false,
-        windowHash: answeredWindowHash,
-        reusedPreviousQuestion: false,
-        reason: "cooldown",
-      };
-    }
-    if (repeatedWindow && lastGenerated.repeatCount >= 1) {
-      return {
-        prompt: "",
-        displayQuestion: "",
-        answeredQuestions: [],
-        questionNorms: [],
-        advanceCursorOnSuccess: false,
-        windowHash: answeredWindowHash,
-        reusedPreviousQuestion: false,
-        reason: "nothing_new",
-      };
-    }
-    return {
-      prompt,
-      displayQuestion,
-      answeredQuestions,
-      questionNorms,
-      advanceCursorOnSuccess: true,
-      windowHash: answeredWindowHash,
-      reusedPreviousQuestion: false,
-    };
-  };
-
-  if (windowSource) {
-    const framedWindow = resolveActiveQuestionWindow(windowSource, { previousQuestion });
-    if (framedWindow.answerability === "complete" && framedWindow.questions.length > 0) {
-      return buildResolutionFromFrame(framedWindow, currentWindowHash);
-    }
-
-    if (explicitFallback && normalizeText(explicitFallback) !== normalizeText(windowSource)) {
-      const fallbackFrame = resolveActiveQuestionWindow(explicitFallback, { previousQuestion });
-      if (fallbackFrame.answerability === "complete" && fallbackFrame.questions.length > 0) {
-        return buildResolutionFromFrame(
-          fallbackFrame,
-          fallbackFrame.windowHash || buildQuestionWindowHash(explicitFallback),
-        );
-      }
-    }
-    return {
-      prompt: "",
-      displayQuestion: "",
-      answeredQuestions: [],
-      questionNorms: [],
-      advanceCursorOnSuccess: false,
-      windowHash: currentWindowHash,
-      reusedPreviousQuestion: false,
-      reason: "insufficient_context",
-    };
-  }
-
-  const fallbackQuestion = activeQuestion?.clean || previousQuestion || "";
-  const fallbackWindowHash =
-    activeQuestion?.windowHash
-    || lastGenerated.windowHash
-    || buildQuestionWindowHash(fallbackQuestion);
-
-  if (fallbackQuestion) {
-    if (state.lastAnswerAt && (now - state.lastAnswerAt) < GENERATE_COOLDOWN_MS) {
-      return {
-        prompt: "",
-        displayQuestion: "",
-        answeredQuestions: [],
-        questionNorms: [],
-        advanceCursorOnSuccess: false,
-        windowHash: fallbackWindowHash,
-        reusedPreviousQuestion: false,
-        reason: "cooldown",
-      };
-    }
-    if (lastGenerated.windowHash === fallbackWindowHash && lastGenerated.repeatCount >= 1) {
-      return {
-        prompt: "",
-        displayQuestion: "",
-        answeredQuestions: [],
-        questionNorms: [],
-        advanceCursorOnSuccess: false,
-        windowHash: fallbackWindowHash,
-        reusedPreviousQuestion: false,
-        reason: "nothing_new",
-      };
-    }
-    return {
-      prompt: fallbackQuestion,
-      displayQuestion: fallbackQuestion,
-      answeredQuestions: [],
-      questionNorms: [],
-      advanceCursorOnSuccess: false,
-      windowHash: fallbackWindowHash,
-      reusedPreviousQuestion: true,
-    };
-  }
-
-  return {
-    prompt: "",
-    displayQuestion: "",
-    answeredQuestions: [],
-    questionNorms: [],
-    advanceCursorOnSuccess: false,
-    windowHash: "",
-    reusedPreviousQuestion: false,
-    reason: "no_active_question",
-  };
 }
 
 async function resolveUserId(req: IncomingMessage): Promise<string> {
@@ -667,11 +524,15 @@ export function setupWsAnswer(httpServer: Server): void {
       cachedMeeting: Meeting | null;
       cachedMeetingAt: number;
     } = { userId, sessionId: "", requestId: "", cachedMeeting: null, cachedMeetingAt: 0 };
-    const MEETING_CACHE_TTL_MS = 30_000;
+    const MEETING_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes — survives long gaps between questions
 
     const getCachedMeeting = async (sessionId: string): Promise<Meeting | null> => {
       const now = Date.now();
-      if (socketState.cachedMeeting && (now - socketState.cachedMeetingAt) < MEETING_CACHE_TTL_MS) {
+      if (
+        socketState.cachedMeeting &&
+        socketState.cachedMeeting.id === sessionId &&
+        (now - socketState.cachedMeetingAt) < MEETING_CACHE_TTL_MS
+      ) {
         return socketState.cachedMeeting;
       }
       const meeting = await storage.getMeeting(sessionId);
@@ -707,6 +568,15 @@ export function setupWsAnswer(httpServer: Server): void {
           socketState.cachedMeeting = meeting;
           socketState.cachedMeetingAt = Date.now();
           safeSend(ws, { type: "session_started", sessionId });
+          // Pre-generate answers for common behavioral questions in background,
+          // including custom instructions so format/style is applied correctly.
+          const profileContext = meeting.customInstructions || "";
+          void warmHeuristicAnswers(userId, sessionId, profileContext, meeting.customInstructions || "").catch(() => {});
+          // Warm the memory cache at session start so the first Enter press and
+          // first speculative stream both get a cache hit instead of a DB fetch.
+          void formatMemorySlotsForPrompt(userId, sessionId)
+            .then((v) => { if (v) setCachedMemory(userId, v); })
+            .catch(() => {});
           return;
         }
 
@@ -753,106 +623,55 @@ export function setupWsAnswer(httpServer: Server): void {
           const metadata = (msg?.metadata && typeof msg.metadata === "object") ? msg.metadata : {};
           const submitSource = typeof metadata.submitSource === "string" ? metadata.submitSource : "unknown";
           const multiQuestionMode = metadata.multiQuestionMode === true;
-          const requestMode = typeof metadata.mode === "string" ? metadata.mode : "enter";
-          const audioMode = metadata.audioMode === "mic" ? "mic" : "system";
-          const useBackendEnterWindow = requestMode === "enter" && submitSource === "enter_window";
-          let questionForStream = "";
-          let displayQuestionForUi = "";
-          let backendAnsweredQuestions: string[] = [];
-          let backendQuestionNorms: string[] = [];
-          let advanceBackendCursorOnSuccess = false;
-          const queuedBackendQuestions: string[] = [];
-          let resolvedWindowHash = "";
-          let reusedPreviousQuestion = false;
-          let enterIgnoredReason: EnterWindowResolution["reason"];
-
-          if (useBackendEnterWindow) {
-            const enterResolution = await resolveEnterWindowQuestion(
-              sessionId,
-              audioMode,
-              questionText,
-              typeof metadata?.liveTranscript === "string" ? metadata.liveTranscript : "",
-            );
-            questionForStream = enterResolution.prompt;
-            displayQuestionForUi = enterResolution.displayQuestion;
-            backendAnsweredQuestions = enterResolution.answeredQuestions.slice();
-            backendQuestionNorms = enterResolution.questionNorms.slice();
-            advanceBackendCursorOnSuccess = enterResolution.advanceCursorOnSuccess;
-            resolvedWindowHash = enterResolution.windowHash;
-            reusedPreviousQuestion = enterResolution.reusedPreviousQuestion;
-            enterIgnoredReason = enterResolution.reason;
-          } else {
-            const activeSeed =
-              getActiveQuestion(sessionId)?.clean
-              || getLastGeneratedTopic(sessionId).question
-              || "";
-            const explicitFrame = resolveActiveQuestionWindow(questionText.trim(), {
-              previousQuestion: activeSeed,
-            });
-            questionForStream = explicitFrame.isQuestion
-              ? (
-                multiQuestionMode && explicitFrame.questions.length > 1
-                  ? buildQueuedQuestionPrompt(explicitFrame.questions.map((item) => item.text))
-                  : explicitFrame.cleanQuestion
-              )
-              : questionText.trim();
-            displayQuestionForUi = explicitFrame.isQuestion
-              ? (
-                explicitFrame.questions.length > 1
-                  ? explicitFrame.questions.map((item, index) => `${index + 1}. ${item.text}`).join("\n")
-                  : explicitFrame.cleanQuestion
-              )
-              : questionText.trim();
-            resolvedWindowHash = explicitFrame.windowHash || buildQuestionWindowHash(questionText.trim());
-          }
-
-          if (!questionForStream.trim()) {
-            safeSend(ws, {
-              type: "request_ignored",
-              sessionId,
-              requestId: "",
-              reason: useBackendEnterWindow
-                ? (enterIgnoredReason || "insufficient_context")
-                : "no_active_question",
-            });
-            return;
-          }
+          const lastUnanswered = getLastUnansweredInterviewerQuestion(sessionId);
+          const latestSpokenReply = getLatestSpokenReply(sessionId);
+          const primarySeed =
+            (multiQuestionMode
+              ? questionText.trim()
+              : (extractStrictInterviewerQuestion(questionText.trim()) || extractLatestMergedSegment(questionText.trim())));
+          let questionForStream = primarySeed
+            ? primarySeed
+            : chooseBestQuestionSeed([lastUnanswered?.text, latestSpokenReply?.text, "[Continue]"]);
 
           const QUESTION_WORD_RE = /^(what|why|how|when|where|who|which|do|does|did|can|could|would|have|has|is|are|tell|walk|explain)\b/i;
-          const normalizedQuestionForStream = normalizeQuestionFragment(questionForStream);
 
-          // #1b: Only anchor genuine follow-up cues, not generic acknowledgements or every single-word fragment.
-          const shouldAnchorShortFollowup = false;
-          if (shouldAnchorShortFollowup) {
-            const prevQ = lastQuestionBySession.get(sessionId) || "";
+          // #1b: Any short utterance / follow-up word → anchor to last active topic
+          const BARE_FOLLOWUP_RE = /^(why|how so|how come|how|elaborate|explain|tell me more|go on|continue|expand|clarify|what next|what else|more detail|give an example|interesting|okay|ok|and|so|right|sure|really|huh|wait|yeah)\??$/i;
+          const wordCount = questionForStream.trim().split(/\s+/).filter(Boolean).length;
+          // Single word always anchors (even question words like "what", "why" alone = follow-up)
+          const isSingleWord = wordCount === 1;
+          // Also treat WH-starting fragments with ≤3 words as vague (e.g. "when building", "how about")
+          const isShortVague = wordCount <= 5 && !questionForStream.includes("?") &&
+            (!QUESTION_WORD_RE.test(questionForStream.trim()) || wordCount <= 3);
+          if (BARE_FOLLOWUP_RE.test(questionForStream.trim()) || isSingleWord || isShortVague) {
+            const prevQ = lastQuestionBySession.get(sessionId);
             if (prevQ && prevQ !== "[Continue]") {
               questionForStream = `${questionForStream.trim()} (follow-up to: "${prevQ}")`;
               console.log(`[ws/answer] anchored_short_utterance sessionId=${sessionId}`, { expanded: questionForStream });
             }
           }
 
-          // #2: Continuation stitching — only append onto prior questions when the previous
-          // question is actually a topic-appendable one like experience/background/used-with.
-          const connectorMatch = CONNECTOR_PREFIX_RE.exec(questionForStream);
-          if (connectorMatch && false && queuedBackendQuestions.length === 0) {
-            const tail = questionForStream.slice((connectorMatch?.[0] || "").length).trim();
-            const prevQ = lastQuestionBySession.get(sessionId) || "";
-            if (prevQ && prevQ !== "[Continue]" && isTopicAppendableQuestion(prevQ) && isSafeTopicTail(tail)) {
-              const prevNoQ = prevQ.replace(/\?\s*$/, "").trim();
-              questionForStream = `${prevNoQ} and also ${tail}?`;
+          // #2: Continuation stitching — "and also X" / "plus X" → stitch onto previous question
+          const CONNECTOR_PREFIX = /^(and\s+also|and|also|plus|as\s+well\s+as|what\s+about|or)\s+/i;
+          const connectorMatch = CONNECTOR_PREFIX.exec(questionForStream);
+          if (connectorMatch) {
+            const tail = questionForStream.slice(connectorMatch[0].length).trim();
+            const prevQ = lastQuestionBySession.get(sessionId);
+            if (prevQ && tail.length >= 2) {
+              questionForStream = `${prevQ} and also ${tail}`;
               console.log(`[ws/answer] stitched continuation sessionId=${sessionId}`, { prevQ, tail, result: questionForStream });
             }
           }
 
-          // #2b: Bare tech-topic stitching — only for appendable topic questions, not arbitrary prior asks.
+          // #2b: Bare tech-topic stitching — "Flask", "Django", "AWS" (no joiner) → stitch onto previous question
           const bareTopicOnly =
             !connectorMatch
             && !QUESTION_WORD_RE.test(questionForStream.trim())
             && !questionForStream.includes("?")
             && questionForStream.trim().split(/\s+/).filter(Boolean).length <= 4;
-          if (false && bareTopicOnly && queuedBackendQuestions.length === 0) {
-            const prevQ = lastQuestionBySession.get(sessionId) || "";
-            if (prevQ && prevQ !== "[Continue]" && isTopicAppendableQuestion(prevQ) && isSafeTopicTail(questionForStream)) {
+          if (bareTopicOnly) {
+            const prevQ = lastQuestionBySession.get(sessionId);
+            if (prevQ && QUESTION_WORD_RE.test(prevQ.trim())) {
               const prevNoQ = prevQ.replace(/\?\s*$/, "").trim();
               questionForStream = `${prevNoQ} and also ${questionForStream.trim()}?`;
               console.log(`[ws/answer] stitched bare topic sessionId=${sessionId}`, { prevQ, topic: questionForStream });
@@ -860,82 +679,48 @@ export function setupWsAnswer(httpServer: Server): void {
           }
 
           // #3: Incomplete/empty transcript — anchor to last known question so answer is always contextual
-          if (false && !useBackendEnterWindow && (questionForStream === "[Continue]" || questionForStream.trim().length === 0)) {
-            const prevQ = lastQuestionBySession.get(sessionId) || "";
+          if (questionForStream === "[Continue]" || questionForStream.trim().length === 0) {
+            const prevQ = lastQuestionBySession.get(sessionId);
             if (prevQ && prevQ !== "[Continue]") {
               questionForStream = `Continue answering: "${prevQ}"`;
               console.log(`[ws/answer] anchored_incomplete sessionId=${sessionId}`, { anchor: questionForStream });
             }
           }
 
-          // #4: Be conservative with ambiguous transcript.
-          // Auto-triggered vague/noisy fragments should not be force-expanded into an invented question.
-          // Manual submits may still pass through literally so the user can explicitly choose to answer them.
-          const isExplicitQuestion = hasSharedQuestionSignal(questionForStream)
-            || /^(write|implement|build|create|design)\b/i.test(questionForStream.trim());
-          const isAmbiguousImplicit =
-            !isExplicitQuestion
+          // #4: If the text isn't a clear question, wrap it so LLM infers and answers the implied question.
+          // This handles statements like "microservices and distributed systems" or "React experience" where
+          // the interviewer is implying a topic without an explicit question mark.
+          const isExplicitQuestion = questionForStream.includes("?") || QUESTION_WORD_RE.test(questionForStream.trim())
+            || /^(tell|walk|explain|describe|share|give|talk|show|write|implement|build|create|design)\b/i.test(questionForStream.trim());
+          if (!isExplicitQuestion
             && questionForStream !== "[Continue]"
             && !questionForStream.startsWith("Continue answering:")
             && !questionForStream.startsWith("[Continue")
-            && questionForStream.trim().length > 0
-            && (isVagueQuestion(questionForStream) || looksLikeInterviewNoise(questionForStream));
-          if (queuedBackendQuestions.length === 0 && isAmbiguousImplicit && !force) {
-            console.log(`[ws/answer] suppressed_ambiguous_auto sessionId=${sessionId}`, {
-              raw: questionForStream,
-            });
-            safeSend(ws, {
-              type: "request_ignored",
-              sessionId,
-              requestId: "",
-              reason: "ambiguous_question",
-            });
-            return;
+            && questionForStream.trim().length > 0) {
+            // Don't append inference instruction — system prompt already handles vague input.
+            // Wrapping with verbose instructions causes LLM to echo them back into the answer.
+            questionForStream = questionForStream.trim();
+            console.log(`[ws/answer] inferred_question sessionId=${sessionId} topic="${questionForStream.slice(0, 100)}"`);
           }
-          // For transcript-driven prompts, keep the literal resolved question/topic.
-          // Wrapping it in meta-instructions here tends to produce awkward refusals or
-          // over-explained answers for otherwise answerable interview prompts.
 
           // #5: Recency amplification — boost detection of topic that appeared in last answer
-          lastQuestionBySession.set(sessionId, displayQuestionForUi || questionForStream);
+          lastQuestionBySession.set(sessionId, questionForStream);
 
           // If questionForStream normalized to empty, anchor to last known question so Enter always answers
-          if (false && !useBackendEnterWindow && (!questionForStream.trim() || normalizeQuestionForSimilarity(questionForStream) === "")) {
-            const prevQ = lastQuestionBySession.get(sessionId) || "";
+          if (!questionForStream.trim() || normalizeQuestionForSimilarity(questionForStream) === "") {
+            const prevQ = lastQuestionBySession.get(sessionId);
             questionForStream = prevQ && prevQ !== "[Continue]"
               ? `Continue answering: "${prevQ}"`
               : "[Continue with latest interviewer context]";
             lastQuestionBySession.set(sessionId, questionForStream);
           }
-          if (!displayQuestionForUi.trim()) {
-            displayQuestionForUi = questionForStream.trim();
-          }
-          const plainDisplayQuestion = displayQuestionForUi
-            .trim()
-            .split(/\n+/)
-            .map((line) => line.replace(/^\d+\.\s*/, "").trim())
-            .filter(Boolean)
-            .slice(-1)[0] || "";
-          if (plainDisplayQuestion) {
-            const activeState = getMeetingState(sessionId);
-            activeState.lastPrompt = plainDisplayQuestion;
-            setActiveQuestion(sessionId, plainDisplayQuestion, Date.now(), {
-              windowHash: resolvedWindowHash || buildQuestionWindowHash(plainDisplayQuestion),
-            });
-          }
-          const fp = normalizeQuestionForSimilarity(questionForStream) || "question";
-          if (!force && !useBackendEnterWindow && isRecentDuplicate(sessionId, fp, questionText)) {
+          const fp = normalizeQuestionForSimilarity(questionForStream) || "continue";
+          if (!force && isRecentDuplicate(sessionId, fp, questionText)) {
             console.log(`[ws/answer] duplicate suppressed sessionId=${sessionId} fp="${fp.slice(0, 60)}"`);
-            safeSend(ws, {
-              type: "request_ignored",
-              sessionId,
-              requestId: "",
-              reason: "duplicate_question",
-            });
             return;
           }
           rememberFingerprint(sessionId, fp, questionText);
-          recordUserQuestion(sessionId, displayQuestionForUi || questionForStream);
+          recordUserQuestion(sessionId, questionForStream);
           console.log(
             `[ws/answer] question sessionId=${sessionId} userId=${userId} chars=${questionForStream.length} force=${force} source=${submitSource} multi=${multiQuestionMode}`,
             {
@@ -967,7 +752,7 @@ export function setupWsAnswer(httpServer: Server): void {
           const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
           socketState.requestId = requestId;
           activeBySession.set(sessionId, { ws, userId, sessionId, requestId });
-          safeSend(ws, { type: "assistant_start", sessionId, requestId, question: displayQuestionForUi || questionForStream });
+          safeSend(ws, { type: "assistant_start", sessionId, requestId });
           console.log(`[ws/answer] assistant_start sessionId=${sessionId} requestId=${requestId}`);
 
           // ── Speculative replay ────────────────────────────────────────────
@@ -983,15 +768,37 @@ export function setupWsAnswer(httpServer: Server): void {
             const realNorm = rawNorm || normalizeQuestionForSimilarity(questionForStream);
             const similarity = realNorm ? levenshteinSimilarity(specNorm, realNorm) : 0;
             const isRecent = (Date.now() - spec.ts) <= 15000;
-            if (similarity >= 0.70 && isRecent) {
-              console.log(`[ws/answer] speculative_hit sessionId=${sessionId} similarity=${similarity.toFixed(2)} chunks=${spec.chunks.length} done=${spec.done}`);
+            // Reject speculative if Enter question is >35% longer than what speculative was
+            // generated for — means a new question arrived after speculative started and the
+            // buffered answer is incomplete (e.g. Q2 arrived after speculative started with Q1).
+            const specWordCount = specNorm.split(/\s+/).filter(Boolean).length;
+            const enterWordCount = (realNorm || "").split(/\s+/).filter(Boolean).length;
+            const lengthRatio = specWordCount / Math.max(enterWordCount, 1);
+            const lengthOk = lengthRatio >= 0.65;
+            if (similarity >= 0.70 && isRecent && lengthOk) {
+              // Check if the finished speculative answer looks truncated — ends mid-sentence
+              // without terminal punctuation. If so, don't mark as a hit so the full pipeline
+              // runs and produces a complete answer.
+              const bufferedText = spec.chunks.join("");
+              const lastChar = bufferedText.trimEnd().slice(-1);
+              // A finished speculative is considered truncated if it doesn't end with
+              // terminal punctuation. The length < 80 clause was removed because short
+              // answers like "At Anthem Blue Cross and Blue" (74 chars, mid-sentence)
+              // were incorrectly treated as complete.
+              const looksComplete = !spec.done || /[.?!\n`]/.test(lastChar);
+              if (spec.done && !looksComplete) {
+                console.log(`[ws/answer] speculative_truncated sessionId=${sessionId} chars=${bufferedText.length} — falling back to full pipeline`);
+              } else {
+              console.log(`[ws/answer] speculative_hit sessionId=${sessionId} similarity=${similarity.toFixed(2)} lengthRatio=${lengthRatio.toFixed(2)} chunks=${spec.chunks.length} done=${spec.done}`);
               // Flush all chunks buffered so far
               for (const chunk of spec.chunks) {
                 safeSend(ws, { type: "assistant_chunk", sessionId, requestId, text: chunk });
               }
+              // Remove from map immediately on adoption so any subsequent speculative_question
+              // from audio detection cannot evict this entry and trigger onDone mid-stream.
+              speculativeStreams.delete(sessionId);
               if (spec.done) {
                 // Stream already finished — send end immediately
-                speculativeStreams.delete(sessionId);
                 safeSend(ws, { type: "assistant_end", sessionId, requestId, cancelled: false });
                 removeOnSocketClose();
               } else {
@@ -1000,12 +807,18 @@ export function setupWsAnswer(httpServer: Server): void {
                   safeSend(ws, { type: "assistant_chunk", sessionId, requestId, text: chunk });
                 };
                 spec.onDone = () => {
-                  speculativeStreams.delete(sessionId);
                   safeSend(ws, { type: "assistant_end", sessionId, requestId, cancelled: false });
                   removeOnSocketClose();
                 };
+                // When WebSocket closes before onDone fires, null out callbacks immediately
+                // so the closed ws object and closure references can be garbage collected.
+                ws.once("close", () => {
+                  spec.onChunk = undefined;
+                  spec.onDone = undefined;
+                });
               }
               speculativeHit = true;
+              }
             }
           }
           if (!speculativeHit) {
@@ -1081,41 +894,6 @@ export function setupWsAnswer(httpServer: Server): void {
             if (event.type === "error") {
               safeSend(ws, { type: "error", sessionId, requestId: event.requestId, message: event.message || "stream failed" });
             }
-          }
-
-          if (!fastCancelled && emittedChunkCount > 0) {
-            getMeetingState(sessionId).lastAnswerAt = Date.now();
-          }
-
-          if (!fastCancelled && emittedChunkCount > 0 && backendAnsweredQuestions.length > 0) {
-            const answeredAt = Date.now();
-            for (const backendQuestion of backendAnsweredQuestions) {
-              markInterviewerQuestionAnswered(sessionId, backendQuestion, answeredAt);
-            }
-            if (backendQuestionNorms.length > 0) {
-              markAnsweredInStore(sessionId, backendQuestionNorms, answeredAt);
-            }
-            if (advanceBackendCursorOnSuccess) {
-              advanceCursor(sessionId);
-            }
-            if (resolvedWindowHash) {
-              setLastAnsweredWindowHash(sessionId, resolvedWindowHash);
-            }
-          } else if (!fastCancelled && emittedChunkCount > 0 && advanceBackendCursorOnSuccess) {
-            advanceCursor(sessionId);
-            if (resolvedWindowHash) {
-              setLastAnsweredWindowHash(sessionId, resolvedWindowHash);
-            }
-          } else if (!fastCancelled && emittedChunkCount > 0 && reusedPreviousQuestion && resolvedWindowHash) {
-            setLastAnsweredWindowHash(sessionId, resolvedWindowHash);
-          }
-          if (!fastCancelled && emittedChunkCount > 0) {
-            markGeneratedTopic(
-              sessionId,
-              plainDisplayQuestion || displayQuestionForUi || questionForStream,
-              resolvedWindowHash || buildQuestionWindowHash(plainDisplayQuestion || displayQuestionForUi || questionForStream),
-              Date.now(),
-            );
           }
 
           // --- TYPED REFINEMENT PASS ---
