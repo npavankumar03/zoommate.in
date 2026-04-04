@@ -19,7 +19,8 @@ import {
   Shield, Search, Loader2, Settings, Activity, Key, Eye, EyeOff, Save,
   CreditCard, Gift, Ban, History, ChevronDown, ChevronUp, DollarSign, Plus,
   Download, Megaphone, AlertTriangle, Trash2, UserX, CheckCircle, XCircle,
-  TrendingUp, UserPlus, Globe, Wrench, FileText, Database, Router, BarChart2
+  TrendingUp, UserPlus, Globe, Wrench, FileText, Database, Router, BarChart2,
+  Mail, Send
 } from "lucide-react";
 import { motion } from "framer-motion";
 
@@ -728,15 +729,46 @@ function SettingsTab() {
   const [showOpenai, setShowOpenai] = useState(false);
   const [showGemini, setShowGemini] = useState(false);
   const [showAzure, setShowAzure] = useState(false);
+  const [showSmtpPass, setShowSmtpPass] = useState(false);
   const { data: settings, isLoading: settingsLoading } = useQuery<any>({ queryKey: ["/api/admin/settings"] });
   const [defaultModel, setDefaultModel] = useState("gpt-4o");
   const [modelSynced, setModelSynced] = useState(false);
+  const [smtpHost, setSmtpHost] = useState("");
+  const [smtpPort, setSmtpPort] = useState("587");
+  const [smtpUser, setSmtpUser] = useState("");
+  const [smtpPass, setSmtpPass] = useState("");
+  const [smtpFromEmail, setSmtpFromEmail] = useState("");
+  const [smtpFromName, setSmtpFromName] = useState("");
+  const [smtpSynced, setSmtpSynced] = useState(false);
+  const [testEmail, setTestEmail] = useState("");
+
+  if (settings && !smtpSynced) {
+    setSmtpHost(settings.smtp_host || "");
+    setSmtpPort(settings.smtp_port || "587");
+    setSmtpUser(settings.smtp_user || "");
+    setSmtpFromEmail(settings.smtp_from_email || "");
+    setSmtpFromName(settings.smtp_from_name || "");
+    setSmtpSynced(true);
+  }
   const { data: models } = useQuery<{ openai: string[]; gemini: string[] }>({ queryKey: ["/api/models"] });
 
   if (settings?.default_model && !modelSynced) {
     setDefaultModel(settings.default_model);
     setModelSynced(true);
   }
+
+  const smtpTestMutation = useMutation({
+    mutationFn: async (email: string) => {
+      const res = await apiRequest("POST", "/api/admin/smtp/test", { email });
+      return res.json();
+    },
+    onSuccess: () => {
+      toast({ title: "Test email sent successfully" });
+    },
+    onError: (error: Error) => {
+      toast({ title: "SMTP test failed", description: error.message, variant: "destructive" });
+    },
+  });
 
   const saveMutation = useMutation({
     mutationFn: async (data: any) => {
@@ -916,6 +948,73 @@ function SettingsTab() {
           <Button onClick={() => saveMutation.mutate({ default_model: defaultModel })} disabled={saveMutation.isPending} data-testid="button-save-model">
             <Save className="w-4 h-4 mr-1" /> Save Model
           </Button>
+        </div>
+      </Card>
+
+      <Card className="p-6">
+        <h3 className="font-semibold mb-1 flex items-center gap-2"><Mail className="w-4 h-4 text-primary" /> Email / SMTP Settings</h3>
+        <p className="text-xs text-muted-foreground mb-4">Configure SMTP for email verification on signup. When configured, new users must verify their email before logging in.</p>
+        <div className="space-y-4">
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-1">
+              <label className="text-xs font-medium">SMTP Host</label>
+              <Input value={smtpHost} onChange={(e) => setSmtpHost(e.target.value)} placeholder="smtp.gmail.com" />
+            </div>
+            <div className="space-y-1">
+              <label className="text-xs font-medium">SMTP Port</label>
+              <Input value={smtpPort} onChange={(e) => setSmtpPort(e.target.value)} placeholder="587" />
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-1">
+              <label className="text-xs font-medium">SMTP Username</label>
+              <Input value={smtpUser} onChange={(e) => setSmtpUser(e.target.value)} placeholder="user@gmail.com" />
+            </div>
+            <div className="space-y-1">
+              <label className="text-xs font-medium">SMTP Password</label>
+              <div className="relative">
+                <Input type={showSmtpPass ? "text" : "password"} value={smtpPass} onChange={(e) => setSmtpPass(e.target.value)} placeholder={settings?.smtp_pass_set ? "••••••••" : "App password"} />
+                <Button variant="ghost" size="icon" className="absolute right-0 top-0 h-full" onClick={() => setShowSmtpPass(!showSmtpPass)}>
+                  {showSmtpPass ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </Button>
+              </div>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-1">
+              <label className="text-xs font-medium">From Email</label>
+              <Input value={smtpFromEmail} onChange={(e) => setSmtpFromEmail(e.target.value)} placeholder="noreply@zoommate.in" />
+            </div>
+            <div className="space-y-1">
+              <label className="text-xs font-medium">From Name</label>
+              <Input value={smtpFromName} onChange={(e) => setSmtpFromName(e.target.value)} placeholder="Zoom Mate" />
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <div className={`w-2 h-2 rounded-full ${settings?.smtp_pass_set && settings?.smtp_host ? "bg-emerald-500" : "bg-muted-foreground"}`} />
+            <span className="text-xs text-muted-foreground">{settings?.smtp_pass_set && settings?.smtp_host ? "SMTP Configured" : "Not configured"}</span>
+          </div>
+          <div className="flex items-center gap-2 flex-wrap">
+            <Button size="sm" onClick={() => {
+              const data: any = {};
+              if (smtpHost) data.smtp_host = smtpHost;
+              if (smtpPort) data.smtp_port = smtpPort;
+              if (smtpUser) data.smtp_user = smtpUser;
+              if (smtpPass) data.smtp_pass = smtpPass;
+              if (smtpFromEmail) data.smtp_from_email = smtpFromEmail;
+              if (smtpFromName) data.smtp_from_name = smtpFromName;
+              saveMutation.mutate(data);
+              setSmtpPass("");
+            }} disabled={saveMutation.isPending}>
+              <Save className="w-4 h-4 mr-1" /> Save SMTP
+            </Button>
+            <div className="flex items-center gap-2 ml-auto">
+              <Input value={testEmail} onChange={(e) => setTestEmail(e.target.value)} placeholder="test@example.com" className="w-48" />
+              <Button size="sm" variant="outline" onClick={() => smtpTestMutation.mutate(testEmail)} disabled={!testEmail || smtpTestMutation.isPending}>
+                <Send className="w-4 h-4 mr-1" /> {smtpTestMutation.isPending ? "Sending..." : "Send Test"}
+              </Button>
+            </div>
+          </div>
         </div>
       </Card>
     </div>
