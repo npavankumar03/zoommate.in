@@ -16,12 +16,14 @@ import bcrypt from "bcrypt";
 import { getUncachableStripeClient, getStripePublishableKey } from "./stripeClient";
 import { db } from "./db";
 import { sql } from "drizzle-orm";
+import { users } from "@shared/schema";
 import multer from "multer";
 import OpenAI from "openai";
 import fs from "fs";
 import path from "path";
 import { mintAzureToken, getAzureStatus } from "./speech/azureToken";
 import { encryptSettingValue, decryptSettingValue } from "./settingsCrypto";
+import { sendVerificationEmail, testSmtpConnection } from "./emailService";
 import { runDetectionPipeline, extractQuestionsWithLLM, composeQuestionWithLLM, normalizeQuestion, isDuplicateQuestion } from "./assist/questionDetect";
 import { streamAssistantAnswer } from "./assist/answerStream";
 import { orchestrate } from "./assist/orchestrator";
@@ -150,6 +152,26 @@ export async function registerRoutes(
       }
       const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS);
       const user = await storage.createUser({ username, password: hashedPassword, email });
+
+      // Check if SMTP is configured — if so, require email verification
+      const smtpHost = await storage.getSetting("smtp_host");
+      if (smtpHost && email) {
+        const code = Math.floor(100000 + Math.random() * 900000).toString();
+        const expiry = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+        await db.update(users).set({
+          verificationCode: code,
+          verificationCodeExpiry: expiry,
+          emailVerified: false,
+        }).where(sql`id = ${user.id}`);
+        try {
+          await sendVerificationEmail(email, code);
+        } catch (emailErr: any) {
+          console.error("Failed to send verification email:", emailErr.message);
+        }
+        return res.json({ id: user.id, username: user.username, role: user.role, requiresVerification: true });
+      }
+
+      // No SMTP configured — skip verification, log in directly
       (req.session as any).userId = user.id;
       req.session.save((err) => {
         if (err) {
@@ -157,10 +179,73 @@ export async function registerRoutes(
           return res.status(500).json({ message: "Account created but session failed. Please log in." });
         }
         res.json({ id: user.id, username: user.username, role: user.role });
-        });
+      });
     } catch (error: any) {
       console.error("Signup error:", error);
       res.status(500).json({ message: error?.message || "An error occurred during signup. Please try again." });
+    }
+  });
+
+  // Verify email with 6-digit code
+  app.post("/api/auth/verify-email", async (req, res) => {
+    try {
+      const { username, code } = req.body;
+      if (!username || !code) {
+        return res.status(400).json({ message: "Username and verification code are required" });
+      }
+      const user = await storage.getUserByUsername(username);
+      if (!user) {
+        return res.status(404).json({ message: "User not found" });
+      }
+      if ((user as any).emailVerified) {
+        return res.status(400).json({ message: "Email is already verified" });
+      }
+      if ((user as any).verificationCode !== code) {
+        return res.status(400).json({ message: "Invalid verification code" });
+      }
+      if ((user as any).verificationCodeExpiry && new Date((user as any).verificationCodeExpiry) < new Date()) {
+        return res.status(400).json({ message: "Verification code has expired. Please sign up again." });
+      }
+      await db.update(users).set({
+        emailVerified: true,
+        verificationCode: null,
+        verificationCodeExpiry: null,
+      }).where(sql`id = ${user.id}`);
+      (req.session as any).userId = user.id;
+      req.session.save((err) => {
+        if (err) {
+          console.error("Session save error:", err);
+          return res.status(500).json({ message: "Email verified but session failed. Please log in." });
+        }
+        res.json({ id: user.id, username: user.username, role: user.role, verified: true });
+      });
+    } catch (error: any) {
+      console.error("Verify email error:", error);
+      res.status(500).json({ message: error?.message || "Verification failed" });
+    }
+  });
+
+  // Resend verification code
+  app.post("/api/auth/resend-verification", async (req, res) => {
+    try {
+      const { username } = req.body;
+      if (!username) return res.status(400).json({ message: "Username is required" });
+      const user = await storage.getUserByUsername(username);
+      if (!user) return res.status(404).json({ message: "User not found" });
+      if ((user as any).emailVerified) return res.status(400).json({ message: "Email is already verified" });
+      if (!user.email) return res.status(400).json({ message: "No email address on file" });
+
+      const code = Math.floor(100000 + Math.random() * 900000).toString();
+      const expiry = new Date(Date.now() + 10 * 60 * 1000);
+      await db.update(users).set({
+        verificationCode: code,
+        verificationCodeExpiry: expiry,
+      }).where(sql`id = ${user.id}`);
+      await sendVerificationEmail(user.email, code);
+      res.json({ message: "Verification code sent" });
+    } catch (error: any) {
+      console.error("Resend verification error:", error);
+      res.status(500).json({ message: error?.message || "Failed to resend verification code" });
     }
   });
 
@@ -183,6 +268,13 @@ export async function registerRoutes(
       const isValid = await bcrypt.compare(password, user.password);
       if (!isValid) {
         return res.status(401).json({ message: "Invalid username or password" });
+      }
+      // Block login if email verification is required but not completed
+      if (user.email && !(user as any).emailVerified) {
+        const smtpHost = await storage.getSetting("smtp_host");
+        if (smtpHost) {
+          return res.status(403).json({ message: "Please verify your email before logging in.", requiresVerification: true, username: user.username });
+        }
       }
       await storage.updateUser(user.id, { lastLoginAt: new Date() });
       (req.session as any).userId = user.id;
@@ -2160,6 +2252,13 @@ Return ONLY valid JSON. No explanation, no markdown, no code fences. Just the JS
       }
       safeSettings.openai_env_set = !!process.env.OPENAI_API_KEY;
       safeSettings.default_model = settings.default_model || "gpt-4o";
+      // SMTP settings
+      safeSettings.smtp_host = settings.smtp_host || "";
+      safeSettings.smtp_port = settings.smtp_port || "587";
+      safeSettings.smtp_user = settings.smtp_user || "";
+      safeSettings.smtp_pass_set = !!(settings.smtp_pass);
+      safeSettings.smtp_from_email = settings.smtp_from_email || "";
+      safeSettings.smtp_from_name = settings.smtp_from_name || "";
       res.json(safeSettings);
     } catch (error: any) {
       res.status(500).json({ message: error.message });
@@ -2212,6 +2311,27 @@ Return ONLY valid JSON. No explanation, no markdown, no code fences. Just the JS
       }
       if (typeof req.body.transcript_retention_days === "string") {
         await storage.setSetting("transcript_retention_days", req.body.transcript_retention_days);
+      }
+
+      // SMTP settings
+      if (typeof req.body.smtp_host === "string") {
+        await storage.setSetting("smtp_host", req.body.smtp_host.trim());
+      }
+      if (typeof req.body.smtp_port === "string") {
+        await storage.setSetting("smtp_port", req.body.smtp_port.trim() || "587");
+      }
+      if (typeof req.body.smtp_user === "string") {
+        await storage.setSetting("smtp_user", req.body.smtp_user.trim());
+      }
+      if (typeof req.body.smtp_pass === "string") {
+        const pass = req.body.smtp_pass.trim();
+        await storage.setSetting("smtp_pass", pass ? encryptSettingValue(pass) : "");
+      }
+      if (typeof req.body.smtp_from_email === "string") {
+        await storage.setSetting("smtp_from_email", req.body.smtp_from_email.trim());
+      }
+      if (typeof req.body.smtp_from_name === "string") {
+        await storage.setSetting("smtp_from_name", req.body.smtp_from_name.trim());
       }
 
       invalidateSettingsCache();
@@ -2765,6 +2885,22 @@ Return ONLY valid JSON. No explanation, no markdown, no code fences. Just the JS
       const limit = parseInt(req.query.limit as string) || 100;
       const metrics = await storage.getCallMetrics(limit);
       res.json(metrics);
+    } catch (error: any) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  // Test SMTP configuration by sending a test email
+  app.post("/api/admin/smtp/test", requireAdmin, async (req: any, res) => {
+    try {
+      const { email } = req.body;
+      if (!email) return res.status(400).json({ message: "Email address is required" });
+      const result = await testSmtpConnection(email);
+      if (result.success) {
+        res.json({ message: "Test email sent successfully" });
+      } else {
+        res.status(400).json({ message: result.error || "SMTP test failed" });
+      }
     } catch (error: any) {
       res.status(500).json({ message: error.message });
     }
